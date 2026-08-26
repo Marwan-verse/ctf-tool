@@ -26,15 +26,31 @@ class ToolSpec:
 TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("file", "file", "libmagic file identification", "identity", None, frozenset({"quick", "balanced", "deep"})),
     ToolSpec("exiftool", "exiftool", "ExifTool metadata", "metadata", None, frozenset({"quick", "balanced", "deep"})),
+    ToolSpec("exiv2", "exiv2", "Exiv2 metadata cross-check", "metadata", None, frozenset({"balanced", "deep"})),
     ToolSpec("strings", "strings", "GNU/Unix strings cross-check", "strings", None, frozenset({"quick", "balanced", "deep"})),
+    ToolSpec("identify", "identify", "ImageMagick decoded-image inspection", "identity", None, frozenset({"balanced", "deep"})),
     ToolSpec("pngcheck", "pngcheck", "pngcheck structure validation", "structure", frozenset({"png"}), frozenset({"quick", "balanced", "deep"})),
+    ToolSpec("pngcrush", "pngcrush", "pngcrush lossless validation", "structure", frozenset({"png"}), frozenset({"deep"})),
     ToolSpec("jpeginfo", "jpeginfo", "jpeginfo structure validation", "structure", frozenset({"jpeg"}), frozenset({"quick", "balanced", "deep"})),
+    ToolSpec("jpegtran", "jpegtran", "jpegtran lossless normalization", "repair", frozenset({"jpeg"}), frozenset({"balanced", "deep"})),
+    ToolSpec("djpeg", "djpeg", "libjpeg pixel decode validation", "structure", frozenset({"jpeg"}), frozenset({"deep"})),
     ToolSpec("zsteg", "zsteg", "zsteg lossless steganography", "steganography", frozenset({"png", "bmp"}), frozenset({"balanced", "deep"})),
     ToolSpec("stegseek", "stegseek", "Stegseek JPEG extraction", "steganography", frozenset({"jpeg"}), frozenset({"balanced", "deep"})),
+    ToolSpec("steghide", "steghide", "Steghide password extraction", "steganography", frozenset({"jpeg", "bmp"}), frozenset({"balanced", "deep"})),
+    ToolSpec("outguess", "outguess", "OutGuess password extraction", "steganography", frozenset({"jpeg"}), frozenset({"balanced", "deep"})),
+    ToolSpec("jpseek", "jpseek", "JPHide/JPSeek payload extraction", "steganography", frozenset({"jpeg"}), frozenset({"balanced", "deep"})),
+    ToolSpec("jsteg", "jsteg", "JSteg JPEG coefficient extraction", "steganography", frozenset({"jpeg"}), frozenset({"balanced", "deep"})),
+    ToolSpec("openstego", "openstego", "OpenStego RandomLSB extraction", "steganography", frozenset({"png", "bmp"}), frozenset({"balanced", "deep"})),
     ToolSpec("binwalk", "binwalk", "Binwalk signature scan", "embedded-data", None, frozenset({"balanced", "deep"})),
+    ToolSpec("foremost", "foremost", "Foremost header/footer carving", "embedded-data", None, frozenset({"deep"})),
+    ToolSpec("7z", "7z", "7-Zip embedded/archive listing", "embedded-data", None, frozenset({"deep"})),
     ToolSpec("tiffinfo", "tiffinfo", "libtiff tiffinfo", "structure", frozenset({"tiff"}), frozenset({"balanced", "deep"})),
+    ToolSpec("tiffdump", "tiffdump", "libtiff directory dump", "structure", frozenset({"tiff"}), frozenset({"deep"})),
     ToolSpec("webpinfo", "webpinfo", "WebP RIFF inspection", "structure", frozenset({"webp"}), frozenset({"quick", "balanced", "deep"})),
+    ToolSpec("webpmux", "webpmux", "WebP container and animation inspection", "structure", frozenset({"webp"}), frozenset({"balanced", "deep"})),
     ToolSpec("gifsicle", "gifsicle", "Gifsicle animation inspection", "animation", frozenset({"gif"}), frozenset({"balanced", "deep"})),
+    ToolSpec("tesseract", "tesseract", "Tesseract OCR command-line cross-check", "ocr", None, frozenset({"balanced", "deep"})),
+    ToolSpec("zbarimg", "zbarimg", "ZBar barcode command-line cross-check", "barcodes", None, frozenset({"balanced", "deep"})),
 )
 
 
@@ -55,11 +71,22 @@ class ExternalToolRunner:
         profile: str,
         password: str | None,
         work_dir: Path,
+        ocr_language: str = "eng",
+        selected_tools: set[str] | None = None,
+        zsteg_mode: str = "all",
+        allow_extraction: bool = True,
+        max_extracted_files: int = 32,
     ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         for spec in TOOL_SPECS:
             if cancel_requested(self.is_cancelled):
                 results.append(self._not_run(spec, "cancelled", "Job cancellation was requested."))
+                continue
+            if selected_tools is not None and spec.tool_id not in selected_tools:
+                results.append(self._not_run(spec, "skipped", "Disabled in this job's analysis settings."))
+                continue
+            if not allow_extraction and spec.tool_id in {"foremost", "jpseek", "openstego", "outguess", "steghide", "stegseek"}:
+                results.append(self._not_run(spec, "skipped", "External payload extraction is disabled in this job's settings."))
                 continue
             if spec.kinds is not None and kind not in spec.kinds:
                 results.append(self._not_run(spec, "skipped", f"Not applicable to detected {kind} input."))
@@ -71,7 +98,19 @@ class ExternalToolRunner:
             if executable is None:
                 results.append(self._not_run(spec, "missing", f"Optional executable {spec.executable!r} was not found on PATH."))
                 continue
-            results.append(self._run_spec(spec, Path(executable), path, profile, password, work_dir))
+            results.append(
+                self._run_spec(
+                    spec,
+                    Path(executable),
+                    path,
+                    profile,
+                    password,
+                    work_dir,
+                    ocr_language,
+                    zsteg_mode,
+                    max_extracted_files,
+                )
+            )
         return results
 
     def _run_spec(
@@ -82,22 +121,39 @@ class ExternalToolRunner:
         profile: str,
         password: str | None,
         work_dir: Path,
+        ocr_language: str,
+        zsteg_mode: str,
+        max_extracted_files: int,
     ) -> dict[str, Any]:
         extracted_path: Path | None = None
+        extracted_dir: Path | None = None
+        stdin_data: bytes | None = None
         with tempfile.TemporaryDirectory(prefix=f"{spec.tool_id}-", dir=str(work_dir)) as temp_name:
             temp_dir = Path(temp_name)
             if spec.tool_id == "file":
                 argv = [str(executable), "--brief", "--mime-type", str(input_path)]
             elif spec.tool_id == "exiftool":
                 argv = [str(executable), "-j", "-G1", "-s", str(input_path)]
+            elif spec.tool_id == "exiv2":
+                argv = [str(executable), "-pa", str(input_path)]
             elif spec.tool_id == "strings":
                 argv = [str(executable), "-a", "-n", "4", str(input_path)]
+            elif spec.tool_id == "identify":
+                argv = [str(executable), "-verbose", str(input_path)]
             elif spec.tool_id == "pngcheck":
                 argv = [str(executable), "-v", str(input_path)]
+            elif spec.tool_id == "pngcrush":
+                argv = [str(executable), "-n", "-v", str(input_path)]
             elif spec.tool_id == "jpeginfo":
                 argv = [str(executable), "-c", str(input_path)]
+            elif spec.tool_id == "jpegtran":
+                extracted_path = temp_dir / "jpegtran_normalized.jpg"
+                argv = [str(executable), "-copy", "all", "-outfile", str(extracted_path), str(input_path)]
+            elif spec.tool_id == "djpeg":
+                extracted_path = temp_dir / "djpeg_decoded.ppm"
+                argv = [str(executable), "-verbose", "-outfile", str(extracted_path), str(input_path)]
             elif spec.tool_id == "zsteg":
-                argv = [str(executable), "-a", str(input_path)]
+                argv = [str(executable), "--lsb" if zsteg_mode == "lsb" else "-a", str(input_path)]
             elif spec.tool_id == "stegseek":
                 if password is not None:
                     extracted_path = temp_dir / "stegseek_payload.bin"
@@ -106,25 +162,63 @@ class ExternalToolRunner:
                     argv = [str(executable), "--seed", str(input_path)]
                 else:
                     return self._not_run(spec, "skipped", "A password was not supplied; seed scanning is reserved for Deep mode.", executable=str(executable))
+            elif spec.tool_id == "steghide":
+                if password is None:
+                    return self._not_run(spec, "skipped", "A passphrase is required for bounded Steghide extraction.", executable=str(executable))
+                extracted_path = temp_dir / "steghide_payload.bin"
+                argv = [str(executable), "extract", "-sf", str(input_path), "-p", password, "-xf", str(extracted_path), "-f"]
+            elif spec.tool_id == "outguess":
+                if password is None:
+                    return self._not_run(spec, "skipped", "A passphrase is required for bounded OutGuess extraction.", executable=str(executable))
+                extracted_path = temp_dir / "outguess_payload.bin"
+                argv = [str(executable), "-k", password, "-r", str(input_path), str(extracted_path)]
+            elif spec.tool_id == "jpseek":
+                extracted_path = temp_dir / "jpseek_payload.bin"
+                argv = [str(executable), str(input_path), str(extracted_path)]
+                stdin_data = ((password or "") + "\n").encode("utf-8")
+            elif spec.tool_id == "jsteg":
+                argv = [str(executable), "reveal", str(input_path)]
+            elif spec.tool_id == "openstego":
+                extracted_dir = temp_dir / "openstego-output"
+                extracted_dir.mkdir()
+                argv = [
+                    str(executable), "extract", "-a", "randomlsb", "--cryptalgo", "AES128",
+                    "-sf", str(input_path), "-xd", str(extracted_dir), "-p", password or "",
+                ]
             elif spec.tool_id == "binwalk":
                 argv = [str(executable), "--signature", "--quiet", str(input_path)]
+            elif spec.tool_id == "foremost":
+                extracted_dir = temp_dir / "foremost-output"
+                argv = [str(executable), "-Q", "-i", str(input_path), "-o", str(extracted_dir)]
+            elif spec.tool_id == "7z":
+                argv = [str(executable), "l", "-slt", "--", str(input_path)]
             elif spec.tool_id == "tiffinfo":
+                argv = [str(executable), str(input_path)]
+            elif spec.tool_id == "tiffdump":
                 argv = [str(executable), str(input_path)]
             elif spec.tool_id == "webpinfo":
                 argv = [str(executable), str(input_path)]
+            elif spec.tool_id == "webpmux":
+                argv = [str(executable), "-info", str(input_path)]
             elif spec.tool_id == "gifsicle":
                 argv = [str(executable), "--info", str(input_path)]
+            elif spec.tool_id == "tesseract":
+                argv = [str(executable), str(input_path), "stdout", "-l", ocr_language, "--psm", "6"]
+            elif spec.tool_id == "zbarimg":
+                argv = [str(executable), "--quiet", "--raw", str(input_path)]
             else:
                 return self._not_run(spec, "skipped", "No fixed invocation is registered.", executable=str(executable))
 
             started_at = utc_now()
             start = time.monotonic()
-            execution = self._execute(argv, cwd=temp_dir)
+            execution = self._execute(argv, cwd=temp_dir, stdin_data=stdin_data)
             duration_ms = int((time.monotonic() - start) * 1000)
-            stdout = self._sanitize(execution["stdout"], input_path, temp_dir)
-            stderr = self._sanitize(execution["stderr"], input_path, temp_dir)
+            stdout = self._sanitize(execution["stdout"], input_path, temp_dir, password)
+            stderr = self._sanitize(execution["stderr"], input_path, temp_dir, password)
             public_argv = self._redacted_argv(spec.tool_id, argv, password, input_path, temp_dir)
             status = execution["status"]
+            if spec.tool_id == "zbarimg" and status == "completed" and execution["return_code"] == 4:
+                execution["return_code"] = 0
             if status == "completed" and execution["return_code"] not in (0, None):
                 status = "failed"
             method: dict[str, Any] = {
@@ -163,18 +257,63 @@ class ExternalToolRunner:
                     size = extracted_path.stat().st_size
                     if 0 < size <= 96 * 1024 * 1024:
                         payload = extracted_path.read_bytes()
+                        labels = {
+                            "stegseek": ("stegseek_payload", "extract Steghide-compatible payload with supplied password"),
+                            "steghide": ("steghide_payload", "extract embedded payload with supplied Steghide password"),
+                            "outguess": ("outguess_payload", "extract embedded payload with supplied OutGuess password"),
+                            "jpegtran": ("jpegtran_normalized", "losslessly normalize JPEG markers and entropy stream"),
+                            "djpeg": ("djpeg_decoded", "decode JPEG pixels to a PPM validation artifact"),
+                            "jpseek": ("jpseek_payload", "extract a JPHide payload with JPSeek"),
+                        }
+                        label, transformation = labels.get(spec.tool_id, (f"{spec.tool_id}_output", "external tool output"))
                         method["extracted"].append({
-                            "label": "stegseek_payload", "data": payload, "producer": "stegseek",
-                            "transformation": "extract Steghide-compatible payload with supplied password",
+                            "label": label, "data": payload, "producer": spec.tool_id,
+                            "transformation": transformation,
                             "offset": None, "kind": sniff_kind(payload),
                         })
                     elif size:
                         method["extraction_warning"] = f"Extracted payload size {size} exceeded the adapter limit."
                 except OSError as exc:
                     method["extraction_warning"] = f"Could not read extracted payload: {display_text(exc, 200)}"
+            if extracted_dir and extracted_dir.is_dir():
+                extracted_count = 0
+                extracted_bytes = 0
+                extraction_limit = max(1, min(64, int(max_extracted_files)))
+                for candidate in sorted(extracted_dir.rglob("*")):
+                    if extracted_count >= extraction_limit:
+                        method["extraction_warning"] = f"Only the first {extraction_limit} extracted files were retained."
+                        break
+                    try:
+                        if candidate.is_symlink() or not candidate.is_file():
+                            continue
+                        size = candidate.stat().st_size
+                        if size <= 0 or size > 96 * 1024 * 1024 or extracted_bytes + size > 192 * 1024 * 1024:
+                            continue
+                        payload = candidate.read_bytes()
+                    except OSError:
+                        continue
+                    relative_name = candidate.relative_to(extracted_dir).as_posix().replace("/", "_")
+                    method["extracted"].append({
+                        "label": f"{spec.tool_id}_{relative_name}",
+                        "data": payload,
+                        "producer": spec.tool_id,
+                        "transformation": f"recover file with {spec.name}",
+                        "offset": None,
+                        "kind": sniff_kind(payload),
+                    })
+                    extracted_count += 1
+                    extracted_bytes += size
+                method["extracted_count"] = extracted_count
             return method
 
-    def _execute(self, argv: list[str], *, cwd: Path, timeout: int | None = None) -> dict[str, Any]:
+    def _execute(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path,
+        timeout: int | None = None,
+        stdin_data: bytes | None = None,
+    ) -> dict[str, Any]:
         status = "completed"
         output_truncated = False
         return_code: int | None = None
@@ -182,7 +321,7 @@ class ExternalToolRunner:
             kwargs: dict[str, Any] = {
                 "args": argv,
                 "cwd": str(cwd),
-                "stdin": subprocess.DEVNULL,
+                "stdin": subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
                 "stdout": stdout_file,
                 "stderr": stderr_file,
                 "shell": False,
@@ -196,6 +335,12 @@ class ExternalToolRunner:
                 process = subprocess.Popen(**kwargs)
             except OSError as exc:
                 return {"status": "failed", "return_code": None, "stdout": "", "stderr": f"{type(exc).__name__}: {display_text(exc, 500)}", "output_truncated": False}
+            if stdin_data is not None and process.stdin is not None:
+                try:
+                    process.stdin.write(stdin_data[:16 * 1024 + 1])
+                    process.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
             deadline = time.monotonic() + (timeout or self.timeout)
             while process.poll() is None:
                 if cancel_requested(self.is_cancelled):
@@ -247,11 +392,19 @@ class ExternalToolRunner:
     def _version(self, spec: ToolSpec, executable: Path) -> str | None:
         if spec.tool_id in self._version_cache:
             return self._version_cache[spec.tool_id]
+        if spec.tool_id == "jpseek":
+            self._version_cache[spec.tool_id] = None
+            return None
         version_args = {
             "exiftool": ["-ver"], "gifsicle": ["--version"], "file": ["--version"],
             "strings": ["--version"], "pngcheck": ["-V"], "jpeginfo": ["--version"],
             "zsteg": ["--version"], "stegseek": ["--version"], "binwalk": ["--version"],
             "tiffinfo": ["--version"], "webpinfo": ["-version"],
+            "exiv2": ["--version"], "identify": ["-version"], "pngcrush": ["-version"],
+            "jpegtran": ["-version"], "djpeg": ["-version"], "steghide": ["--version"],
+            "outguess": ["-h"], "7z": [], "tiffdump": ["--version"], "webpmux": ["-version"],
+            "tesseract": ["--version"], "zbarimg": ["--version"],
+            "foremost": ["-V"], "jpseek": [], "jsteg": ["--help"], "openstego": ["--version"],
         }.get(spec.tool_id, ["--version"])
         result = self._execute([str(executable), *version_args], cwd=executable.parent, timeout=4)
         combined = (result["stdout"] or result["stderr"]).strip().splitlines()
@@ -278,7 +431,7 @@ class ExternalToolRunner:
                 redacted.append("<redacted>")
                 hide_next = False
                 continue
-            if value == "-p":
+            if value in {"-p", "-k"}:
                 redacted.append(value)
                 hide_next = True
             elif password is not None and value == password:
@@ -292,9 +445,11 @@ class ExternalToolRunner:
         return redacted
 
     @staticmethod
-    def _sanitize(text: str, input_path: Path, temp_dir: Path) -> str:
+    def _sanitize(text: str, input_path: Path, temp_dir: Path, password: str | None = None) -> str:
         sanitized = text.replace(str(input_path), f"<input>/{input_path.name}")
         sanitized = sanitized.replace(str(temp_dir), "<temporary>")
+        if password:
+            sanitized = sanitized.replace(password, "<redacted>")
         return sanitized
 
     @staticmethod

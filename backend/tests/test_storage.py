@@ -14,6 +14,7 @@ def new_job(job_id: str = "job-1") -> dict[str, object]:
         "size_bytes": 123,
         "sha256": "a" * 64,
         "flag_prefix": None,
+        "options": {"ocr": False, "max_artifacts": 45},
         "input_relative_path": f"jobs/{job_id}/input/source.png",
         "output_relative_path": f"jobs/{job_id}/output",
     }
@@ -23,6 +24,8 @@ def test_job_state_progress_and_cancellation_are_persistent(tmp_path: Path) -> N
     storage = Storage(tmp_path / "forenscope.sqlite3")
     storage.initialize()
     storage.create_job(new_job())
+
+    assert storage.get_job("job-1")["options"] == {"ocr": False, "max_artifacts": 45}
 
     assert storage.begin_job("job-1")["status"] == "running"
     storage.update_progress("job-1", progress=0.6, stage="Parsing")

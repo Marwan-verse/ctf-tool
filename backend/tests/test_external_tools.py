@@ -31,6 +31,25 @@ def test_pre_requested_cancellation_never_launches_an_external_tool(clean_png: P
     assert all(method["status"] == "cancelled" and method["command"] == [] for method in methods)
 
 
+def test_tool_selection_is_recorded_as_skipped_without_lookup(monkeypatch, clean_png: Path, tmp_path: Path) -> None:
+    looked_up: list[str] = []
+    monkeypatch.setattr(shutil, "which", lambda name: looked_up.append(name) or None)
+    runner = ExternalToolRunner(timeout=1)
+
+    methods = runner.run_all(
+        clean_png,
+        kind="png",
+        profile="deep",
+        password=None,
+        work_dir=tmp_path,
+        selected_tools=set(),
+    )
+
+    assert looked_up == []
+    assert all(method["status"] == "skipped" for method in methods)
+    assert all("settings" in method["summary"] for method in methods)
+
+
 def test_external_output_is_hard_limited(tmp_path: Path) -> None:
     runner = ExternalToolRunner(timeout=5, output_limit=64 * 1024)
 
@@ -58,3 +77,32 @@ def test_password_and_private_paths_are_redacted_from_audit_command(tmp_path: Pa
     assert str(tmp_path) not in rendered
     assert "<redacted>" in public
     assert "<input>/--hostile image.jpg" in public
+
+
+def test_zsteg_mode_uses_explicit_all_or_lsb_switch(monkeypatch, clean_png: Path, tmp_path: Path) -> None:
+    monkeypatch.setattr(shutil, "which", lambda name: sys.executable if name == "zsteg" else None)
+    runner = ExternalToolRunner(timeout=1)
+
+    def fake_execute(argv, *, cwd, timeout=None, stdin_data=None):
+        return {"status": "completed", "return_code": 0, "stdout": "zsteg output", "stderr": "", "output_truncated": False}
+
+    monkeypatch.setattr(runner, "_execute", fake_execute)
+    all_result = runner.run_all(
+        clean_png, kind="png", profile="deep", password=None, work_dir=tmp_path,
+        selected_tools={"zsteg"}, zsteg_mode="all",
+    )
+    lsb_result = runner.run_all(
+        clean_png, kind="png", profile="deep", password=None, work_dir=tmp_path,
+        selected_tools={"zsteg"}, zsteg_mode="lsb",
+    )
+
+    assert next(method for method in all_result if method["id"] == "zsteg")["command"][1] == "-a"
+    assert next(method for method in lsb_result if method["id"] == "zsteg")["command"][1] == "--lsb"
+
+
+def test_tool_output_scrubs_supplied_password(tmp_path: Path) -> None:
+    scrubbed = ExternalToolRunner._sanitize(  # noqa: SLF001 - output redaction contract
+        "tool echoed super-secret-passphrase", tmp_path / "input.jpg", tmp_path / "private", "super-secret-passphrase"
+    )
+    assert "super-secret-passphrase" not in scrubbed
+    assert "<redacted>" in scrubbed

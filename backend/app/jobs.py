@@ -32,6 +32,7 @@ class EngineProtocol(Protocol):
         password: str | None,
         progress_callback: Callable[..., None],
         is_cancelled: Callable[[], bool],
+        options: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -218,6 +219,7 @@ class JobManager:
                 profile=str(job["profile"]),
                 flag_prefix=job.get("flag_prefix"),
                 password=password,
+                options=job.get("options") or {},
                 progress_callback=progress_callback,
                 is_cancelled=is_cancelled,
             )

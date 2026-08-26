@@ -9,7 +9,18 @@ from typing import Any, Iterable
 from .common import byte_entropy, display_text, iter_ascii_strings, normalize_json, sha256_bytes, sniff_kind, utc_now
 
 
-def analyze_visual(path: Any, *, profile: str, max_megapixels: int) -> dict[str, Any]:
+def analyze_visual(
+    path: Any,
+    *,
+    profile: str,
+    max_megapixels: int,
+    enabled: bool = True,
+    lsb_analysis: bool = True,
+    ocr: bool = True,
+    barcodes: bool = True,
+    ocr_language: str = "eng",
+    color_remap_variants: int = 8,
+) -> dict[str, Any]:
     """Decode pixels safely and produce bounded, useful visual transformations."""
     started_at = utc_now()
     start = time.monotonic()
@@ -19,8 +30,12 @@ def analyze_visual(path: Any, *, profile: str, max_megapixels: int) -> dict[str,
         "started_at": started_at, "duration_ms": 0, "summary": "",
         "tool": {"executable": "Pillow", "resolved": None, "version": None},
         "metadata": {}, "properties": {}, "text_records": [], "visuals": [],
-        "stego_streams": [], "findings": [], "integrations": {},
+        "stego_streams": [], "findings": [], "integrations": {}, "submethods": [],
     }
+    if not enabled:
+        result["status"] = "skipped"
+        result["summary"] = "Decoded-pixel analysis was disabled in this job's settings."
+        return result
     try:
         import PIL  # type: ignore
         from PIL import ExifTags, Image, ImageChops, ImageEnhance, ImageFilter, ImageOps  # type: ignore
@@ -71,11 +86,44 @@ def analyze_visual(path: Any, *, profile: str, max_megapixels: int) -> dict[str,
                 opened.seek(0)
                 base = opened.convert("RGBA")
                 result["visuals"].append(_visual("safe_preview", "Safe decoded preview", base, "Pillow", {"operation": "decode and convert to RGBA"}))
+                decomposer_start = len(result["visuals"])
                 _add_pixel_visuals(result, base, profile, Image, ImageOps, ImageChops, ImageEnhance, ImageFilter)
+                decomposer_views = len(result["visuals"]) - decomposer_start
+                result["submethods"].append({
+                    "id": "decomposer", "name": "Bit-layer decomposer", "category": "visual",
+                    "status": "completed", "applicable": True, "started_at": started_at, "duration_ms": 0,
+                    "summary": f"Generated {decomposer_views} channel, threshold, edge, transparency, and bit-plane view(s).",
+                    "tool": {"executable": "Pillow", "resolved": "built-in", "version": getattr(PIL, "__version__", None)},
+                    "details": {"view_count": decomposer_views},
+                })
+                remap_count = _add_color_remaps(result, base, color_remap_variants, ImageOps)
+                result["submethods"].append({
+                    "id": "color_remapping", "name": "Color remapping", "category": "visual",
+                    "status": "completed" if remap_count else "skipped", "applicable": True,
+                    "started_at": started_at if remap_count else None, "duration_ms": 0,
+                    "summary": (
+                        f"Generated {remap_count} deterministic high-contrast color remapping variant(s)."
+                        if remap_count else "Color remapping was configured for zero variants."
+                    ),
+                    "tool": {"executable": "Pillow", "resolved": "built-in", "version": getattr(PIL, "__version__", None)},
+                    "details": {"variant_count": remap_count},
+                })
                 _add_frames(result, opened, profile, Image, ImageChops)
-                _add_lsb_analysis(result, base, profile)
+                if lsb_analysis:
+                    _add_lsb_analysis(result, base, profile)
+                else:
+                    result["integrations"]["built-in-lsb"] = {"status": "skipped", "reason": "Disabled in job settings."}
                 _add_optional_cv(result, base, profile)
-                _add_ocr_and_barcodes(result, base, profile, Image, ImageOps)
+                _add_ocr_and_barcodes(
+                    result,
+                    base,
+                    profile,
+                    Image,
+                    ImageOps,
+                    run_ocr=ocr,
+                    run_barcodes=barcodes,
+                    ocr_language=ocr_language,
+                )
                 result["status"] = "completed"
                 result["summary"] = (
                     f"Decoded {width}x{height} {opened.mode} image; generated {len(result['visuals'])} "
@@ -104,6 +152,33 @@ def _visual(label: str, title: str, image: Any, producer: str, parameters: dict[
         "transformation": parameters.get("operation", title), "parameters": parameters,
         "width": image.width, "height": image.height, "kind": "png",
     }
+
+
+def _add_color_remaps(result: dict[str, Any], base: Any, requested: int, ImageOps: Any) -> int:
+    count = max(0, min(8, int(requested)))
+    if count == 0:
+        return 0
+    grayscale = ImageOps.autocontrast(ImageOps.grayscale(base))
+    palettes = [
+        ("#071a13", "#b9ff66", "#ffffff"),
+        ("#050816", "#22d3ee", "#fef08a"),
+        ("#190a26", "#f472b6", "#fde68a"),
+        ("#001b2e", "#60a5fa", "#f8fafc"),
+        ("#1f1300", "#fb923c", "#fff7ed"),
+        ("#101010", "#ef4444", "#facc15"),
+        ("#00120b", "#34d399", "#dbeafe"),
+        ("#160505", "#a78bfa", "#f0fdf4"),
+    ]
+    for index, (black, mid, white) in enumerate(palettes[:count], start=1):
+        remapped = ImageOps.colorize(grayscale, black=black, white=white, mid=mid, blackpoint=0, midpoint=128, whitepoint=255)
+        result["visuals"].append(_visual(
+            f"color_remap_{index}",
+            f"Color remapping {index}",
+            remapped,
+            "Pillow",
+            {"operation": "deterministic three-tone color remap", "black": black, "mid": mid, "white": white},
+        ))
+    return count
 
 
 def _add_pixel_visuals(result: dict[str, Any], base: Any, profile: str, Image: Any, ImageOps: Any, ImageChops: Any, ImageEnhance: Any, ImageFilter: Any) -> None:
@@ -287,7 +362,17 @@ def _add_optional_cv(result: dict[str, Any], base: Any, profile: str) -> None:
         result["integrations"]["opencv"] = {"status": "failed", "reason": f"{type(exc).__name__}: {display_text(exc, 300)}"}
 
 
-def _add_ocr_and_barcodes(result: dict[str, Any], base: Any, profile: str, Image: Any, ImageOps: Any) -> None:
+def _add_ocr_and_barcodes(
+    result: dict[str, Any],
+    base: Any,
+    profile: str,
+    Image: Any,
+    ImageOps: Any,
+    *,
+    run_ocr: bool,
+    run_barcodes: bool,
+    ocr_language: str,
+) -> None:
     grayscale = ImageOps.grayscale(base)
     variants: list[tuple[str, Any]] = [("original", base.convert("RGB")), ("autocontrast", ImageOps.autocontrast(grayscale))]
     if profile != "quick":
@@ -299,14 +384,23 @@ def _add_ocr_and_barcodes(result: dict[str, Any], base: Any, profile: str, Image
             ("rotate-270", ImageOps.autocontrast(grayscale).rotate(270, expand=True)),
         ])
 
+    if not run_ocr:
+        result["integrations"]["pytesseract"] = {"status": "skipped", "reason": "Disabled in job settings."}
     try:
+        if not run_ocr:
+            raise ImportError
         import pytesseract  # type: ignore
 
         result["integrations"]["pytesseract"] = {"status": "available", "version": getattr(pytesseract, "__version__", None)}
         ocr_limit = 2 if profile == "quick" else len(variants)
         for name, variant in variants[:ocr_limit]:
             try:
-                text = pytesseract.image_to_string(variant, config="--psm 6", timeout=15 if profile != "deep" else 30)
+                text = pytesseract.image_to_string(
+                    variant,
+                    lang=ocr_language,
+                    config="--psm 6",
+                    timeout=15 if profile != "deep" else 30,
+                )
                 if text.strip():
                     result["text_records"].append({"source": f"OCR:{name}", "offset": None, "text": display_text(text, 1_000_000), "confidence_hint": -8})
             except RuntimeError as exc:
@@ -315,10 +409,17 @@ def _add_ocr_and_barcodes(result: dict[str, Any], base: Any, profile: str, Image
                 result["integrations"]["pytesseract"] = {"status": "failed", "reason": f"{type(exc).__name__}: {display_text(exc, 300)}"}
                 break
     except ImportError:
-        result["integrations"]["pytesseract"] = {"status": "missing", "reason": "pytesseract is not installed."}
+        if not run_ocr:
+            pass
+        else:
+            result["integrations"]["pytesseract"] = {"status": "missing", "reason": "pytesseract is not installed."}
 
     barcode_count = 0
+    if not run_barcodes:
+        result["integrations"]["pyzbar"] = {"status": "skipped", "reason": "Disabled in job settings."}
     try:
+        if not run_barcodes:
+            raise ImportError
         from pyzbar.pyzbar import decode as zbar_decode  # type: ignore
 
         result["integrations"]["pyzbar"] = {"status": "available"}
@@ -335,10 +436,13 @@ def _add_ocr_and_barcodes(result: dict[str, Any], base: Any, profile: str, Image
                 result["integrations"]["pyzbar"] = {"status": "failed", "reason": f"{type(exc).__name__}: {display_text(exc, 300)}"}
                 break
     except (ImportError, OSError) as exc:
-        result["integrations"]["pyzbar"] = {"status": "missing", "reason": f"pyzbar or its native ZBar library is unavailable: {display_text(exc, 200)}"}
+        if run_barcodes:
+            result["integrations"]["pyzbar"] = {"status": "missing", "reason": f"pyzbar or its native ZBar library is unavailable: {display_text(exc, 200)}"}
 
     # OpenCV QR decoding is a useful independent fallback/cross-check.
     try:
+        if not run_barcodes:
+            raise ImportError
         import cv2  # type: ignore
         import numpy as np  # type: ignore
 

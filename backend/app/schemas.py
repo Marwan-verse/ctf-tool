@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ScanProfile(StrEnum):
@@ -25,6 +25,66 @@ class JobStatus(StrEnum):
     @property
     def terminal(self) -> bool:
         return self in {self.COMPLETED, self.FAILED, self.CANCELLED}
+
+
+class AnalysisOptions(BaseModel):
+    """User-configurable analysis controls with hard safety bounds."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    structure_analysis: bool = True
+    visual_analysis: bool = True
+    lsb_analysis: bool = True
+    ocr: bool = True
+    barcodes: bool = True
+    recursive_extraction: bool = True
+    decoders: bool = True
+    repairs: bool = True
+    external_tools: bool = True
+    external_extraction: bool = True
+    max_recursion_depth: int = Field(default=3, ge=1, le=4)
+    max_artifacts: int = Field(default=100, ge=25, le=500)
+    tool_timeout_seconds: int = Field(default=60, ge=5, le=180)
+    external_output_kib: int = Field(default=1024, ge=64, le=2048)
+    max_external_files: int = Field(default=32, ge=1, le=64)
+    color_remap_variants: int = Field(default=8, ge=0, le=8)
+    zsteg_mode: Literal["all", "lsb"] = "all"
+    ocr_language: str = Field(default="eng", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_+\-]+$")
+    selected_external_tools: list[str] | None = Field(default=None, max_length=64)
+
+    @classmethod
+    def for_profile(cls, profile: ScanProfile | str) -> "AnalysisOptions":
+        profile_name = str(profile)
+        budgets = {
+            "quick": (2, 45, 20, 512, 16, 4),
+            "balanced": (3, 100, 60, 1024, 32, 8),
+            "deep": (4, 220, 180, 2048, 64, 8),
+        }
+        recursion, artifacts, timeout, output_kib, external_files, remaps = budgets.get(profile_name, budgets["balanced"])
+        return cls(
+            max_recursion_depth=recursion,
+            max_artifacts=artifacts,
+            tool_timeout_seconds=timeout,
+            external_output_kib=output_kib,
+            max_external_files=external_files,
+            color_remap_variants=remaps,
+        )
+
+    @field_validator("selected_external_tools")
+    @classmethod
+    def unique_tool_ids(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            tool_id = item.strip().lower()
+            if not tool_id or len(tool_id) > 64:
+                raise ValueError("External tool identifiers must contain 1 to 64 characters.")
+            if tool_id not in seen:
+                seen.add(tool_id)
+                normalized.append(tool_id)
+        return normalized
 
 
 class ArtifactResponse(BaseModel):
@@ -56,6 +116,7 @@ class JobResponse(BaseModel):
     size_bytes: int = Field(ge=0)
     sha256: str
     flag_prefix: str | None = None
+    options: AnalysisOptions = Field(default_factory=AnalysisOptions)
     progress: float = Field(ge=0, le=1)
     current_stage: str | None = None
     cancel_requested: bool = False
@@ -94,7 +155,34 @@ class CapabilitiesResponse(BaseModel):
     analysis_categories: list[str]
     exports: list[str]
     tools: list[dict[str, Any]]
+    builtin_tools: list[dict[str, Any]]
+    option_defaults: dict[str, dict[str, Any]]
     limits: dict[str, int | float]
+
+
+class ToolDownloadRequest(BaseModel):
+    """Explicit request to download allowlisted tool installers."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    tool_ids: list[str] = Field(min_length=1, max_length=64)
+    confirmed: bool
+
+    @field_validator("tool_ids")
+    @classmethod
+    def normalize_tool_ids(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            tool_id = item.strip().lower()
+            if not tool_id or len(tool_id) > 64:
+                raise ValueError("Tool identifiers must contain 1 to 64 characters.")
+            if tool_id not in seen:
+                seen.add(tool_id)
+                normalized.append(tool_id)
+        if not normalized:
+            raise ValueError("At least one tool identifier is required.")
+        return normalized
 
 
 class MessageResponse(BaseModel):

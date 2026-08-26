@@ -23,14 +23,22 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         file \
+        binutils \
+        binwalk \
+        foremost \
+        outguess \
+        default-jre-headless \
+        exiv2 \
         gifsicle \
         imagemagick \
         libimage-exiftool-perl \
         libjpeg-turbo-progs \
         libmagic1 \
         libtiff-tools \
+        jpeginfo \
         p7zip-full \
         pngcheck \
+        pngcrush \
         ruby \
         steghide \
         tesseract-ocr \

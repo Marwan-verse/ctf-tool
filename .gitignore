@@ -40,6 +40,7 @@ web/.wrangler/
 web/.open-next/
 web/coverage/
 web/dist/
+generated-assets/
 *.tsbuildinfo
 
 # Editors and operating systems

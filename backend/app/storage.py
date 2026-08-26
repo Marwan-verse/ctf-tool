@@ -77,6 +77,7 @@ class Storage:
                         size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
                         sha256 TEXT NOT NULL,
                         flag_prefix TEXT,
+                        options_json TEXT NOT NULL DEFAULT '{}',
                         input_relative_path TEXT NOT NULL,
                         output_relative_path TEXT NOT NULL,
                         progress REAL NOT NULL DEFAULT 0 CHECK(progress >= 0 AND progress <= 1),
@@ -125,6 +126,12 @@ class Storage:
                         ON artifacts(job_id, created_at, id);
                     """
                 )
+                columns = {
+                    str(row["name"])
+                    for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+                }
+                if "options_json" not in columns:
+                    connection.execute("ALTER TABLE jobs ADD COLUMN options_json TEXT NOT NULL DEFAULT '{}'")
                 connection.commit()
             self._initialized = True
 
@@ -157,6 +164,7 @@ class Storage:
             return None
         item = dict(row)
         report_json = item.pop("report_json", None)
+        item["options"] = _json_load(item.pop("options_json", None), {})
         item["result"] = _json_load(report_json, None)
         item["cancel_requested"] = bool(item.get("cancel_requested"))
         return item
@@ -187,10 +195,10 @@ class Storage:
                 """
                 INSERT INTO jobs(
                     id, status, profile, original_filename, content_type,
-                    size_bytes, sha256, flag_prefix, input_relative_path,
+                    size_bytes, sha256, flag_prefix, options_json, input_relative_path,
                     output_relative_path, progress, current_stage,
                     cancel_requested, created_at, updated_at
-                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, 0, 'Queued', 0, ?, ?)
+                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'Queued', 0, ?, ?)
                 """,
                 (
                     values["id"],
@@ -200,6 +208,7 @@ class Storage:
                     int(values["size_bytes"]),
                     values["sha256"],
                     values.get("flag_prefix"),
+                    _json_dump(values.get("options") or {}),
                     values["input_relative_path"],
                     values["output_relative_path"],
                     timestamp,

@@ -178,6 +178,7 @@ class AnalysisEngine:
         password: str | None,
         progress_callback: Callable[..., Any] | None,
         is_cancelled: Callable[[], bool] | Any,
+        options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         profile = (profile or "balanced").lower().strip()
         if profile not in PROFILE_LIMITS:
@@ -190,7 +191,33 @@ class AnalysisEngine:
         if not destination.is_dir():
             raise ValueError("output_dir must identify a directory")
 
+        analysis_options = {
+            "structure_analysis": True,
+            "visual_analysis": True,
+            "lsb_analysis": True,
+            "ocr": True,
+            "barcodes": True,
+            "recursive_extraction": True,
+            "decoders": True,
+            "repairs": True,
+            "external_tools": True,
+            "external_extraction": True,
+            "external_output_kib": 1024,
+            "max_external_files": 32,
+            "color_remap_variants": 8,
+            "zsteg_mode": "all",
+            "ocr_language": "eng",
+            "selected_external_tools": None,
+        }
+        if isinstance(options, dict):
+            analysis_options.update(options)
         limits = dict(PROFILE_LIMITS[profile])
+        if isinstance(analysis_options.get("max_recursion_depth"), int):
+            limits["recursion_depth"] = max(1, min(4, int(analysis_options["max_recursion_depth"])))
+        if isinstance(analysis_options.get("max_artifacts"), int):
+            limits["max_artifacts"] = max(25, min(500, int(analysis_options["max_artifacts"])))
+        if isinstance(analysis_options.get("tool_timeout_seconds"), int):
+            limits["tool_timeout"] = max(5, min(180, int(analysis_options["tool_timeout_seconds"])))
         job_id = f"analysis-{uuid.uuid4().hex[:12]}"
         started_at = utc_now()
         start_monotonic = time.monotonic()
@@ -255,6 +282,7 @@ class AnalysisEngine:
         derived_queue: deque[tuple[str, bytes, str, int]] = deque()
         processed_artifacts: set[str] = set()
         all_string_seeds: list[dict[str, Any]] = []
+        repair_artifact_ids: list[str] = []
 
         try:
             self._emit(progress_callback, 6, "core", "Scanning raw bytes, signatures, entropy, and strings")
@@ -285,7 +313,11 @@ class AnalysisEngine:
             self._emit(progress_callback, 18, "structure", f"Parsing {source_kind.upper()} structure")
             check_cancelled(is_cancelled)
             structure_start = time.monotonic()
-            if read_truncated:
+            if not analysis_options["structure_analysis"]:
+                structure_status = "skipped"
+                structure_summary = "Image-specific structural parsing was disabled in this job's settings."
+                format_root = None
+            elif read_truncated:
                 structure_status = "skipped"
                 structure_summary = "Structural parsing was skipped because the profile did not read the complete source."
                 format_root = None
@@ -321,7 +353,7 @@ class AnalysisEngine:
                             derived_queue.append((artifact_id, extracted["data"], extracted.get("kind") or sniff_kind(extracted["data"]), 1))
                     elif reason:
                         log("warning", f"Skipped derived artifact {extracted['label']}: {reason}", "built-in-structure")
-                for repair in format_root["repairs"]:
+                for repair in format_root["repairs"] if analysis_options["repairs"] else []:
                     artifact_id, _, reason = store.add_bytes(
                         repair["data"], label=repair["label"], parent_id=source_id,
                         producer=repair.get("producer", "built-in-structure"),
@@ -329,6 +361,7 @@ class AnalysisEngine:
                         kind=source_kind, depth=1, repair_candidate=True, reason=repair.get("reason"),
                     )
                     if artifact_id:
+                        repair_artifact_ids.append(artifact_id)
                         add_finding({
                             "severity": "info", "category": "repair", "title": "Derived repair candidate created",
                             "description": "A separate, hashed repair candidate was written; the original evidence was not modified.",
@@ -343,8 +376,24 @@ class AnalysisEngine:
                 "summary": structure_summary, "tool": {"executable": "Python stdlib", "resolved": None, "version": None},
                 "details": normalize_json({"detected_type": source_kind, "properties": format_root["properties"] if format_root else {}}),
             })
+            pcrt_applicable = source_kind == "png" and format_root is not None
+            pcrt_repairs = len(format_root["repairs"]) if pcrt_applicable else 0
+            methods.append({
+                "id": "pcrt", "name": "PCRT-compatible PNG check and repair", "category": "repair",
+                "status": "completed" if pcrt_applicable else "skipped", "applicable": source_kind == "png",
+                "started_at": utc_now() if pcrt_applicable else None, "duration_ms": 0,
+                "summary": (
+                    f"Validated PNG chunks, CRCs, dimensions, trailing data, and {pcrt_repairs} repair candidate(s); "
+                    f"repair output was {'enabled' if analysis_options['repairs'] else 'disabled'}."
+                    if pcrt_applicable
+                    else "PCRT-style PNG repair is only applicable to a completely read PNG input."
+                ),
+                "tool": {"executable": "Forenscope built-in", "resolved": "built-in", "version": "1"},
+                "artifact_ids": repair_artifact_ids,
+                "details": {"repairs_detected": pcrt_repairs, "repair_generation_enabled": bool(analysis_options["repairs"])},
+            })
 
-            if profile == "deep" and not read_truncated:
+            if profile == "deep" and not read_truncated and analysis_options["recursive_extraction"]:
                 self._emit(progress_callback, 27, "carving", "Carving bounded embedded signatures")
                 carved_count = self._carve_signatures(core_details["magic_offsets"], source_data, source_id, store, derived_queue, log)
                 methods.append({
@@ -357,7 +406,7 @@ class AnalysisEngine:
                 methods.append({
                     "id": "built-in-carver", "name": "Bounded signature carver", "category": "embedded-data",
                     "status": "skipped", "applicable": True, "started_at": None, "duration_ms": 0,
-                    "summary": "Signature carving is enabled by the Deep profile.",
+                    "summary": "Signature carving requires Deep mode and recursive extraction to be enabled.",
                     "tool": {"executable": "Python stdlib", "resolved": None, "version": None}, "details": {},
                 })
 
@@ -365,7 +414,7 @@ class AnalysisEngine:
             recursive_start = time.monotonic()
             recursive_processed = 0
             archive_members = 0
-            while derived_queue and len(store.artifacts) < limits["max_artifacts"]:
+            while analysis_options["recursive_extraction"] and derived_queue and len(store.artifacts) < limits["max_artifacts"]:
                 check_cancelled(is_cancelled)
                 artifact_id, artifact_data, artifact_kind, depth = derived_queue.popleft()
                 if artifact_id in processed_artifacts or depth > limits["recursion_depth"]:
@@ -403,16 +452,31 @@ class AnalysisEngine:
                     archive_members += members
             methods.append({
                 "id": "recursive-analysis", "name": "Recursive artifact and archive analysis", "category": "embedded-data",
-                "status": "completed", "applicable": True, "started_at": utc_now(),
+                "status": "completed" if analysis_options["recursive_extraction"] else "skipped",
+                "applicable": True, "started_at": utc_now() if analysis_options["recursive_extraction"] else None,
                 "duration_ms": int((time.monotonic() - recursive_start) * 1000),
-                "summary": f"Recursively inspected {recursive_processed} artifact(s) and safely extracted {archive_members} archive member(s).",
+                "summary": (
+                    f"Recursively inspected {recursive_processed} artifact(s) and safely extracted {archive_members} archive member(s)."
+                    if analysis_options["recursive_extraction"]
+                    else "Recursive extraction was disabled in this job's settings."
+                ),
                 "tool": {"executable": "Python stdlib", "resolved": None, "version": None},
                 "details": {"recursion_depth_limit": limits["recursion_depth"], "artifacts_processed": recursive_processed, "archive_members": archive_members},
             })
 
             self._emit(progress_callback, 46, "visual", "Generating safe pixel, channel, bit-plane, frame, OCR, and barcode views")
             check_cancelled(is_cancelled)
-            visual_result = analyze_visual(source_path, profile=profile, max_megapixels=limits["visual_megapixels"])
+            visual_result = analyze_visual(
+                source_path,
+                profile=profile,
+                max_megapixels=limits["visual_megapixels"],
+                enabled=bool(analysis_options["visual_analysis"]),
+                lsb_analysis=bool(analysis_options["lsb_analysis"]),
+                ocr=bool(analysis_options["ocr"]),
+                barcodes=bool(analysis_options["barcodes"]),
+                ocr_language=str(analysis_options["ocr_language"]),
+                color_remap_variants=int(analysis_options["color_remap_variants"]),
+            )
             for item in visual_result.pop("findings", []):
                 add_finding(item, source_id, "pillow-visual")
             metadata.update({f"pillow:{key}": value for key, value in visual_result.get("metadata", {}).items()})
@@ -426,6 +490,7 @@ class AnalysisEngine:
                     confidence_hint=int(record.get("confidence_hint", 0)),
                 )
             raw_visuals = visual_result.pop("visuals", [])
+            visual_submethods = visual_result.pop("submethods", [])
             for order, item in enumerate(raw_visuals):
                 artifact_id, _, reason = store.add_bytes(
                     item["data"], label=item["label"], parent_id=source_id,
@@ -465,6 +530,23 @@ class AnalysisEngine:
                 elif reason:
                     log("warning", f"Skipped bitstream artifact {stream['label']}: {reason}", "built-in-lsb")
             methods.append(_public_method(visual_result))
+            if visual_submethods:
+                methods.extend(_public_method(method) for method in visual_submethods)
+            else:
+                methods.extend([
+                    {
+                        "id": "decomposer", "name": "Bit-layer decomposer", "category": "visual",
+                        "status": "skipped", "applicable": True, "started_at": None, "duration_ms": 0,
+                        "summary": "Bit-layer decomposition did not run because decoded-pixel analysis was unavailable or disabled.",
+                        "tool": {"executable": "Forenscope built-in", "resolved": "built-in", "version": "1"}, "details": {},
+                    },
+                    {
+                        "id": "color_remapping", "name": "Color remapping", "category": "visual",
+                        "status": "skipped", "applicable": True, "started_at": None, "duration_ms": 0,
+                        "summary": "Color remapping did not run because decoded-pixel analysis was unavailable, disabled, or configured for zero variants.",
+                        "tool": {"executable": "Forenscope built-in", "resolved": "built-in", "version": "1"}, "details": {},
+                    },
+                ])
 
             self._emit(progress_callback, 63, "decoders", "Exploring bounded text encodings and compression layers")
             check_cancelled(is_cancelled)
@@ -473,7 +555,7 @@ class AnalysisEngine:
                 max_depth=limits["decode_depth"], max_nodes=limits["decode_nodes"],
                 max_output=min(limits["max_single_artifact"], 16 * 1024 * 1024),
             )
-            decoded_nodes = decoder.explore(all_string_seeds)
+            decoded_nodes = decoder.explore(all_string_seeds) if analysis_options["decoders"] else []
             decoded_artifact_map: dict[str, str] = {}
             decoder_artifacts = 0
             for node in decoded_nodes:
@@ -501,17 +583,65 @@ class AnalysisEngine:
                         log("warning", f"Skipped decoded artifact {node.node_id}: {reason}", "bounded-decoder")
             methods.append({
                 "id": "bounded-decoder", "name": "Recursive encoding and compression decoder", "category": "decoding",
-                "status": "completed", "applicable": True, "started_at": utc_now(),
+                "status": "completed" if analysis_options["decoders"] else "skipped",
+                "applicable": True, "started_at": utc_now() if analysis_options["decoders"] else None,
                 "duration_ms": int((time.monotonic() - decode_start) * 1000),
-                "summary": f"Explored {len(decoded_nodes)} unique bounded transform result(s) and retained {decoder_artifacts} artifact(s).",
+                "summary": (
+                    f"Explored {len(decoded_nodes)} unique bounded transform result(s) and retained {decoder_artifacts} artifact(s)."
+                    if analysis_options["decoders"]
+                    else "Recursive text and compression decoding was disabled in this job's settings."
+                ),
                 "tool": {"executable": "Python stdlib", "resolved": None, "version": None},
                 "details": {"max_depth": limits["decode_depth"], "max_nodes": limits["decode_nodes"], "result_count": len(decoded_nodes)},
             })
 
             self._emit(progress_callback, 72, "external-tools", "Running applicable optional forensic tools")
             check_cancelled(is_cancelled)
-            runner = ExternalToolRunner(timeout=limits["tool_timeout"], is_cancelled=is_cancelled)
-            external_results = runner.run_all(source_path, kind=source_kind, profile=profile, password=password, work_dir=destination)
+            runner = ExternalToolRunner(
+                timeout=limits["tool_timeout"],
+                output_limit=max(64, min(2048, int(analysis_options["external_output_kib"]))) * 1024,
+                is_cancelled=is_cancelled,
+            )
+            selected_tools = analysis_options.get("selected_external_tools")
+            selected_tool_ids = set(selected_tools) if isinstance(selected_tools, list) else None
+            if not analysis_options["external_tools"]:
+                selected_tool_ids = set()
+            else:
+                excluded_tool_ids: set[str] = set()
+                if not analysis_options["structure_analysis"]:
+                    excluded_tool_ids.update(
+                        spec.tool_id
+                        for spec in TOOL_SPECS
+                        if spec.category in {"metadata", "structure", "animation"}
+                    )
+                if not analysis_options["lsb_analysis"]:
+                    excluded_tool_ids.add("zsteg")
+                if not analysis_options["ocr"]:
+                    excluded_tool_ids.add("tesseract")
+                if not analysis_options["barcodes"]:
+                    excluded_tool_ids.add("zbarimg")
+                if not analysis_options["recursive_extraction"]:
+                    excluded_tool_ids.update({"binwalk", "foremost", "7z"})
+                if not analysis_options["repairs"]:
+                    excluded_tool_ids.add("jpegtran")
+                if excluded_tool_ids:
+                    selected_tool_ids = (
+                        {spec.tool_id for spec in TOOL_SPECS}
+                        if selected_tool_ids is None
+                        else selected_tool_ids
+                    ) - excluded_tool_ids
+            external_results = runner.run_all(
+                source_path,
+                kind=source_kind,
+                profile=profile,
+                password=password,
+                work_dir=destination,
+                ocr_language=str(analysis_options["ocr_language"]),
+                selected_tools=selected_tool_ids,
+                zsteg_mode=str(analysis_options["zsteg_mode"]),
+                allow_extraction=bool(analysis_options["external_extraction"]),
+                max_extracted_files=int(analysis_options["max_external_files"]),
+            )
             for method in external_results:
                 check_cancelled(is_cancelled) if method["status"] not in {"cancelled"} else None
                 method_id = method["id"]
@@ -524,6 +654,7 @@ class AnalysisEngine:
                         if len(all_string_seeds) < limits["max_strings"] * 2:
                             all_string_seeds.append({"source": f"metadata:{key}", "offset": None, "text": text_value})
                 extracted_items = method.pop("extracted", [])
+                extracted_artifact_ids: list[str] = []
                 for extracted in extracted_items:
                     artifact_id, created, reason = store.add_bytes(
                         extracted["data"], label=extracted["label"], parent_id=source_id,
@@ -531,18 +662,42 @@ class AnalysisEngine:
                         offset=extracted.get("offset"), kind=extracted.get("kind"), depth=1,
                     )
                     if artifact_id:
+                        extracted_artifact_ids.append(artifact_id)
                         collector.scan_bytes(extracted["data"], source_artifact_id=artifact_id, method=method_id, confidence_hint=12)
                     elif reason:
                         log("warning", f"Skipped {method_id} artifact {extracted['label']}: {reason}", method_id)
+                method["artifact_ids"] = extracted_artifact_ids
+                method["extracted_count"] = len(extracted_artifact_ids)
                 if method["status"] in {"failed", "timed_out"}:
                     log("warning", method["summary"], method_id, return_code=method.get("return_code"))
                 methods.append(_public_method(method))
 
             # Metadata collected late can contain layered encoding; run a small second pass.
             late_seeds = [seed for seed in all_string_seeds if str(seed.get("source", "")).startswith("metadata:")]
-            if late_seeds:
+            if late_seeds and analysis_options["decoders"]:
                 for node in BoundedDecoder(max_depth=min(2, limits["decode_depth"]), max_nodes=min(30, limits["decode_nodes"])).explore(late_seeds):
                     collector.scan_bytes(node.data, source_artifact_id=source_id, method="metadata-decoder", transform_chain=node.chain, confidence_hint=8)
+
+            methods.extend([
+                {
+                    "id": "spectrogram", "name": "Spectrogram", "category": "audio",
+                    "status": "skipped", "applicable": False, "started_at": None, "duration_ms": 0,
+                    "summary": "Spectrogram analysis is audio-only and will be implemented in Forenscope's Audio section.",
+                    "tool": {"executable": "FFmpeg", "resolved": None, "version": None}, "details": {},
+                },
+                {
+                    "id": "pdfinfo", "name": "pdfinfo", "category": "document",
+                    "status": "skipped", "applicable": False, "started_at": None, "duration_ms": 0,
+                    "summary": "pdfinfo is not applicable to the image section.",
+                    "tool": {"executable": "pdfinfo", "resolved": None, "version": None}, "details": {},
+                },
+                {
+                    "id": "pdfid", "name": "PDFiD", "category": "document",
+                    "status": "skipped", "applicable": False, "started_at": None, "duration_ms": 0,
+                    "summary": "PDFiD is not applicable to the image section.",
+                    "tool": {"executable": "pdfid", "resolved": None, "version": None}, "details": {},
+                },
+            ])
 
             report_status = "completed"
             self._emit(progress_callback, 98, "report", "Normalizing findings, coverage, and artifact lineage")
@@ -567,6 +722,7 @@ class AnalysisEngine:
             "method_status_counts": dict(method_status_counts),
             "missing_optional_tools": missing_optional,
             "optional_tools_declared": [spec.tool_id for spec in TOOL_SPECS],
+            "analysis_options": normalize_json(analysis_options),
             "limits": {
                 "read_bytes": limits["read_bytes"], "max_artifacts": limits["max_artifacts"],
                 "max_derived_bytes": limits["max_artifact_bytes"], "max_single_artifact": limits["max_single_artifact"],

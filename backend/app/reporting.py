@@ -351,6 +351,7 @@ _PUBLIC_JOB_FIELDS = (
     "size_bytes",
     "sha256",
     "flag_prefix",
+    "options",
     "progress",
     "current_stage",
     "cancel_requested",

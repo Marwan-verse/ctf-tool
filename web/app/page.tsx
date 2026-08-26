@@ -4,7 +4,31 @@ import { type CSSProperties, type DragEvent, useCallback, useEffect, useMemo, us
 
 type Profile = 'quick' | 'balanced' | 'deep';
 type Screen = 'setup' | 'running' | 'results';
-type ResultTab = 'overview' | 'candidates' | 'artifacts' | 'visual' | 'metadata' | 'methods';
+type ResultTab = 'overview' | 'candidates' | 'artifacts' | 'visual' | 'metadata' | 'tools' | 'methods';
+type MethodFilter = 'all' | 'completed' | 'missing' | 'skipped' | 'failed';
+type BooleanOptionKey = 'structure_analysis' | 'visual_analysis' | 'lsb_analysis' | 'ocr' | 'barcodes' | 'recursive_extraction' | 'decoders' | 'repairs' | 'external_tools' | 'external_extraction';
+
+type ScanOptions = {
+  structure_analysis: boolean;
+  visual_analysis: boolean;
+  lsb_analysis: boolean;
+  ocr: boolean;
+  barcodes: boolean;
+  recursive_extraction: boolean;
+  decoders: boolean;
+  repairs: boolean;
+  external_tools: boolean;
+  external_extraction: boolean;
+  max_recursion_depth: number;
+  max_artifacts: number;
+  tool_timeout_seconds: number;
+  external_output_kib: number;
+  max_external_files: number;
+  color_remap_variants: number;
+  zsteg_mode: 'all' | 'lsb';
+  ocr_language: string;
+  selected_external_tools: string[] | null;
+};
 
 type Candidate = {
   id?: string;
@@ -64,6 +88,15 @@ type MethodRun = {
   duration_ms?: number;
   findings?: number;
   error?: string;
+  stdout?: string;
+  stderr?: string;
+  command?: string[];
+  artifact_ids?: string[];
+  extracted_count?: number;
+  output_truncated?: boolean;
+  category?: string;
+  tool?: { executable?: string; resolved?: string | null; version?: string | null };
+  details?: Record<string, unknown>;
 };
 
 type Finding = {
@@ -100,6 +133,7 @@ type AnalysisResult = {
   candidates?: Candidate[];
   flag_candidates?: Candidate[];
   artifacts?: Artifact[];
+  options?: ScanOptions;
   findings?: Finding[];
   methods?: MethodRun[];
   coverage?: MethodRun[] | Record<string, unknown>;
@@ -123,6 +157,7 @@ type Job = {
   sha256?: string;
   input_sha256?: string;
   progress?: number;
+  options?: ScanOptions;
   stage?: string;
   current_stage?: string;
   message?: string;
@@ -134,14 +169,33 @@ type Job = {
   [key: string]: unknown;
 };
 
-type Capability = { id?: string; name?: string; available?: boolean; version?: string; category?: string };
+type Capability = { id?: string; name?: string; executable?: string; available?: boolean; version?: string; category?: string; profiles?: string[]; formats?: string[]; download_url?: string; install_hint?: string };
+type ToolDownloadReport = { status?: string; manager?: string | null; bundle_url?: string | null; downloaded_count?: number; total_bytes?: number; message?: string; items?: Array<{ id?: string; status?: string; message?: string; download_url?: string; files?: string[] }> };
 type ActivityItem = { at: string; message: string; stage?: string };
+type MetadataRow = { path: string; value: string };
 
 const API_BASE = (
   process.env.NEXT_PUBLIC_API_URL
   || (typeof window !== 'undefined' ? `${window.location.protocol}//${window.location.hostname}:8000` : 'http://localhost:8000')
 ).replace(/\/$/, '');
 const TERMINAL = new Set(['completed', 'succeeded', 'partial', 'failed', 'cancelled', 'expired']);
+const profileOptionDefaults: Record<Profile, ScanOptions> = {
+  quick: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 2, max_artifacts: 45, tool_timeout_seconds: 20, external_output_kib: 512, max_external_files: 16, color_remap_variants: 4, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
+  balanced: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 3, max_artifacts: 100, tool_timeout_seconds: 60, external_output_kib: 1024, max_external_files: 32, color_remap_variants: 8, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
+  deep: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 4, max_artifacts: 220, tool_timeout_seconds: 180, external_output_kib: 2048, max_external_files: 64, color_remap_variants: 8, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
+};
+const configurableMethods: Array<{ key: BooleanOptionKey; title: string; copy: string }> = [
+  { key: 'structure_analysis', title: 'Structure & metadata', copy: 'Chunks, markers, EXIF, comments, trailers and embedded objects.' },
+  { key: 'visual_analysis', title: 'Pixel laboratory', copy: 'Safe previews, channels, frames, bit planes and pixel statistics.' },
+  { key: 'lsb_analysis', title: 'LSB stream extraction', copy: 'Channel orders, bit positions and byte packing permutations.' },
+  { key: 'ocr', title: 'OCR', copy: 'Tesseract across contrast, threshold and rotated variants.' },
+  { key: 'barcodes', title: 'Barcode & QR decoding', copy: 'ZBar and OpenCV QR cross-checks.' },
+  { key: 'recursive_extraction', title: 'Carving & recursion', copy: 'Embedded signatures, archives and nested image structures.' },
+  { key: 'decoders', title: 'Encoding decoders', copy: 'Base encodings and bounded compression chains.' },
+  { key: 'repairs', title: 'Repair candidates', copy: 'Hashed repair copies while preserving the original.' },
+  { key: 'external_tools', title: 'External CLI tools', copy: 'Run installed command-line analyzers in bounded subprocesses.' },
+  { key: 'external_extraction', title: 'External payload extraction', copy: 'Allow password-gated stego tools to write bounded child artifacts.' },
+];
 const methodGroups = [
   { title: 'Metadata', copy: 'EXIF, XMP, IPTC, ICC', tone: 1 },
   { title: 'Structure', copy: 'Chunks, markers, trailers', tone: 2 },
@@ -159,6 +213,7 @@ const resultTabs: Array<{ id: ResultTab; label: string }> = [
   { id: 'artifacts', label: 'Artifacts' },
   { id: 'visual', label: 'Visual lab' },
   { id: 'metadata', label: 'Metadata' },
+  { id: 'tools', label: 'Tool results' },
   { id: 'methods', label: 'Coverage & logs' },
 ];
 
@@ -252,13 +307,52 @@ function evidenceText(value: unknown) {
   return '';
 }
 
-async function readJson(response: Response) {
-  if (response.ok) return response.json();
+function flattenMetadata(value: unknown, limit = 600): MetadataRow[] {
+  const rows: MetadataRow[] = [];
+  const visit = (current: unknown, path: string, depth: number) => {
+    if (rows.length >= limit) return;
+    if (current === null || current === undefined || typeof current !== 'object' || depth >= 6) {
+      const rendered = typeof current === 'string' ? current : JSON.stringify(current);
+      rows.push({ path: path || 'value', value: rendered === undefined ? String(current) : rendered });
+      return;
+    }
+    const entries = Array.isArray(current)
+      ? current.map((entry, index) => [String(index), entry] as const)
+      : Object.entries(current as Record<string, unknown>);
+    if (!entries.length) rows.push({ path: path || 'value', value: Array.isArray(current) ? '[]' : '{}' });
+    for (const [key, entry] of entries) visit(entry, path ? `${path}.${key}` : key, depth + 1);
+  };
+  visit(value, '', 0);
+  return rows;
+}
+
+function searchable(...values: unknown[]) {
+  return values.map((value) => typeof value === 'string' ? value : JSON.stringify(value ?? '')).join(' ').toLowerCase();
+}
+
+function boundedDisplay(value: string, maximum = 20_000) {
+  return value.length <= maximum ? value : `${value.slice(0, maximum)}\n\n… ${value.length - maximum} more characters are available in the exported report.`;
+}
+
+function methodStatusGroup(method: MethodRun): Exclude<MethodFilter, 'all'> {
+  const status = (method.status || '').toLowerCase();
+  if (['completed', 'success', 'succeeded', 'no_findings'].includes(status)) return 'completed';
+  if (status === 'missing') return 'missing';
+  if (['skipped', 'not_applicable', 'disabled'].includes(status)) return 'skipped';
+  return 'failed';
+}
+
+async function readJson<T = unknown>(response: Response): Promise<T> {
+  if (response.ok) return await response.json() as T;
   let message = `Request failed (${response.status})`;
   try {
-    const data = await response.json();
-    message = data?.detail?.message || data?.detail || data?.error?.message || data?.error || data?.message || message;
-    if (typeof message !== 'string') message = `Request failed (${response.status})`;
+    const data = await response.json() as Record<string, unknown>;
+    const detail = data.detail;
+    const detailMessage = detail && typeof detail === 'object' ? (detail as Record<string, unknown>).message : undefined;
+    const error = data.error;
+    const errorMessage = error && typeof error === 'object' ? (error as Record<string, unknown>).message : undefined;
+    const candidate = detailMessage || (typeof detail === 'string' ? detail : undefined) || errorMessage || (typeof error === 'string' ? error : undefined) || data.message;
+    message = typeof candidate === 'string' ? candidate : message;
   } catch { /* keep the generic safe message */ }
   throw new Error(message);
 }
@@ -267,6 +361,7 @@ export default function Home() {
   const fileInput = useRef<HTMLInputElement>(null);
   const [screen, setScreen] = useState<Screen>('setup');
   const [profile, setProfile] = useState<Profile>('balanced');
+  const [scanOptions, setScanOptions] = useState<ScanOptions>(profileOptionDefaults.balanced);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [flagPrefix, setFlagPrefix] = useState('');
   const [password, setPassword] = useState('');
@@ -276,17 +371,23 @@ export default function Home() {
   const [job, setJob] = useState<Job | null>(null);
   const [recentJobs, setRecentJobs] = useState<Job[]>([]);
   const [capabilities, setCapabilities] = useState<Capability[]>([]);
+  const [toolDownloadReport, setToolDownloadReport] = useState<ToolDownloadReport | null>(null);
+  const [toolDownloadBusy, setToolDownloadBusy] = useState(false);
   const [engineOnline, setEngineOnline] = useState<boolean | null>(null);
   const [error, setError] = useState('');
   const [activity, setActivity] = useState<ActivityItem[]>([]);
   const [activeTab, setActiveTab] = useState<ResultTab>('overview');
   const [candidateFilter, setCandidateFilter] = useState<'all' | 'high' | 'medium' | 'low'>('all');
+  const [methodFilter, setMethodFilter] = useState<MethodFilter>('all');
+  const [resultQuery, setResultQuery] = useState('');
   const [selectedVisual, setSelectedVisual] = useState<VisualView | null>(null);
+  const [selectedArtifact, setSelectedArtifact] = useState<Artifact | null>(null);
 
   const refreshRecent = useCallback(async () => {
     try {
-      const payload = await readJson(await fetch(`${API_BASE}/api/jobs`, { cache: 'no-store' }));
-      setRecentJobs(Array.isArray(payload) ? payload : payload.items || payload.jobs || []);
+      const payload = await readJson<unknown>(await fetch(`${API_BASE}/api/jobs`, { cache: 'no-store' }));
+      const record = payload && typeof payload === 'object' ? payload as { items?: Job[]; jobs?: Job[] } : {};
+      setRecentJobs(Array.isArray(payload) ? payload as Job[] : record.items || record.jobs || []);
     } catch { /* the engine indicator already explains offline state */ }
   }, []);
 
@@ -298,7 +399,8 @@ export default function Home() {
     ]).then(([, capabilityPayload]) => {
       if (!alive) return;
       setEngineOnline(true);
-      setCapabilities(Array.isArray(capabilityPayload) ? capabilityPayload : capabilityPayload.capabilities || capabilityPayload.tools || []);
+      const record = capabilityPayload && typeof capabilityPayload === 'object' ? capabilityPayload as { capabilities?: Capability[]; tools?: Capability[] } : {};
+      setCapabilities(Array.isArray(capabilityPayload) ? capabilityPayload as Capability[] : record.capabilities || record.tools || []);
       refreshRecent();
     }).catch(() => alive && setEngineOnline(false));
     return () => { alive = false; };
@@ -309,6 +411,8 @@ export default function Home() {
     try {
       const next = await readJson(await fetch(`${API_BASE}/api/jobs/${id}`, { cache: 'no-store' })) as Job;
       setJob(next);
+      if (next.profile) setProfile(next.profile);
+      if (next.options) setScanOptions(next.options);
       if (TERMINAL.has(next.status.toLowerCase())) {
         setScreen('results');
         refreshRecent();
@@ -329,13 +433,15 @@ export default function Home() {
       events = new EventSource(`${API_BASE}/api/jobs/${id}/events`);
       const handleEvent = (event: MessageEvent) => {
         try {
-          const envelope = JSON.parse(event.data);
-          const payload = envelope?.data && typeof envelope.data === 'object' ? envelope.data : envelope;
-          const message = payload.message || payload.detail?.message || payload.stage || payload.status;
-          if (message) setActivity((current) => [...current.slice(-19), { at: envelope.created_at || new Date().toISOString(), message: String(message), stage: payload.stage }]);
-          if (payload.job) setJob(payload.job);
+          const envelope = JSON.parse(event.data) as Record<string, unknown>;
+          const payload = (envelope.data && typeof envelope.data === 'object' ? envelope.data : envelope) as Record<string, unknown>;
+          const detail = payload.detail && typeof payload.detail === 'object' ? payload.detail as Record<string, unknown> : undefined;
+          const message = payload.message || detail?.message || payload.stage || payload.status;
+          if (message) setActivity((current) => [...current.slice(-19), { at: String(envelope.created_at || new Date().toISOString()), message: String(message), stage: typeof payload.stage === 'string' ? payload.stage : undefined }]);
+          if (payload.job && typeof payload.job === 'object') setJob(payload.job as Job);
           else if (payload.status || payload.progress !== undefined || payload.stage) setJob((current) => current ? { ...current, ...payload } : current);
-          if (event.type === 'terminal' || TERMINAL.has(String(payload.status || payload.job?.status || '').toLowerCase())) poll();
+          const eventJob = payload.job && typeof payload.job === 'object' ? payload.job as Record<string, unknown> : undefined;
+          if (event.type === 'terminal' || TERMINAL.has(String(payload.status || eventJob?.status || '').toLowerCase())) poll();
         } catch { /* malformed event cannot break polling fallback */ }
       };
       events.onmessage = handleEvent;
@@ -351,27 +457,53 @@ export default function Home() {
 
   const result = job?.result;
   const candidates = useMemo(() => getCandidates(result).slice().sort((a, b) => scoreOf(b) - scoreOf(a)), [result]);
-  const artifacts = useMemo(() => job?.artifacts?.length ? job.artifacts : getArtifacts(result), [job?.artifacts, result]);
+  const artifacts = useMemo(() => job?.artifacts?.length ? job.artifacts : getArtifacts(result), [job, result]);
   const methods = useMemo(() => getMethods(result), [result]);
-  const visuals = useMemo(() => {
-    const publicByEngineId = new Map<string, Artifact>();
+  const publicArtifactsByEngineId = useMemo(() => {
+    const map = new Map<string, Artifact>();
     for (const artifact of artifacts) {
       const engineId = artifact.metadata?.id;
-      if (typeof engineId === 'string') publicByEngineId.set(engineId, artifact);
+      if (typeof engineId === 'string') map.set(engineId, artifact);
     }
+    return map;
+  }, [artifacts]);
+  const visuals = useMemo(() => {
     return getVisuals(result).map((view) => {
-      const publicArtifact = view.artifact_id ? publicByEngineId.get(view.artifact_id) : undefined;
+      const publicArtifact = view.artifact_id ? publicArtifactsByEngineId.get(view.artifact_id) : undefined;
       return publicArtifact ? {
         ...view,
         artifact_id: artifactId(publicArtifact),
         preview_url: publicArtifact.preview_url,
       } : view;
     });
-  }, [artifacts, result]);
+  }, [publicArtifactsByEngineId, result]);
+  const toolMethods = useMemo(() => {
+    return methods.filter((method) => Boolean(method.tool?.executable || method.command?.length || method.stdout || method.stderr || method.details));
+  }, [methods]);
+  const declaredExternalToolIds = useMemo(() => new Set(capabilities.map((capability) => capability.id).filter((id): id is string => Boolean(id))), [capabilities]);
+  const capabilitiesById = useMemo(() => new Map(capabilities.map((capability) => [capability.id || capability.executable || '', capability])), [capabilities]);
   const findings = useMemo(() => result?.findings || [], [result]);
-  const filteredCandidates = candidateFilter === 'all' ? candidates : candidates.filter((candidate) => confidenceBand(candidate) === candidateFilter);
+  const metadataRows = useMemo(() => flattenMetadata(Array.isArray(result?.metadata) ? result?.metadata[0] || {} : result?.metadata || {}), [result]);
+  const normalizedQuery = resultQuery.trim().toLowerCase();
+  const queryMatches = useCallback((...values: unknown[]) => !normalizedQuery || searchable(...values).includes(normalizedQuery), [normalizedQuery]);
+  const filteredCandidates = candidates.filter((candidate) =>
+    (candidateFilter === 'all' || confidenceBand(candidate) === candidateFilter)
+    && queryMatches(candidateValue(candidate), candidateEvidence(candidate), candidate.reasons, candidate.occurrences, candidateTransformChain(candidate))
+  );
+  const filteredArtifacts = artifacts.filter((artifact) => queryMatches(artifactName(artifact), artifactMediaType(artifact), artifact.sha256, artifactOrigin(artifact), artifact.metadata));
+  const filteredMethods = methods.filter((method) =>
+    (methodFilter === 'all' || methodStatusGroup(method) === methodFilter)
+    && queryMatches(methodName(method), method.status, method.summary, method.stdout, method.stderr, method.category)
+  );
+  const filteredToolMethods = toolMethods.filter((method) =>
+    (methodFilter === 'all' || methodStatusGroup(method) === methodFilter)
+    && queryMatches(methodName(method), method.status, method.summary, method.stdout, method.stderr, method.category, method.command, method.tool?.executable, method.extracted_count)
+  );
+  const filteredMetadata = metadataRows.filter((row) => queryMatches(row.path, row.value));
+  const filteredFindings = findings.filter((finding) => queryMatches(finding.title, finding.description, finding.summary, finding.category, finding.method_id));
+  const filteredVisuals = visuals.filter((view) => queryMatches(view.title, view.name, view.kind, view.category));
   const availableTools = capabilities.filter((capability) => capability.available === true).length;
-  const armedMethodCount = 8 + availableTools;
+  const armedMethodCount = 9 + availableTools;
 
   function selectFile(file?: File | null) {
     setError('');
@@ -395,6 +527,7 @@ export default function Home() {
     form.append('profile', profile);
     if (flagPrefix.trim()) form.append('flag_prefix', flagPrefix.trim());
     if (password) form.append('password', password);
+    form.append('options', JSON.stringify(scanOptions));
     try {
       const created = await readJson(await fetch(`${API_BASE}/api/jobs`, { method: 'POST', body: form })) as Job;
       setJob(created);
@@ -423,10 +556,58 @@ export default function Home() {
     setActivity([]);
     setActiveTab('overview');
     setSelectedVisual(null);
+    setSelectedArtifact(null);
+    setResultQuery('');
+    setMethodFilter('all');
+  }
+
+  function chooseProfile(next: Profile) {
+    setProfile(next);
+    const defaults = profileOptionDefaults[next];
+    setScanOptions((current) => ({
+      ...current,
+      max_recursion_depth: defaults.max_recursion_depth,
+      max_artifacts: defaults.max_artifacts,
+      tool_timeout_seconds: defaults.tool_timeout_seconds,
+    }));
+  }
+
+  function toggleExternalTool(toolId: string, enabled: boolean) {
+    const declared = capabilities.map((item) => item.id).filter((item): item is string => Boolean(item));
+    setScanOptions((current) => {
+      const selected = new Set(current.selected_external_tools ?? declared);
+      if (enabled) selected.add(toolId); else selected.delete(toolId);
+      return { ...current, selected_external_tools: [...selected] };
+    });
+  }
+
+  async function downloadMissingTools() {
+    const missing = capabilities.filter((capability) => capability.available !== true).map((capability) => capability.id || capability.executable).filter((id): id is string => Boolean(id));
+    if (!missing.length) {
+      setToolDownloadReport({ status: 'completed', downloaded_count: 0, message: 'All declared tools are already available.' });
+      return;
+    }
+    if (!window.confirm(`Download installers for ${missing.length} missing tool${missing.length === 1 ? '' : 's'}?`)) return;
+    setToolDownloadBusy(true);
+    setToolDownloadReport(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/tools/download`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tool_ids: missing, confirmed: true }),
+      });
+      const report = await readJson<ToolDownloadReport>(response);
+      setToolDownloadReport(report);
+    } catch (caught) {
+      setToolDownloadReport({ status: 'failed', message: caught instanceof Error ? caught.message : 'The tool download could not be started.' });
+    } finally {
+      setToolDownloadBusy(false);
+    }
   }
 
   async function openRecent(recent: Job) {
     setJob(recent);
+    if (recent.profile) setProfile(recent.profile);
+    if (recent.options) setScanOptions(recent.options);
     const id = getJobId(recent);
     if (id) await refreshJob(id);
     setScreen(TERMINAL.has(recent.status.toLowerCase()) ? 'results' : 'running');
@@ -453,7 +634,7 @@ export default function Home() {
           <button className="nav-item disabled" disabled><span>⌁</span>Corrupted files<em>Soon</em></button>
           <p className="nav-label second">Workspace</p>
           <button className="nav-item" onClick={() => document.getElementById('recent-scans')?.scrollIntoView({ behavior: 'smooth' })}><span>◷</span>Recent scans</button>
-          <button className="nav-item" onClick={() => setShowAdvanced(true)}><span>⌘</span>Method library</button>
+          <button className="nav-item" onClick={() => setShowAdvanced(true)}><span>⌘</span>Scan settings</button>
         </nav>
 
         <div className="recent-mini" id="recent-scans">
@@ -528,7 +709,7 @@ export default function Home() {
                 </div>
                 <div className="profile-grid">
                   {profiles.map((item) => (
-                    <button key={item.id} className={`profile-card ${profile === item.id ? 'selected' : ''}`} onClick={() => setProfile(item.id)} aria-pressed={profile === item.id}>
+                    <button key={item.id} className={`profile-card ${profile === item.id ? 'selected' : ''}`} onClick={() => chooseProfile(item.id)} aria-pressed={profile === item.id}>
                       <span className="profile-symbol">{item.symbol}</span>
                       <span><strong>{item.name}</strong><small>{item.copy}</small></span>
                       <em>{item.tag}</em>
@@ -667,8 +848,16 @@ export default function Home() {
             )}
 
             <nav className="result-tabs" aria-label="Analysis result sections">
-              {resultTabs.map((tab) => <button key={tab.id} className={activeTab === tab.id ? 'active' : ''} onClick={() => setActiveTab(tab.id)}>{tab.label}{tab.id === 'candidates' && <span>{candidates.length}</span>}{tab.id === 'artifacts' && <span>{artifacts.length}</span>}</button>)}
+              {resultTabs.map((tab) => <button key={tab.id} className={activeTab === tab.id ? 'active' : ''} onClick={() => setActiveTab(tab.id)}>{tab.label}{tab.id === 'candidates' && <span>{candidates.length}</span>}{tab.id === 'artifacts' && <span>{artifacts.length}</span>}{tab.id === 'metadata' && <span>{metadataRows.length}</span>}{tab.id === 'tools' && <span>{toolMethods.length}</span>}{tab.id === 'methods' && <span>{methods.length}</span>}</button>)}
             </nav>
+
+            <div className="result-search">
+              <span aria-hidden="true">⌕</span>
+              <label className="sr-only" htmlFor="evidence-search">Search all recovered information</label>
+              <input id="evidence-search" type="search" value={resultQuery} onChange={(event) => setResultQuery(event.target.value)} placeholder="Search flags, metadata, hashes, artifacts and tool output…" />
+              {resultQuery && <button onClick={() => setResultQuery('')} aria-label="Clear evidence search">Clear</button>}
+              <small>{resultQuery ? `${filteredCandidates.length + filteredArtifacts.length + filteredToolMethods.length + filteredMetadata.length} matching records` : `${candidates.length + artifacts.length + toolMethods.length + metadataRows.length} indexed records`}</small>
+            </div>
 
             <div className="result-content">
               {activeTab === 'overview' && (
@@ -682,13 +871,13 @@ export default function Home() {
                   <section className="findings-panel">
                     <div className="section-title"><div><p className="eyebrow">Notable evidence</p><h2>What deserves attention</h2></div><span>{findings.length} findings</span></div>
                     <div className="finding-list">
-                      {findings.slice(0, 8).map((finding, index) => (
+                      {filteredFindings.slice(0, 8).map((finding, index) => (
                         <article key={finding.id || `${finding.title}-${index}`}>
                           <span className="finding-index">{String(index + 1).padStart(2, '0')}</span>
                           <div><strong>{finding.title || finding.category || 'Forensic finding'}</strong><p>{finding.description || finding.summary || finding.evidence || 'Evidence recorded by the analysis engine.'}</p><small>{finding.method_id || finding.method || finding.category}{finding.offset !== undefined ? ` · offset 0x${finding.offset.toString(16)}` : ''}</small></div>
                         </article>
                       ))}
-                      {!findings.length && <div className="empty-state"><span>✓</span><strong>No structural warnings were reported</strong><p>Review method coverage for skipped or unavailable tools.</p></div>}
+                      {!filteredFindings.length && <div className="empty-state"><span>✓</span><strong>{resultQuery ? 'No findings match this search' : 'No structural warnings were reported'}</strong><p>Review method coverage for skipped or unavailable tools.</p></div>}
                     </div>
                   </section>
                 </div>
@@ -701,7 +890,7 @@ export default function Home() {
                     {filteredCandidates.map((candidate, index) => (
                       <article className="candidate-card" key={candidate.id || `${candidateValue(candidate)}-${index}`}>
                         <div className={`score-orb ${confidenceBand(candidate)}`}><strong>{scoreOf(candidate)}</strong><small>%</small></div>
-                        <div className="candidate-main"><div><span className={`confidence-chip ${confidenceBand(candidate)}`}>{confidenceBand(candidate)} confidence</span><small>Candidate {String(index + 1).padStart(2, '0')}</small></div><code>{candidateValue(candidate)}</code><p>{candidateEvidence(candidate)}</p>{candidateTransformChain(candidate).length ? <div className="transform-chain">{candidateTransformChain(candidate).map((step) => <span key={step}>{step}</span>)}</div> : null}</div>
+                        <div className="candidate-main"><div><span className={`confidence-chip ${confidenceBand(candidate)}`}>{confidenceBand(candidate)} confidence</span><small>Candidate {String(index + 1).padStart(2, '0')}</small></div><code>{candidateValue(candidate)}</code><p>{candidateEvidence(candidate)}</p>{candidateTransformChain(candidate).length ? <div className="transform-chain">{candidateTransformChain(candidate).map((step) => <span key={step}>{step}</span>)}</div> : null}{(candidate.reasons?.length || candidate.occurrences?.length) ? <details className="evidence-trace"><summary>Show evidence trace</summary>{candidate.reasons?.map((reason) => <p key={reason}>✓ {reason}</p>)}{candidate.occurrences?.map((occurrence, occurrenceIndex) => <p key={`${occurrence.method}-${occurrence.offset}-${occurrenceIndex}`}><strong>{occurrence.method || 'analyzer'}</strong>{occurrence.offset !== null && occurrence.offset !== undefined ? ` · offset 0x${occurrence.offset.toString(16)}` : ''}{occurrence.artifact_id ? ` · ${occurrence.artifact_id}` : ''}</p>)}</details> : null}</div>
                         <button onClick={() => navigator.clipboard?.writeText(candidateValue(candidate))}>Copy</button>
                       </article>
                     ))}
@@ -713,14 +902,17 @@ export default function Home() {
               {activeTab === 'artifacts' && (
                 <section className="tab-panel">
                   <div className="section-title"><div><p className="eyebrow">Extraction lineage</p><h2>Recovered artifact tree</h2></div><span>{formatBytes(artifacts.reduce((sum, item) => sum + artifactSize(item), 0))} total</span></div>
-                  <div className="artifact-table" role="table" aria-label="Recovered artifacts">
-                    <div className="artifact-head" role="row"><span>Name</span><span>Type</span><span>Size</span><span>SHA-256</span><span /></div>
-                    {artifacts.map((artifact, index) => {
-                      const id = artifactId(artifact);
-                      const download = normalizeUrl(artifact.download_url) || `${API_BASE}/api/jobs/${jobId}/artifacts/${id}?download=1`;
-                      return <div className="artifact-row" role="row" key={id || index} style={{ '--depth': Math.min(artifactDepth(artifact), 4) } as CSSProperties}><span><i>{artifact.parent_id || artifactDepth(artifact) ? '└' : '◆'}</i><strong>{artifactName(artifact)}</strong><small>{artifactOrigin(artifact)}</small></span><span><em>{artifactMediaType(artifact)}</em></span><span>{formatBytes(artifactSize(artifact))}</span><span className="mono">{artifact.sha256?.slice(0, 12) || '—'}</span><a href={download} download aria-label={`Download ${artifactName(artifact)}`}>↓</a></div>;
-                    })}
-                    {!artifacts.length && <div className="empty-state large"><span>⌁</span><strong>No child artifacts were recovered</strong><p>The original evidence and method logs are still included in the report.</p></div>}
+                  <div className="artifact-workspace">
+                    <div className="artifact-table" role="table" aria-label="Recovered artifacts">
+                      <div className="artifact-head" role="row"><span>Name</span><span>Type</span><span>Size</span><span>SHA-256</span><span /></div>
+                      {filteredArtifacts.map((artifact, index) => {
+                        const id = artifactId(artifact);
+                        const download = normalizeUrl(artifact.download_url) || `${API_BASE}/api/jobs/${jobId}/artifacts/${id}?download=1`;
+                        return <div className={`artifact-row ${artifactId(selectedArtifact || {}) === id ? 'selected' : ''}`} role="row" key={id || index} style={{ '--depth': Math.min(artifactDepth(artifact), 4) } as CSSProperties}><span><i>{artifact.parent_id || artifactDepth(artifact) ? '└' : '◆'}</i><button className="artifact-open" onClick={() => setSelectedArtifact(artifact)}><strong>{artifactName(artifact)}</strong><small>{artifactOrigin(artifact)}</small></button></span><span><em>{artifactMediaType(artifact)}</em></span><span>{formatBytes(artifactSize(artifact))}</span><span className="mono">{artifact.sha256?.slice(0, 12) || '—'}</span><a href={download} download aria-label={`Download ${artifactName(artifact)}`}>↓</a></div>;
+                      })}
+                      {!filteredArtifacts.length && <div className="empty-state large"><span>⌁</span><strong>{resultQuery ? 'No artifacts match this search' : 'No child artifacts were recovered'}</strong><p>The original evidence and method logs are still included in the report.</p></div>}
+                    </div>
+                    {selectedArtifact && <aside className="artifact-inspector"><header><div><p className="eyebrow">Evidence inspector</p><h3>{artifactName(selectedArtifact)}</h3></div><button onClick={() => setSelectedArtifact(null)} aria-label="Close artifact inspector">×</button></header><dl><div><dt>Type</dt><dd>{artifactMediaType(selectedArtifact)}</dd></div><div><dt>Size</dt><dd>{formatBytes(artifactSize(selectedArtifact))}</dd></div><div><dt>Origin</dt><dd>{artifactOrigin(selectedArtifact)}</dd></div><div><dt>Depth</dt><dd>{artifactDepth(selectedArtifact)}</dd></div><div className="full"><dt>SHA-256</dt><dd className="mono">{selectedArtifact.sha256 || 'Unavailable'}</dd></div>{selectedArtifact.parent_id && <div className="full"><dt>Parent</dt><dd className="mono">{selectedArtifact.parent_id}</dd></div>}</dl><details className="raw-details"><summary>Lineage &amp; metadata</summary><pre>{JSON.stringify(selectedArtifact.metadata || {}, null, 2)}</pre></details><a className="inspector-download" href={normalizeUrl(selectedArtifact.download_url) || `${API_BASE}/api/jobs/${jobId}/artifacts/${artifactId(selectedArtifact)}?download=1`} download>Download evidence ↓</a></aside>}
                   </div>
                 </section>
               )}
@@ -730,11 +922,11 @@ export default function Home() {
                   <div className="section-title"><div><p className="eyebrow">Pixel laboratory</p><h2>Channels, bit planes &amp; frames</h2></div><span>{visuals.length} safe previews</span></div>
                   <div className="visual-layout">
                     <div className="visual-grid">
-                      {visuals.map((view, index) => {
+                      {filteredVisuals.map((view, index) => {
                         const preview = normalizeUrl(view.preview_url) || (view.artifact_id ? `${API_BASE}/api/jobs/${jobId}/artifacts/${view.artifact_id}/preview` : '');
                         return <button key={view.id || `${view.name}-${index}`} onClick={() => setSelectedVisual({ ...view, preview_url: preview })} className={selectedVisual?.id === view.id ? 'active' : ''}>{preview ? <SafePreviewImage src={preview} alt={view.title || view.name || `Visual derivative ${index + 1}`} /> : <span className="visual-placeholder">◫</span>}<span><strong>{view.title || view.name || `View ${index + 1}`}</strong><small>{view.kind || 'Derived image'}</small></span></button>;
                       })}
-                      {!visuals.length && <div className="empty-state large"><span>◫</span><strong>No visual derivatives are available</strong><p>Pillow-based views appear here when the optional image engine is installed.</p></div>}
+                      {!filteredVisuals.length && <div className="empty-state large"><span>◫</span><strong>{resultQuery ? 'No visual views match this search' : 'No visual derivatives are available'}</strong><p>Pillow-based views appear here when the optional image engine is installed.</p></div>}
                     </div>
                     {selectedVisual && <aside className="visual-focus"><button onClick={() => setSelectedVisual(null)} aria-label="Close visual preview">×</button>{selectedVisual.preview_url ? <SafePreviewImage src={selectedVisual.preview_url} alt={selectedVisual.title || selectedVisual.name || 'Selected visual derivative'} /> : null}<strong>{selectedVisual.title || selectedVisual.name}</strong><p>{selectedVisual.kind || 'Derived visual evidence'}</p></aside>}
                   </div>
@@ -745,19 +937,39 @@ export default function Home() {
                 <section className="tab-panel">
                   <div className="section-title"><div><p className="eyebrow">Parsed properties</p><h2>Metadata &amp; structure</h2></div><span>Original values preserved</span></div>
                   <div className="metadata-grid">
-                    {Object.entries(Array.isArray(result?.metadata) ? result?.metadata[0] || {} : result?.metadata || {}).map(([key, value]) => <div key={key}><span>{key.replace(/([A-Z])/g, ' $1').replace(/_/g, ' ')}</span><strong>{typeof value === 'object' ? JSON.stringify(value) : String(value)}</strong></div>)}
-                    {!Object.keys(Array.isArray(result?.metadata) ? result?.metadata[0] || {} : result?.metadata || {}).length && <div className="empty-state large"><span>◇</span><strong>No structured metadata was returned</strong><p>Raw strings and tool output remain available in the exported report.</p></div>}
+                    {filteredMetadata.map((row) => <div key={row.path}><span>{row.path.replace(/([A-Z])/g, ' $1').replace(/_/g, ' ')}</span><strong>{row.value}</strong></div>)}
+                    {!filteredMetadata.length && <div className="empty-state large"><span>◇</span><strong>{resultQuery ? 'No metadata matches this search' : 'No structured metadata was returned'}</strong><p>Raw strings and tool output remain available in the exported report.</p></div>}
                   </div>
                   {result?.structure !== undefined && <details className="raw-details"><summary>Raw structure report</summary><pre>{JSON.stringify(result.structure, null, 2)}</pre></details>}
                 </section>
               )}
 
+              {activeTab === 'tools' && (
+                <section className="tab-panel tool-results-panel">
+                  <div className="section-title"><div><p className="eyebrow">Raw analyzer evidence</p><h2>Tool results</h2></div><span>{toolMethods.length} analyzers · {availableTools} external tools installed</span></div>
+                  <p className="panel-lede">Every built-in and external analyzer is recorded, including skipped and missing tools. Expand a result to inspect the redacted command, bounded stdout/stderr, and any recovered payloads.</p>
+                  <div className="tool-results-list">
+                    {filteredToolMethods.map((method, index) => {
+                      const status = methodStatusGroup(method);
+                      const linkedArtifacts = (method.artifact_ids || []).map((id) => publicArtifactsByEngineId.get(id)).filter((item): item is Artifact => Boolean(item));
+                      return <article className={`tool-result-card ${status}`} key={method.id || `${methodName(method)}-${index}`}>
+                        <div className="tool-result-heading"><span className={`coverage-status ${method.status || 'unknown'}`}>{status === 'completed' ? '✓' : status === 'failed' ? '!' : '·'}</span><div><strong>{methodName(method)}</strong><p>{method.summary || method.error || 'No additional commentary.'}</p><small>{declaredExternalToolIds.has(method.id || method.tool_id || '') ? 'external adapter' : 'built-in analyzer'} · {method.tool?.executable || 'forensics engine'}{method.tool?.version ? ` · v${method.tool.version}` : ''}{method.duration_ms !== undefined ? ` · ${formatDuration(method.duration_ms)}` : ''}{method.extracted_count ? ` · ${method.extracted_count} artifact${method.extracted_count === 1 ? '' : 's'}` : ''}</small></div><em>{method.status || 'recorded'}</em></div>
+                        {status === 'missing' && capabilitiesById.get(method.id || method.tool_id || '')?.download_url ? <a className="missing-tool-link" href={capabilitiesById.get(method.id || method.tool_id || '')?.download_url} target="_blank" rel="noreferrer">Download tool ↗</a> : null}
+                        <details open className="tool-result-details"><summary>Inspect command &amp; output</summary>{method.command?.length ? <div className="tool-command"><span>Command</span><code>{method.command.join(' ')}</code></div> : null}{method.stdout ? <div className="tool-output"><span>stdout</span><pre>{boundedDisplay(method.stdout)}</pre></div> : null}{method.stderr ? <div className="tool-output"><span>stderr</span><pre>{boundedDisplay(method.stderr)}</pre></div> : null}{method.details && Object.keys(method.details).length ? <div className="tool-output"><span>details</span><pre>{boundedDisplay(JSON.stringify(method.details, null, 2))}</pre></div> : null}{method.output_truncated ? <p className="output-note">Output was capped by the configured external-output budget; the full process was not retained.</p> : null}</details>
+                        {linkedArtifacts.length ? <div className="tool-artifacts"><span>Recovered by this tool</span>{linkedArtifacts.map((artifact) => <button key={artifactId(artifact)} onClick={() => { setSelectedArtifact(artifact); setActiveTab('artifacts'); }}><strong>{artifactName(artifact)}</strong><small>{formatBytes(artifactSize(artifact))} · {artifactMediaType(artifact)}</small></button>)}</div> : null}
+                      </article>;
+                    })}
+                    {!filteredToolMethods.length && <div className="empty-state large"><span>⌘</span><strong>{resultQuery ? 'No tool results match this search' : 'No tool results are recorded'}</strong><p>Enable analysis stages in Scan settings or start the local API to see external availability.</p></div>}
+                  </div>
+                </section>
+              )}
+
               {activeTab === 'methods' && (
                 <section className="tab-panel">
-                  <div className="section-title"><div><p className="eyebrow">Coverage statement</p><h2>Every applicable method</h2></div><span>{methods.length} recorded</span></div>
+                  <div className="section-title"><div><p className="eyebrow">Coverage statement</p><h2>Every applicable method</h2></div><div className="filter-pills">{(['all', 'completed', 'missing', 'skipped', 'failed'] as const).map((filter) => <button key={filter} className={methodFilter === filter ? 'active' : ''} onClick={() => setMethodFilter(filter)}>{filter}</button>)}</div></div>
                   <div className="coverage-list">
-                    {methods.map((method, index) => <article key={method.id || `${methodName(method)}-${index}`}><span className={`coverage-status ${method.status || 'unknown'}`}>{['success', 'completed', 'succeeded', 'no_findings'].includes((method.status || '').toLowerCase()) ? '✓' : ['failed', 'tool_error', 'timeout'].includes((method.status || '').toLowerCase()) ? '!' : '·'}</span><div><strong>{methodName(method)}</strong><p>{method.summary || method.error || 'Method completed without additional commentary.'}</p><small>{method.version ? `v${method.version} · ` : ''}{formatDuration(method.duration_ms)}{method.findings !== undefined ? ` · ${method.findings} findings` : ''}</small></div><em>{method.status || 'recorded'}</em></article>)}
-                    {!methods.length && <div className="empty-state large"><span>⌘</span><strong>Coverage records are not available</strong><p>The downloadable report may contain raw tool execution details.</p></div>}
+                    {filteredMethods.map((method, index) => <article key={method.id || `${methodName(method)}-${index}`}><span className={`coverage-status ${method.status || 'unknown'}`}>{methodStatusGroup(method) === 'completed' ? '✓' : methodStatusGroup(method) === 'failed' ? '!' : '·'}</span><div><strong>{methodName(method)}</strong><p>{method.summary || method.error || 'Method completed without additional commentary.'}</p><small>{method.tool?.version || method.version ? `v${method.tool?.version || method.version} · ` : ''}{formatDuration(method.duration_ms)}{method.findings !== undefined ? ` · ${method.findings} findings` : ''}</small>{(method.command?.length || method.stdout || method.stderr || method.details) ? <details open className="method-details"><summary>Inspect output</summary>{method.command?.length ? <code>{method.command.join(' ')}</code> : null}{method.stdout ? <pre>{boundedDisplay(method.stdout)}</pre> : null}{method.stderr ? <pre>{boundedDisplay(method.stderr)}</pre> : null}{method.details ? <pre>{boundedDisplay(JSON.stringify(method.details, null, 2))}</pre> : null}</details> : null}</div><em>{method.status || 'recorded'}</em></article>)}
+                    {!filteredMethods.length && <div className="empty-state large"><span>⌘</span><strong>No coverage records match these filters</strong><p>Clear the search or choose another status filter.</p></div>}
                   </div>
                   {result?.logs?.length ? <details className="raw-details"><summary>Sanitized tool logs</summary><pre>{JSON.stringify(result.logs, null, 2)}</pre></details> : null}
                 </section>
@@ -770,21 +982,47 @@ export default function Home() {
       {showAdvanced && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setShowAdvanced(false)}>
           <section className="method-modal" role="dialog" aria-modal="true" aria-labelledby="method-title">
-            <header><div><p className="eyebrow">Method library</p><h2 id="method-title">What Forenscope will run</h2></div><button onClick={() => setShowAdvanced(false)} aria-label="Close method library">×</button></header>
-            <p className="modal-intro">Methods are routed by detected content, not the filename. Missing optional tools are reported transparently and never fail the complete scan.</p>
-            <div className="method-catalog">
-              {[
-                ['Fingerprint & raw bytes', 'SHA-256 · libmagic · ASCII/UTF-16 strings · entropy · signature carving'],
-                ['Metadata', 'ExifTool · EXIF · XMP · IPTC · ICC · comments · embedded thumbnails'],
-                ['Structure & integrity', 'PNG chunks/CRC · JPEG markers · GIF frames · BMP padding · RIFF · TIFF IFDs · ICO children'],
-                ['Spatial steganography', 'zsteg · RGB/alpha channels · bit planes 0–7 · palette indices · LSB text streams'],
-                ['JPEG steganography', 'Stegseek · Steghide-compatible extraction · marker trailers · optional passwords'],
-                ['Vision', 'Tesseract OCR · QR/barcodes · rotations · thresholds · animation frames'],
-                ['Carving & decoding', 'Binwalk signatures · exact trailers · Base encodings · compression · bounded recursion'],
-                ['Repair laboratory', 'Auditable PNG/JPEG/GIF/BMP repair copies; the original is never modified'],
-              ].map(([title, copy], index) => <article key={title}><span>{String(index + 1).padStart(2, '0')}</span><div><strong>{title}</strong><p>{copy}</p></div><em>{profile === 'quick' && index > 4 ? 'Limited' : profile === 'deep' ? 'Deep' : 'Enabled'}</em></article>)}
+            <header><div><p className="eyebrow">Scan configuration</p><h2 id="method-title">Choose exactly what will run</h2></div><button onClick={() => setShowAdvanced(false)} aria-label="Close scan settings">×</button></header>
+            <p className="modal-intro">Settings are validated by the local engine and saved with the case. Fingerprinting and raw string recovery always run so every result keeps a trustworthy evidence baseline.</p>
+            <div className="method-catalog settings-catalog">
+              <section className="settings-section" aria-labelledby="analysis-switches">
+                <div className="settings-section-title"><div><p className="eyebrow">Analysis stages</p><h3 id="analysis-switches">Method groups</h3></div><span>{configurableMethods.filter((item) => scanOptions[item.key]).length}/{configurableMethods.length} enabled</span></div>
+                <div className="method-settings-grid">
+                  {configurableMethods.map((item) => <label className="setting-toggle" key={item.key}><span><strong>{item.title}</strong><small>{item.copy}</small></span><input type="checkbox" checked={scanOptions[item.key]} onChange={(event) => setScanOptions((current) => ({ ...current, [item.key]: event.target.checked }))} /><i aria-hidden="true" /></label>)}
+                </div>
+              </section>
+
+              <section className="settings-section" aria-labelledby="safety-budgets">
+                <div className="settings-section-title"><div><p className="eyebrow">Resource controls</p><h3 id="safety-budgets">Safety budgets</h3></div><button onClick={() => setScanOptions(profileOptionDefaults[profile])}>Reset {profile}</button></div>
+                <div className="budget-settings">
+                  <label><span>Recursion depth<small>Nested extraction levels</small></span><select value={scanOptions.max_recursion_depth} onChange={(event) => setScanOptions((current) => ({ ...current, max_recursion_depth: Number(event.target.value) }))}>{[1, 2, 3, 4].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+                  <label><span>Artifact ceiling<small>25–500 derived records</small></span><input type="number" min="25" max="500" step="5" value={scanOptions.max_artifacts} onChange={(event) => setScanOptions((current) => ({ ...current, max_artifacts: Math.max(25, Math.min(500, Number(event.target.value) || 25)) }))} /></label>
+                  <label><span>Tool timeout<small>Seconds per external tool</small></span><input type="number" min="5" max="180" step="5" value={scanOptions.tool_timeout_seconds} onChange={(event) => setScanOptions((current) => ({ ...current, tool_timeout_seconds: Math.max(5, Math.min(180, Number(event.target.value) || 5)) }))} /></label>
+                  <label><span>External output<small>KiB retained per tool</small></span><input type="number" min="64" max="2048" step="64" value={scanOptions.external_output_kib} onChange={(event) => setScanOptions((current) => ({ ...current, external_output_kib: Math.max(64, Math.min(2048, Number(event.target.value) || 64)) }))} /></label>
+                  <label><span>Extracted files<small>Maximum child files per tool</small></span><input type="number" min="1" max="64" step="1" value={scanOptions.max_external_files} onChange={(event) => setScanOptions((current) => ({ ...current, max_external_files: Math.max(1, Math.min(64, Number(event.target.value) || 1)) }))} /></label>
+                  <label><span>Color remaps<small>Three-tone visual variants</small></span><select value={scanOptions.color_remap_variants} onChange={(event) => setScanOptions((current) => ({ ...current, color_remap_variants: Number(event.target.value) }))}>{[0, 2, 4, 6, 8].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+                  <label><span>OCR language<small>Tesseract language code</small></span><input value={scanOptions.ocr_language} maxLength={64} pattern="[A-Za-z0-9_+\-]+" onChange={(event) => setScanOptions((current) => ({ ...current, ocr_language: event.target.value.replace(/[^A-Za-z0-9_+\-]/g, '').slice(0, 64) || 'eng' }))} /></label>
+                  <label><span>zsteg mode<small>All combos or only LSB planes</small></span><select value={scanOptions.zsteg_mode} onChange={(event) => setScanOptions((current) => ({ ...current, zsteg_mode: event.target.value as ScanOptions['zsteg_mode'] }))}><option value="all">All checks (zsteg -a)</option><option value="lsb">LSB only (zsteg --lsb)</option></select></label>
+                </div>
+              </section>
+
+              <section className="settings-section" aria-labelledby="external-tools">
+                <div className="settings-section-title"><div><p className="eyebrow">Installed integrations</p><h3 id="external-tools">External tool adapters</h3></div><div className="tool-header-actions"><span>{availableTools}/{capabilities.length} installed</span><button onClick={downloadMissingTools} disabled={toolDownloadBusy || !capabilities.length}>{toolDownloadBusy ? 'Downloading…' : 'Download all missing'}</button></div></div>
+                <p className="install-note">Download all missing collects safe package-manager installers into one bundle; it never runs them. Other tools stay available through their project page. After installing, restart the local API and refresh this panel.</p>
+                {toolDownloadReport && <div className={`tool-download-report ${toolDownloadReport.status || ''}`}><div><strong>{toolDownloadReport.message || 'Tool download finished.'}</strong><small>{toolDownloadReport.downloaded_count ? `${toolDownloadReport.downloaded_count} installer${toolDownloadReport.downloaded_count === 1 ? '' : 's'} downloaded` : 'No installers were downloaded automatically.'}</small></div>{toolDownloadReport.bundle_url ? <a href={`${API_BASE}${toolDownloadReport.bundle_url}`} download>Download bundle ↓</a> : null}</div>}
+                {toolDownloadReport?.items?.length ? <div className="tool-download-items" aria-label="Tool download status"><span className="tool-download-items-title">Download status</span>{toolDownloadReport.items.map((item, index) => <div className="tool-download-item" key={`${item.id || 'tool'}-${index}`}><span><strong>{item.id || 'tool'}</strong><small>{item.message || item.status || 'recorded'}</small></span><em className={item.status || ''}>{item.status || 'unknown'}</em>{item.download_url ? <a href={item.download_url} target="_blank" rel="noreferrer">Project page ↗</a> : null}</div>)}</div> : null}
+                <div className="tool-selection-actions"><button onClick={() => setScanOptions((current) => ({ ...current, selected_external_tools: null }))}>Select all</button><button onClick={() => setScanOptions((current) => ({ ...current, selected_external_tools: [] }))}>Clear all</button></div>
+                <div className="external-tool-grid">
+                  {capabilities.map((capability) => {
+                    const id = capability.id || capability.executable || capability.name || '';
+                    const selected = scanOptions.selected_external_tools === null || scanOptions.selected_external_tools.includes(id);
+                    return <label key={id} className={!capability.available ? 'missing' : ''}><input type="checkbox" disabled={!scanOptions.external_tools} checked={selected} onChange={(event) => toggleExternalTool(id, event.target.checked)} /><span><strong>{capability.name || id}</strong><small>{capability.category || 'forensics'} · {(capability.formats || ['all']).join(', ')}</small></span><em>{capability.available ? 'Installed' : 'Missing'}</em>{!capability.available && capability.download_url ? <a className="tool-download" href={capability.download_url} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>Download</a> : null}</label>;
+                  })}
+                  {!capabilities.length && <p className="tool-empty">Start the local API to inspect optional tool availability.</p>}
+                </div>
+              </section>
             </div>
-            <footer><div><span className="status-dot" /><p><strong>Safety budget active</strong><small>100 MB input · bounded artifacts · no network</small></p></div><button onClick={() => setShowAdvanced(false)}>Done</button></footer>
+            <footer><div><span className="status-dot" /><p><strong>{configurableMethods.filter((item) => scanOptions[item.key]).length} method groups enabled</strong><small>{scanOptions.max_artifacts} artifacts · {scanOptions.max_recursion_depth} levels · {scanOptions.tool_timeout_seconds}s/tool · zsteg {scanOptions.zsteg_mode === 'lsb' ? '--lsb' : '-a'}</small></p></div><button onClick={() => setShowAdvanced(false)}>Apply settings</button></footer>
           </section>
         </div>
       )}
