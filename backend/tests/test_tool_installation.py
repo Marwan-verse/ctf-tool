@@ -56,3 +56,28 @@ def test_unknown_id_never_becomes_a_command(monkeypatch: pytest.MonkeyPatch) -> 
     assert report["status"] == "failed"
     assert report["items"][0]["status"] == "unavailable"
     assert report["items"][0]["channel"] is None
+
+
+def test_shared_winget_audio_package_is_installed_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    tool_ids = ["ffprobe", "ffmpeg_spectrogram", "ffmpeg_pcm"]
+    winget = Path("C:/Windows/System32/winget.exe")
+    ffmpeg = ResolvedTool(source="native", launcher=Path("C:/tools/ffmpeg.exe"), executable="ffmpeg")
+    ffprobe = ResolvedTool(source="native", launcher=Path("C:/tools/ffprobe.exe"), executable="ffprobe")
+    resolved = {"ffprobe": ffprobe, "ffmpeg_spectrogram": ffmpeg, "ffmpeg_pcm": ffmpeg}
+    availability = iter((dict.fromkeys(tool_ids), dict.fromkeys(tool_ids), resolved))
+    installs: list[str] = []
+
+    monkeypatch.setattr(tool_installation, "_availability", lambda _ids=None: next(availability))
+    monkeypatch.setattr(tool_installation, "resolve_executable", lambda name: winget if name == "winget" else None)
+    monkeypatch.setattr(
+        tool_installation,
+        "_run_winget_install",
+        lambda _winget, package_id: installs.append(package_id)
+        or {"status": "completed", "return_code": 0, "output": "ok", "duration_ms": 1},
+    )
+
+    report = tool_installation.install_tools(tool_ids)
+
+    assert installs == ["Gyan.FFmpeg"]
+    assert report["status"] == "completed"
+    assert report["installed_count"] == 3

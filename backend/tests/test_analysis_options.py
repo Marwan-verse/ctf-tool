@@ -16,6 +16,25 @@ def test_options_forbid_unknown_fields_and_unsafe_ocr_language() -> None:
         AnalysisOptions.model_validate({"ocr_language": "eng; touch owned"})
 
 
+def test_audio_options_enforce_bounded_duration_and_known_fft_sizes() -> None:
+    with pytest.raises(ValidationError):
+        AnalysisOptions.model_validate({"audio_analysis_seconds": 301})
+    with pytest.raises(ValidationError):
+        AnalysisOptions.model_validate({"audio_spectrogram_fft": 123})
+
+    options = AnalysisOptions.model_validate(
+        {
+            "evidence_type": "audio",
+            "audio_analysis_seconds": 90,
+            "audio_spectrogram_fft": 4096,
+            "audio_channel_mode": "difference",
+            "audio_lsb_bits": 4,
+        }
+    )
+    assert options.audio_analysis_seconds == 90
+    assert options.audio_channel_mode == "difference"
+
+
 def test_engine_honors_disabled_stages_and_custom_budgets(clean_png: Path, tmp_path: Path) -> None:
     report = AnalysisEngine().run(
         input_path=clean_png,

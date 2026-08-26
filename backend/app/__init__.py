@@ -1,4 +1,4 @@
-"""Forenscope local image-forensics API."""
+"""Forenscope local image-and-audio forensics API."""
 
 from __future__ import annotations
 

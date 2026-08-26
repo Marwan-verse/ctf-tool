@@ -43,6 +43,16 @@ class AnalysisOptions(BaseModel):
     repairs: bool = True
     external_tools: bool = True
     external_extraction: bool = True
+    evidence_type: Literal["auto", "image", "audio"] = "auto"
+    audio_spectrogram: bool = True
+    audio_signal_decoders: bool = True
+    audio_sstv: bool = True
+    audio_channel_exports: bool = True
+    audio_audacity_bundle: bool = True
+    audio_analysis_seconds: int = Field(default=180, ge=15, le=300)
+    audio_spectrogram_fft: Literal[256, 512, 1024, 2048, 4096] = 2048
+    audio_channel_mode: Literal["mix", "left", "right", "difference"] = "mix"
+    audio_lsb_bits: int = Field(default=2, ge=1, le=4)
     max_recursion_depth: int = Field(default=3, ge=1, le=4)
     max_artifacts: int = Field(default=100, ge=25, le=500)
     tool_timeout_seconds: int = Field(default=60, ge=5, le=180)
@@ -72,6 +82,9 @@ class AnalysisOptions(BaseModel):
             max_external_files=external_files,
             foremost_depth=foremost_depth,
             color_remap_variants=remaps,
+            audio_analysis_seconds={"quick": 60, "balanced": 180, "deep": 300}.get(profile_name, 180),
+            audio_spectrogram_fft={"quick": 1024, "balanced": 2048, "deep": 4096}.get(profile_name, 2048),
+            audio_lsb_bits={"quick": 1, "balanced": 2, "deep": 4}.get(profile_name, 2),
         )
 
     @field_validator("selected_external_tools")

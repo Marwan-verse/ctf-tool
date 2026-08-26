@@ -1,6 +1,6 @@
 # Forenscope
 
-Forenscope is a local-first CTF image-forensics workbench. Upload an image or damaged image candidate, choose a scan profile, and inspect ranked flag candidates, metadata, extracted artifacts, visual derivatives, and a complete method-coverage record.
+Forenscope is a local-first CTF media-forensics workbench. Upload an image, audio file, or damaged media candidate, choose a scan profile, and inspect ranked flag candidates, metadata, extracted artifacts, visual derivatives, signal analysis, and a complete method-coverage record.
 
 The source file is copied into an isolated job directory, hashed, and never modified. Derived evidence is bounded, hashed, and linked to its parent. Scans make no network calls; network access is used only when you explicitly confirm automatic tool installation.
 
@@ -41,11 +41,17 @@ The bounded CLI adapter library currently includes:
 
 Every adapter is optional. The GUI reports it as installed, missing, disabled, inapplicable, timed out, or completed; a missing tool never hides the rest of the scan. The zsteg setting is explicit: `-a` checks all known channel/bit-depth combinations, while `--lsb` restricts the run to LSB checks. The Tool results tab exposes each redacted command, bounded stdout/stderr, exit state, and linked extracted artifacts.
 
-Audio-only spectrogram and document-only `pdfinfo`/PDFiD analyzers are represented as explicit out-of-scope coverage records in the image section; they are reserved for the planned Audio and corrupted-file sections.
+## Audio analysis coverage
+
+Choose **Audio** in the sidebar to inspect WAV, MP3, FLAC, Ogg/Opus, M4A/AAC, AIFF, AU, WMA/ASF, AMR, CAF, MIDI, and damaged audio candidates. The built-in WAV analyzer creates an interactive audio handoff, waveform and spectrogram views, channel/phase statistics, frequency peaks, silence and clipping findings, DTMF and tentative Morse decoding, RX-SSTV-compatible leader/sync detection, PCM sample-bit extraction, channel/difference WAVs, reversed/normalized WAVs, and an Audacity-compatible label track. All recovered files are linked to the source and can be played or downloaded in the GUI.
+
+Optional audio adapters add FFprobe metadata, FFmpeg PCM conversion and spectrograms, SoX statistics and spectrograms, MediaInfo metadata, Multimon-ng radio/DTMF decoding, Minimodem decoding, and Steghide extraction for supported lossless audio. RX-SSTV and Audacity remain desktop applications, so Forenscope prepares compatible WAV/label files instead of launching an interactive GUI inside the server. Their handoff files appear in **Audio lab** and **Artifacts**.
+
+Document-only `pdfinfo`/PDFiD analyzers remain explicit out-of-scope records until the corrupted-file section is implemented.
 
 ## Configurable scan settings
 
-The settings panel controls structure parsing, visual analysis, LSB streams, OCR, barcodes, recursive extraction, decoders, encrypted-payload recovery, repair generation, external tools, and external payload extraction. It also sets the recursion depth, Foremost carving depth (1–4 bounded passes), artifact ceiling, per-tool timeout, external output budget, extracted-file ceiling, color-remap variants, OCR language, zsteg mode, and the exact external adapters to run. Settings are server-validated and saved with the job; passphrases are never persisted. When a ciphertext-like payload is detected, the engine reports the signal and, if a passphrase was supplied, tries only bounded repeating-key XOR and OpenSSL salted AES-256-CBC recovery. Successful plaintext is written as a hashed child artifact and scanned for flag candidates.
+The settings panel controls structure parsing, visual analysis, LSB streams, OCR, barcodes, recursive extraction, decoders, encrypted-payload recovery, repair generation, external tools, and external payload extraction. Image settings include recursion depth, Foremost carving depth (1–4 bounded passes), color-remap variants, OCR language, and zsteg mode. Audio settings include the maximum analyzed duration, spectrogram FFT size, channel mode, PCM LSB depth, signal/SSTV analysis, channel exports, and Audacity handoff generation. Shared limits cover artifacts, per-tool runtime, external output, and extracted files. Settings are server-validated and saved with the job; passphrases are never persisted. When a ciphertext-like extracted payload is detected, the engine reports the signal and, if a passphrase was supplied, tries only bounded repeating-key XOR and OpenSSL salted AES-256-CBC recovery. Successful plaintext is written as a hashed child artifact and scanned for flag candidates.
 
 Foremost-carved PNG, JPEG, GIF, WebP, and BMP files appear as inline thumbnails in **Tool results**. Selecting a thumbnail opens the artifact inspector with a larger verified preview; other recovered formats remain available through the artifact download and lineage views.
 
@@ -53,7 +59,7 @@ The **Hex view** is a read-only byte inspector for the original upload and every
 
 Results can be searched across flag candidates, provenance, metadata paths and values, artifact names and hashes, method summaries, and bounded tool output. JSON, standalone HTML, and ZIP case exports preserve the same evidence record.
 
-The settings panel also includes **Install all missing**. After an explicit confirmation, the local API installs only fixed, allowlisted packages: Linux-native forensic tools come from Kali WSL's package manager, while supported native utilities use silent Windows Package Manager installs. ZSteg, JSteg, and JPSeek use fixed-version or pinned-source managed installs. No package name, URL, archive, or command comes from the browser, and no manual ZIP extraction is required. The app re-detects every requested command when installation finishes and shows a per-tool diagnostic for anything still unavailable.
+The settings panel also includes **Install all missing**. After an explicit confirmation, the local API installs only fixed, allowlisted packages: Linux-native forensic and audio tools come from Kali WSL's package manager, while supported native utilities use silent Windows Package Manager installs. This includes FFmpeg/FFprobe, SoX, MediaInfo, Multimon-ng, and Minimodem for the Audio section where available. ZSteg, JSteg, and JPSeek use fixed-version or pinned-source managed installs. No package name, URL, archive, or command comes from the browser, and no manual ZIP extraction is required. The app re-detects every requested command when installation finishes and shows a per-tool diagnostic for anything still unavailable.
 
 Detection checks native Windows PATH values, standard install folders, Ruby command wrappers, and the default WSL distribution. A tool found in WSL runs transparently against the uploaded file through its `/mnt/<drive>/...` path. The automatic Linux installer requires a working WSL distribution with root package access; on this Windows setup, Kali WSL is supported directly. For an existing portable Windows directory elsewhere, set `FORENSCOPE_TOOL_PATHS` to a semicolon-separated list of folders before launching the API.
 

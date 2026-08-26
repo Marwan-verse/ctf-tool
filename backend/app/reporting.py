@@ -186,6 +186,16 @@ def sniff_media_type(path: Path) -> tuple[str, bool]:
         return "image/bmp", True
     if len(head) >= 12 and head.startswith(b"RIFF") and head[8:12] == b"WEBP":
         return "image/webp", True
+    if len(head) >= 12 and head.startswith(b"RIFF") and head[8:12] == b"WAVE":
+        return "audio/wav", True
+    if head.startswith(b"fLaC"):
+        return "audio/flac", True
+    if head.startswith(b"OggS"):
+        return "audio/ogg", True
+    if head.startswith(b"ID3") or (len(head) >= 2 and head[0] == 0xFF and head[1] & 0xE6 == 0xE2):
+        return "audio/mpeg", True
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        return "audio/mp4", True
     guessed, _ = mimetypes.guess_type(path.name)
     if guessed in {"text/html", "image/svg+xml", "application/xhtml+xml"}:
         return guessed, False
@@ -204,6 +214,7 @@ def input_artifact_record(
     content_type: str,
     size_bytes: int,
     sha256: str,
+    previewable: bool = False,
 ) -> dict[str, Any]:
     return {
         "id": deterministic_artifact_id(job_id, relative_path),
@@ -215,7 +226,7 @@ def input_artifact_record(
         "media_type": content_type or "application/octet-stream",
         "size_bytes": size_bytes,
         "sha256": sha256,
-        "previewable": False,
+        "previewable": bool(previewable),
         "metadata": {"immutable_source": True},
     }
 
@@ -388,12 +399,21 @@ def job_public_record(job: Mapping[str, Any], artifacts: Sequence[Mapping[str, A
 
 def build_export_payload(job: Mapping[str, Any], artifacts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     public_job = job_public_record(job, artifacts)
+    result = public_job.get("result")
+    options = public_job.get("options") if isinstance(public_job.get("options"), dict) else {}
+    section = (
+        result.get("section")
+        if isinstance(result, dict) and isinstance(result.get("section"), str)
+        else options.get("evidence_type", "image")
+    )
+    if section not in {"image", "audio"}:
+        section = "image"
     return {
         "schema_version": "1.0",
         "exported_at": _utc_now(),
-        "application": {"name": "Forenscope", "section": "image"},
+        "application": {"name": "Forenscope", "section": section},
         "job": {key: value for key, value in public_job.items() if key not in {"result", "artifacts"}},
-        "result": public_job.get("result"),
+        "result": result,
         "artifacts": public_job["artifacts"],
     }
 

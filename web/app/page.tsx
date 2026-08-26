@@ -3,10 +3,11 @@
 import { type CSSProperties, type DragEvent, type FormEvent, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 
 type Profile = 'quick' | 'balanced' | 'deep';
+type EvidenceSection = 'image' | 'audio';
 type Screen = 'setup' | 'running' | 'results';
-type ResultTab = 'overview' | 'candidates' | 'artifacts' | 'visual' | 'metadata' | 'hex' | 'tools' | 'methods';
+type ResultTab = 'overview' | 'audio' | 'candidates' | 'artifacts' | 'visual' | 'metadata' | 'hex' | 'tools' | 'methods';
 type MethodFilter = 'all' | 'completed' | 'missing' | 'skipped' | 'failed';
-type BooleanOptionKey = 'structure_analysis' | 'visual_analysis' | 'lsb_analysis' | 'ocr' | 'barcodes' | 'recursive_extraction' | 'decoders' | 'crypto_analysis' | 'repairs' | 'external_tools' | 'external_extraction';
+type BooleanOptionKey = 'structure_analysis' | 'visual_analysis' | 'lsb_analysis' | 'ocr' | 'barcodes' | 'recursive_extraction' | 'decoders' | 'crypto_analysis' | 'repairs' | 'external_tools' | 'external_extraction' | 'audio_spectrogram' | 'audio_signal_decoders' | 'audio_sstv' | 'audio_channel_exports' | 'audio_audacity_bundle';
 
 type ScanOptions = {
   structure_analysis: boolean;
@@ -20,6 +21,16 @@ type ScanOptions = {
   repairs: boolean;
   external_tools: boolean;
   external_extraction: boolean;
+  evidence_type: 'auto' | 'image' | 'audio';
+  audio_spectrogram: boolean;
+  audio_signal_decoders: boolean;
+  audio_sstv: boolean;
+  audio_channel_exports: boolean;
+  audio_audacity_bundle: boolean;
+  audio_analysis_seconds: number;
+  audio_spectrogram_fft: 256 | 512 | 1024 | 2048 | 4096;
+  audio_channel_mode: 'mix' | 'left' | 'right' | 'difference';
+  audio_lsb_bits: number;
   max_recursion_depth: number;
   max_artifacts: number;
   tool_timeout_seconds: number;
@@ -158,6 +169,18 @@ type AnalysisResult = {
   metadata?: Record<string, unknown> | Array<Record<string, unknown>>;
   structure?: unknown;
   logs?: unknown[];
+  section?: EvidenceSection;
+  audio_analysis?: {
+    metadata?: { properties?: Record<string, unknown>; statistics?: Record<string, unknown>; container?: Record<string, unknown> };
+    signals?: {
+      frequency_peaks?: Array<{ frequency_hz?: number; relative_db?: number }>;
+      silent_segments?: Array<{ start_seconds?: number; end_seconds?: number; duration_seconds?: number }>;
+      ultrasonic_energy_ratio?: number;
+      dtmf?: { symbols?: string; events?: Array<Record<string, unknown>> };
+      morse?: { text?: string; pattern?: string; events?: Array<Record<string, unknown>> };
+      sstv?: { candidate?: boolean; leader_frames?: number; sync_frames?: number; sync_offsets_seconds?: number[]; method?: string };
+    };
+  };
   [key: string]: unknown;
 };
 
@@ -197,9 +220,9 @@ const API_BASE = (
 ).replace(/\/$/, '');
 const TERMINAL = new Set(['completed', 'succeeded', 'partial', 'failed', 'cancelled', 'expired']);
 const profileOptionDefaults: Record<Profile, ScanOptions> = {
-  quick: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 2, max_artifacts: 45, tool_timeout_seconds: 20, external_output_kib: 512, max_external_files: 16, foremost_depth: 1, color_remap_variants: 4, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
-  balanced: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 3, max_artifacts: 100, tool_timeout_seconds: 60, external_output_kib: 1024, max_external_files: 32, foremost_depth: 2, color_remap_variants: 8, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
-  deep: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 4, max_artifacts: 220, tool_timeout_seconds: 180, external_output_kib: 2048, max_external_files: 64, foremost_depth: 4, color_remap_variants: 8, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
+  quick: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, evidence_type: 'auto', audio_spectrogram: true, audio_signal_decoders: true, audio_sstv: true, audio_channel_exports: true, audio_audacity_bundle: true, audio_analysis_seconds: 60, audio_spectrogram_fft: 1024, audio_channel_mode: 'mix', audio_lsb_bits: 1, max_recursion_depth: 2, max_artifacts: 45, tool_timeout_seconds: 20, external_output_kib: 512, max_external_files: 16, foremost_depth: 1, color_remap_variants: 4, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
+  balanced: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, evidence_type: 'auto', audio_spectrogram: true, audio_signal_decoders: true, audio_sstv: true, audio_channel_exports: true, audio_audacity_bundle: true, audio_analysis_seconds: 180, audio_spectrogram_fft: 2048, audio_channel_mode: 'mix', audio_lsb_bits: 2, max_recursion_depth: 3, max_artifacts: 100, tool_timeout_seconds: 60, external_output_kib: 1024, max_external_files: 32, foremost_depth: 2, color_remap_variants: 8, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
+  deep: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, evidence_type: 'auto', audio_spectrogram: true, audio_signal_decoders: true, audio_sstv: true, audio_channel_exports: true, audio_audacity_bundle: true, audio_analysis_seconds: 300, audio_spectrogram_fft: 4096, audio_channel_mode: 'mix', audio_lsb_bits: 4, max_recursion_depth: 4, max_artifacts: 220, tool_timeout_seconds: 180, external_output_kib: 2048, max_external_files: 64, foremost_depth: 4, color_remap_variants: 8, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
 };
 const configurableMethods: Array<{ key: BooleanOptionKey; title: string; copy: string }> = [
   { key: 'structure_analysis', title: 'Structure & metadata', copy: 'Chunks, markers, EXIF, comments, trailers and embedded objects.' },
@@ -220,6 +243,27 @@ const methodGroups = [
   { title: 'Steganography', copy: 'LSB, channels, JPEG', tone: 3 },
   { title: 'Vision', copy: 'OCR and barcodes', tone: 4 },
 ];
+const audioConfigurableMethods: Array<{ key: BooleanOptionKey; title: string; copy: string }> = [
+  { key: 'structure_analysis', title: 'Container & metadata', copy: 'RIFF chunks, codec streams, tags, declared sizes and appended bytes.' },
+  { key: 'visual_analysis', title: 'Waveform laboratory', copy: 'Bounded waveform, signal statistics, phase and channel inspection.' },
+  { key: 'audio_spectrogram', title: 'Spectrograms', copy: 'Built-in STFT plus FFmpeg and SoX visual cross-checks when installed.' },
+  { key: 'lsb_analysis', title: 'PCM sample bits', copy: 'Extract the configured least-significant sample bit planes.' },
+  { key: 'audio_signal_decoders', title: 'Tone & modem decoders', copy: 'DTMF, Morse, frequency peaks, minimodem and multimon-ng.' },
+  { key: 'audio_sstv', title: 'SSTV scan', copy: 'RX-SSTV-style 1900 Hz leader and 1200 Hz sync detection.' },
+  { key: 'audio_channel_exports', title: 'Channel isolation', copy: 'Mono, left, right and stereo-difference review WAVs.' },
+  { key: 'audio_audacity_bundle', title: 'Audacity handoff', copy: 'Normalized/reversed PCM WAVs and an importable label track.' },
+  { key: 'recursive_extraction', title: 'Carving & recursion', copy: 'Embedded signatures, appended archives and recovered media.' },
+  { key: 'decoders', title: 'Encoding decoders', copy: 'Tags, modem text and recovered strings through bounded transforms.' },
+  { key: 'crypto_analysis', title: 'Encrypted payload recovery', copy: 'Inspect extracted sample-bit and carved data with a supplied key.' },
+  { key: 'external_tools', title: 'External audio tools', copy: 'FFmpeg, SoX, FFprobe, MediaInfo and modem adapters.' },
+  { key: 'external_extraction', title: 'External output artifacts', copy: 'Allow tools to create bounded spectrograms and PCM review files.' },
+];
+const audioMethodGroups = [
+  { title: 'Spectrum', copy: 'Waveform and spectrogram', tone: 1 },
+  { title: 'Signals', copy: 'DTMF, Morse and SSTV', tone: 2 },
+  { title: 'Steganography', copy: 'PCM bits and channel phase', tone: 3 },
+  { title: 'Review', copy: 'Audacity WAVs and labels', tone: 4 },
+];
 const profiles: Array<{ id: Profile; symbol: string; name: string; copy: string; tag: string }> = [
   { id: 'quick', symbol: '↯', name: 'Quick', copy: 'Core clues with minimal transforms', tag: 'Fast' },
   { id: 'balanced', symbol: '✦', name: 'Balanced', copy: 'Best coverage for most CTFs', tag: 'Recommended' },
@@ -227,6 +271,7 @@ const profiles: Array<{ id: Profile; symbol: string; name: string; copy: string;
 ];
 const resultTabs: Array<{ id: ResultTab; label: string }> = [
   { id: 'overview', label: 'Overview' },
+  { id: 'audio', label: 'Audio lab' },
   { id: 'candidates', label: 'Flag candidates' },
   { id: 'artifacts', label: 'Artifacts' },
   { id: 'visual', label: 'Visual lab' },
@@ -324,10 +369,24 @@ function normalizeUrl(url?: string) {
   return `${API_BASE}${url.startsWith('/') ? '' : '/'}${url}`;
 }
 const SAFE_PREVIEW_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp']);
+const SAFE_AUDIO_MIME_TYPES = new Set(['audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/ogg', 'audio/flac', 'audio/mp4', 'audio/aac']);
 function artifactPreviewUrl(artifact: Artifact) {
   const raw = artifact.preview_url;
   const mediaType = artifactMediaType(artifact).split(';', 1)[0].trim().toLowerCase();
   if (!raw || !SAFE_PREVIEW_MIME_TYPES.has(mediaType)) return '';
+  if (/^https?:\/\//i.test(raw)) {
+    try {
+      if (new URL(raw).origin !== new URL(API_BASE).origin) return '';
+    } catch {
+      return '';
+    }
+  }
+  return normalizeUrl(raw);
+}
+function artifactAudioUrl(artifact: Artifact) {
+  const raw = artifact.preview_url;
+  const mediaType = artifactMediaType(artifact).split(';', 1)[0].trim().toLowerCase();
+  if (!raw || !SAFE_AUDIO_MIME_TYPES.has(mediaType)) return '';
   if (/^https?:\/\//i.test(raw)) {
     try {
       if (new URL(raw).origin !== new URL(API_BASE).origin) return '';
@@ -403,9 +462,10 @@ async function readJson<T = unknown>(response: Response): Promise<T> {
 
 function HomeWorkbench() {
   const fileInput = useRef<HTMLInputElement>(null);
+  const [evidenceSection, setEvidenceSection] = useState<EvidenceSection>('image');
   const [screen, setScreen] = useState<Screen>('setup');
   const [profile, setProfile] = useState<Profile>('balanced');
-  const [scanOptions, setScanOptions] = useState<ScanOptions>(profileOptionDefaults.balanced);
+  const [scanOptions, setScanOptions] = useState<ScanOptions>({ ...profileOptionDefaults.balanced, evidence_type: 'image' });
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [flagPrefix, setFlagPrefix] = useState('');
   const [password, setPassword] = useState('');
@@ -475,7 +535,11 @@ function HomeWorkbench() {
       const next = await readJson(await fetch(`${API_BASE}/api/jobs/${id}`, { cache: 'no-store' })) as Job;
       setJob(next);
       if (next.profile) setProfile(next.profile);
-      if (next.options) setScanOptions({ ...profileOptionDefaults[next.profile || 'balanced'], ...next.options });
+      if (next.options) {
+        setScanOptions({ ...profileOptionDefaults[next.profile || 'balanced'], ...next.options });
+        if (next.options.evidence_type === 'audio' || next.result?.section === 'audio') setEvidenceSection('audio');
+        else if (next.options.evidence_type === 'image') setEvidenceSection('image');
+      }
       if (TERMINAL.has(next.status.toLowerCase())) {
         setScreen('results');
         refreshRecent();
@@ -519,6 +583,7 @@ function HomeWorkbench() {
   }, [activeJobId, screen, refreshJob]);
 
   const result = job?.result;
+  const isAudioResult = result?.section === 'audio' || job?.options?.evidence_type === 'audio' || evidenceSection === 'audio';
   const candidates = useMemo(() => getCandidates(result).slice().sort((a, b) => scoreOf(b) - scoreOf(a)), [result]);
   const artifacts = useMemo(() => job?.artifacts?.length ? job.artifacts : getArtifacts(result), [job, result]);
   const hexArtifactChoices = useMemo(() => artifacts.filter((artifact) => artifactId(artifact)), [artifacts]);
@@ -596,8 +661,22 @@ function HomeWorkbench() {
   const filteredMetadata = metadataRows.filter((row) => queryMatches(row.path, row.value));
   const filteredFindings = findings.filter((finding) => queryMatches(finding.title, finding.description, finding.summary, finding.category, finding.method_id));
   const filteredVisuals = visuals.filter((view) => queryMatches(view.title, view.name, view.kind, view.category));
-  const availableTools = capabilities.filter((capability) => capability.available === true).length;
-  const armedMethodCount = 10 + availableTools;
+  const audioKinds = new Set(['audio', 'wav', 'aiff', 'flac', 'ogg', 'mp3', 'aac', 'm4a', 'au', 'asf', 'amr', 'caf', 'midi']);
+  const imageKinds = new Set(['png', 'jpeg', 'gif', 'bmp', 'webp', 'tiff', 'ico']);
+  const relevantCapabilities = capabilities.filter((capability) => {
+    const formats = capability.formats || ['all'];
+    if (formats.includes('all')) return true;
+    return formats.some((format) => (evidenceSection === 'audio' ? audioKinds : imageKinds).has(format.toLowerCase()));
+  });
+  const availableTools = relevantCapabilities.filter((capability) => capability.available === true).length;
+  const armedMethodCount = (evidenceSection === 'audio' ? 8 : 10) + availableTools;
+  const activeResultTabs = resultTabs.filter((tab) => tab.id !== 'audio' || isAudioResult);
+  const audioProperties = result?.audio_analysis?.metadata?.properties || {};
+  const audioStatistics = result?.audio_analysis?.metadata?.statistics || {};
+  const audioSignals = result?.audio_analysis?.signals || {};
+  const audioVisuals = visuals.filter((view) => String(view.category || '').startsWith('audio-'));
+  const audioArtifacts = artifacts.filter((artifact) => Boolean(artifactAudioUrl(artifact)));
+  const primaryAudioArtifact = audioArtifacts.find((artifact) => artifact.kind === 'original') || audioArtifacts.find((artifact) => artifactName(artifact).includes('audacity_review_normalized')) || audioArtifacts[0];
 
   function selectFile(file?: File | null) {
     setError('');
@@ -621,7 +700,7 @@ function HomeWorkbench() {
     form.append('profile', profile);
     if (flagPrefix.trim()) form.append('flag_prefix', flagPrefix.trim());
     if (password) form.append('password', password);
-    form.append('options', JSON.stringify(scanOptions));
+    form.append('options', JSON.stringify({ ...scanOptions, evidence_type: evidenceSection }));
     try {
       const created = await readJson(await fetch(`${API_BASE}/api/jobs`, { method: 'POST', body: form })) as Job;
       setJob(created);
@@ -660,6 +739,24 @@ function HomeWorkbench() {
     setHexError('');
     setResultQuery('');
     setMethodFilter('all');
+  }
+
+  function selectEvidenceSection(next: EvidenceSection) {
+    setEvidenceSection(next);
+    setScreen('setup');
+    setSelectedFile(null);
+    if (fileInput.current) fileInput.current.value = '';
+    setJob(null);
+    setError('');
+    setActivity([]);
+    setActiveTab('overview');
+    setSelectedVisual(null);
+    setSelectedArtifact(null);
+    setHexView(null);
+    setHexError('');
+    setResultQuery('');
+    setToolInstallReport(null);
+    setScanOptions({ ...profileOptionDefaults[profile], evidence_type: next });
   }
 
   function selectHexArtifact(value: string) {
@@ -706,6 +803,9 @@ function HomeWorkbench() {
       max_artifacts: defaults.max_artifacts,
       tool_timeout_seconds: defaults.tool_timeout_seconds,
       foremost_depth: defaults.foremost_depth,
+      audio_analysis_seconds: defaults.audio_analysis_seconds,
+      audio_spectrogram_fft: defaults.audio_spectrogram_fft,
+      audio_lsb_bits: defaults.audio_lsb_bits,
     }));
   }
 
@@ -719,7 +819,7 @@ function HomeWorkbench() {
   }
 
   async function installMissingTools(requested?: string[]) {
-    const missing = requested || capabilities.filter((capability) => capability.available !== true).map((capability) => capability.id || capability.executable).filter((id): id is string => Boolean(id));
+    const missing = requested || relevantCapabilities.filter((capability) => capability.available !== true).map((capability) => capability.id || capability.executable).filter((id): id is string => Boolean(id));
     if (!missing.length) {
       setToolInstallReport({ status: 'completed', installed_count: 0, message: 'All declared tools are already available.' });
       return;
@@ -758,8 +858,10 @@ function HomeWorkbench() {
 
   async function openRecent(recent: Job) {
     setJob(recent);
+    setActiveTab('overview');
     if (recent.profile) setProfile(recent.profile);
     if (recent.options) setScanOptions({ ...profileOptionDefaults[recent.profile || 'balanced'], ...recent.options });
+    setEvidenceSection(recent.options?.evidence_type === 'audio' || recent.result?.section === 'audio' ? 'audio' : 'image');
     const id = getJobId(recent);
     if (id) await refreshJob(id);
     setScreen(TERMINAL.has(recent.status.toLowerCase()) ? 'results' : 'running');
@@ -781,8 +883,8 @@ function HomeWorkbench() {
 
         <nav aria-label="Forensics sections">
           <p className="nav-label">Analyze</p>
-          <button className="nav-item active" onClick={resetScan}><span>◫</span>Image</button>
-          <button className="nav-item disabled" disabled><span>≋</span>Audio<em>Soon</em></button>
+          <button className={`nav-item ${evidenceSection === 'image' ? 'active' : ''}`} onClick={() => selectEvidenceSection('image')}><span>◫</span>Image</button>
+          <button className={`nav-item ${evidenceSection === 'audio' ? 'active' : ''}`} onClick={() => selectEvidenceSection('audio')}><span>≋</span>Audio<em>Ready</em></button>
           <button className="nav-item disabled" disabled><span>⌁</span>Corrupted files<em>Soon</em></button>
           <p className="nav-label second">Workspace</p>
           <button className="nav-item" onClick={() => document.getElementById('recent-scans')?.scrollIntoView({ behavior: 'smooth' })}><span>◷</span>Recent scans</button>
@@ -793,7 +895,7 @@ function HomeWorkbench() {
           {recentJobs.slice(0, 3).map((recent) => (
             <button key={getJobId(recent)} onClick={() => openRecent(recent)}>
               <span className={`mini-status ${recent.status}`} />
-              <span><strong>{jobName(recent) || 'Image scan'}</strong><small>{recent.status}</small></span>
+              <span><strong>{jobName(recent) || `${recent.options?.evidence_type === 'audio' ? 'Audio' : 'Image'} scan`}</strong><small>{recent.status}</small></span>
             </button>
           ))}
         </div>
@@ -811,7 +913,7 @@ function HomeWorkbench() {
         {screen === 'setup' && (
           <>
             <header className="topbar">
-              <div><p className="eyebrow">Image forensics</p><h1>Find what the pixels are hiding.</h1></div>
+              <div><p className="eyebrow">{evidenceSection === 'audio' ? 'Audio forensics' : 'Image forensics'}</p><h1>{evidenceSection === 'audio' ? 'Hear what the waveform is hiding.' : 'Find what the pixels are hiding.'}</h1></div>
               <div className="top-actions">
                 <button className="icon-button" aria-label="Open method settings" onClick={() => setShowAdvanced(true)}>⚙</button>
                 <button className="new-scan" onClick={() => fileInput.current?.click()}>New scan <span>＋</span></button>
@@ -828,27 +930,27 @@ function HomeWorkbench() {
                   onDrop={handleDrop}
                   onClick={() => !selectedFile && fileInput.current?.click()}
                 >
-                  <input ref={fileInput} className="sr-only" type="file" accept=".png,.apng,.jpg,.jpeg,.gif,.bmp,.webp,.tif,.tiff,.ico,application/octet-stream" onChange={(event) => selectFile(event.target.files?.[0])} />
+                  <input ref={fileInput} className="sr-only" type="file" accept={evidenceSection === 'audio' ? '.wav,.wave,.mp3,.flac,.ogg,.oga,.opus,.m4a,.aac,.aif,.aiff,.aifc,.au,.snd,.wma,.amr,.caf,.mid,.midi,audio/*,application/octet-stream' : '.png,.apng,.jpg,.jpeg,.gif,.bmp,.webp,.tif,.tiff,.ico,application/octet-stream'} onChange={(event) => selectFile(event.target.files?.[0])} />
                   {!selectedFile ? (
                     <>
                       <div className="upload-icon" aria-hidden="true"><span>↑</span></div>
                       <p className="card-kicker">Start an investigation</p>
-                      <h2>Drop an image here</h2>
-                      <p className="upload-copy">PNG, JPEG, GIF, BMP, WebP, TIFF or ICO · up to 100 MB</p>
+                      <h2>{evidenceSection === 'audio' ? 'Drop an audio file here' : 'Drop an image here'}</h2>
+                      <p className="upload-copy">{evidenceSection === 'audio' ? 'WAV, MP3, FLAC, Ogg/Opus, M4A, AIFF, AU, WMA, AMR, CAF or MIDI' : 'PNG, JPEG, GIF, BMP, WebP, TIFF or ICO'} · up to 100 MB</p>
                       <button className="choose-button" onClick={(event) => { event.stopPropagation(); fileInput.current?.click(); }}>Choose evidence file</button>
                       <p className="evidence-note"><span>◇</span>The original is hashed and never modified</p>
                     </>
                   ) : (
                     <>
-                      <div className="file-seal" aria-hidden="true"><span>◫</span><i>Evidence</i></div>
+                      <div className="file-seal" aria-hidden="true"><span>{evidenceSection === 'audio' ? '≋' : '◫'}</span><i>Evidence</i></div>
                       <p className="card-kicker">Evidence selected</p>
                       <h2 className="file-name">{selectedFile.name}</h2>
                       <div className="file-facts"><span>{formatBytes(selectedFile.size)}</span><span>SHA-256 on ingest</span><span>Type verified by content</span></div>
                       <div className="file-actions">
-                        <button className="choose-button" onClick={(event) => { event.stopPropagation(); startScan(); }}>Analyze image <span>→</span></button>
+                        <button className="choose-button" onClick={(event) => { event.stopPropagation(); startScan(); }}>Analyze {evidenceSection} <span>→</span></button>
                         <button className="replace-button" onClick={(event) => { event.stopPropagation(); fileInput.current?.click(); }}>Replace</button>
                       </div>
-                      <p className="evidence-note"><span>◇</span>Preview waits for the sandboxed safe renderer</p>
+                      <p className="evidence-note"><span>◇</span>{evidenceSection === 'audio' ? 'Playback uses only content-verified local audio' : 'Preview waits for the sandboxed safe renderer'}</p>
                     </>
                   )}
                 </div>
@@ -873,7 +975,7 @@ function HomeWorkbench() {
                   <div className="input-shell"><input id="flag-prefix-mobile" value={flagPrefix} onChange={(event) => setFlagPrefix(event.target.value.slice(0, 64))} placeholder="e.g. picoCTF, HTB, flag" /><kbd>{'{…}'}</kbd></div>
                   <p>Specific prefixes rank true flags above decoys.</p>
                   <button className="password-toggle" onClick={() => setShowPassword((open) => !open)}>{showPassword ? 'Hide passphrase / key' : '+ Add a passphrase or key'}</button>
-                  {showPassword && <><input className="password-input" type="password" value={password} autoComplete="off" onChange={(event) => setPassword(event.target.value.slice(0, 256))} placeholder="Optional stego or decryption passphrase" /><small className="password-hint">Used only for this scan. Steghide, Stegseek and OutGuess use it for bounded extraction; encrypted payload checks also support OpenSSL salted AES and passphrase-based XOR. Prefix a raw key with <code>hex:</code>.</small></>}
+                  {showPassword && <><input className="password-input" type="password" value={password} autoComplete="off" onChange={(event) => setPassword(event.target.value.slice(0, 256))} placeholder="Optional stego or decryption passphrase" /><small className="password-hint">Used only for this scan. {evidenceSection === 'audio' ? 'Steghide can inspect WAV/AU payloads; extracted PCM bits and carved data also enter bounded encrypted-payload recovery.' : 'Steghide, Stegseek and OutGuess use it for bounded extraction; encrypted payload checks support OpenSSL salted AES and passphrase-based XOR.'} Prefix a raw key with <code>hex:</code>.</small></>}
                 </div>
                 {recentJobs.length > 0 && (
                   <section className="mobile-recent-scans" aria-labelledby="mobile-recent-title">
@@ -882,7 +984,7 @@ function HomeWorkbench() {
                       {recentJobs.slice(0, 5).map((recent) => (
                         <button key={getJobId(recent)} onClick={() => openRecent(recent)}>
                           <span className={`mini-status ${recent.status}`} />
-                          <span><strong>{jobName(recent) || 'Image scan'}</strong><small>{formatDate(recent.updated_at)}</small></span>
+                          <span><strong>{jobName(recent) || `${recent.options?.evidence_type === 'audio' ? 'Audio' : 'Image'} scan`}</strong><small>{formatDate(recent.updated_at)}</small></span>
                           <em>{recent.status}</em>
                         </button>
                       ))}
@@ -897,7 +999,7 @@ function HomeWorkbench() {
                   <span className="shield-badge">✓ Safe mode</span>
                 </div>
                 <div className="methods-list">
-                  {methodGroups.map((method, index) => (
+                  {(evidenceSection === 'audio' ? audioMethodGroups : methodGroups).map((method, index) => (
                     <div className="method-row" key={method.title}>
                       <span className={`method-number tone-${method.tone}`}>{String(index + 1).padStart(2, '0')}</span>
                       <span className="method-copy"><strong>{method.title}</strong><small>{method.copy}</small></span>
@@ -910,7 +1012,7 @@ function HomeWorkbench() {
                   <div className="input-shell"><input id="flag-prefix" value={flagPrefix} onChange={(event) => setFlagPrefix(event.target.value.slice(0, 64))} placeholder="e.g. picoCTF, HTB, flag" /><kbd>{'{…}'}</kbd></div>
                   <p>Specific prefixes rank true flags above decoys.</p>
                   <button className="password-toggle" onClick={() => setShowPassword((open) => !open)}>{showPassword ? 'Hide passphrase / key' : '+ Add a passphrase or key'}</button>
-                  {showPassword && <><input className="password-input" type="password" value={password} autoComplete="off" onChange={(event) => setPassword(event.target.value.slice(0, 256))} placeholder="Optional stego or decryption passphrase" /><small className="password-hint">Used only for this scan. Steghide, Stegseek and OutGuess use it for bounded extraction; encrypted payload checks also support OpenSSL salted AES and passphrase-based XOR. Prefix a raw key with <code>hex:</code>.</small></>}
+                  {showPassword && <><input className="password-input" type="password" value={password} autoComplete="off" onChange={(event) => setPassword(event.target.value.slice(0, 256))} placeholder="Optional stego or decryption passphrase" /><small className="password-hint">Used only for this scan. {evidenceSection === 'audio' ? 'Steghide can inspect WAV/AU payloads; extracted PCM bits and carved data also enter bounded encrypted-payload recovery.' : 'Steghide, Stegseek and OutGuess use it for bounded extraction; encrypted payload checks support OpenSSL salted AES and passphrase-based XOR.'} Prefix a raw key with <code>hex:</code>.</small></>}
                 </div>
                 <div className={`engine-status ${engineOnline === false ? 'engine-offline' : ''}`}>
                   <span className="pulse-ring"><i /></span>
@@ -968,7 +1070,7 @@ function HomeWorkbench() {
             <header className="results-header">
               <div className="result-title-row">
                 <button className="back-button" onClick={resetScan} aria-label="Start another scan">←</button>
-                <div><p className="eyebrow">Investigation complete</p><h1>{jobName(job) || selectedFile?.name || 'Image analysis'}</h1></div>
+                <div><p className="eyebrow">{isAudioResult ? 'Audio investigation complete' : 'Investigation complete'}</p><h1>{jobName(job) || selectedFile?.name || `${isAudioResult ? 'Audio' : 'Image'} analysis`}</h1></div>
               </div>
               <div className="result-actions">
                 <a className="report-button secondary" href={`${API_BASE}/api/jobs/${jobId}/report.json`} download>JSON</a>
@@ -996,11 +1098,11 @@ function HomeWorkbench() {
                 <button onClick={() => navigator.clipboard?.writeText(candidateValue(candidates[0]))}>Copy flag</button>
               </section>
             ) : (
-              <section className="no-candidate-hero"><span>◇</span><div><strong>No high-confidence flag was found</strong><p>The completed coverage remains available below. Try Deep mode, a challenge prefix, or a known passphrase.</p></div></section>
+              <section className="no-candidate-hero"><span>◇</span><div><strong>No high-confidence flag was found</strong><p>{isAudioResult ? 'Review the spectrogram, PCM bit streams, channel difference, SSTV signals and complete tool output below.' : 'The completed coverage remains available below. Try Deep mode, a challenge prefix, or a known passphrase.'}</p></div></section>
             )}
 
             <nav className="result-tabs" aria-label="Analysis result sections">
-              {resultTabs.map((tab) => <button key={tab.id} className={activeTab === tab.id ? 'active' : ''} onClick={() => setActiveTab(tab.id)}>{tab.label}{tab.id === 'candidates' && <span>{candidates.length}</span>}{tab.id === 'artifacts' && <span>{artifacts.length}</span>}{tab.id === 'metadata' && <span>{metadataRows.length}</span>}{tab.id === 'tools' && <span>{toolMethods.length}</span>}{tab.id === 'methods' && <span>{methods.length}</span>}</button>)}
+              {activeResultTabs.map((tab) => <button key={tab.id} className={activeTab === tab.id ? 'active' : ''} onClick={() => setActiveTab(tab.id)}>{tab.label}{tab.id === 'audio' && <span>{audioVisuals.length}</span>}{tab.id === 'candidates' && <span>{candidates.length}</span>}{tab.id === 'artifacts' && <span>{artifacts.length}</span>}{tab.id === 'metadata' && <span>{metadataRows.length}</span>}{tab.id === 'tools' && <span>{toolMethods.length}</span>}{tab.id === 'methods' && <span>{methods.length}</span>}</button>)}
             </nav>
 
             <div className="result-search">
@@ -1035,6 +1137,54 @@ function HomeWorkbench() {
                 </div>
               )}
 
+              {activeTab === 'audio' && isAudioResult && (
+                <section className="tab-panel audio-lab-panel">
+                  <div className="section-title"><div><p className="eyebrow">Signal workstation</p><h2>Audio laboratory</h2></div><span>{audioVisuals.length} visual analyses · {audioArtifacts.length} playable files</span></div>
+                  <p className="panel-lede">Listen to content-verified local audio, compare waveform and spectral evidence, inspect decoded tones, and download channel or Audacity review exports without changing the source.</p>
+                  <div className="audio-player-card">
+                    <div><span className="audio-player-mark">≋</span><div><strong>{primaryAudioArtifact ? artifactName(primaryAudioArtifact) : 'No browser-playable artifact'}</strong><small>{primaryAudioArtifact ? `${artifactMediaType(primaryAudioArtifact)} · ${formatBytes(artifactSize(primaryAudioArtifact))}` : 'Install FFmpeg to create a PCM review WAV for this format.'}</small></div></div>
+                    {primaryAudioArtifact && artifactAudioUrl(primaryAudioArtifact) ? <audio controls preload="metadata" src={artifactAudioUrl(primaryAudioArtifact)}>Your browser cannot play this verified audio artifact.</audio> : <p>Playback is unavailable, but waveform, metadata, carving, and raw-tool evidence remain accessible.</p>}
+                  </div>
+                  <div className="audio-stat-grid">
+                    <div><strong>{audioProperties.duration_seconds !== undefined ? `${Number(audioProperties.duration_seconds).toFixed(3)} s` : '—'}</strong><small>duration</small></div>
+                    <div><strong>{audioProperties.sample_rate !== undefined ? `${Number(audioProperties.sample_rate).toLocaleString()} Hz` : '—'}</strong><small>sample rate</small></div>
+                    <div><strong>{audioProperties.channels !== undefined ? String(audioProperties.channels) : '—'}</strong><small>channels</small></div>
+                    <div><strong>{audioProperties.bit_depth !== undefined ? `${String(audioProperties.bit_depth)} bit` : '—'}</strong><small>PCM depth</small></div>
+                    <div><strong>{audioStatistics.rms_dbfs !== undefined ? `${Number(audioStatistics.rms_dbfs).toFixed(2)} dBFS` : '—'}</strong><small>RMS level</small></div>
+                    <div><strong>{audioStatistics.stereo_correlation !== undefined && audioStatistics.stereo_correlation !== null ? Number(audioStatistics.stereo_correlation).toFixed(4) : '—'}</strong><small>stereo correlation</small></div>
+                  </div>
+                  <div className="audio-lab-grid">
+                    <section className="audio-visual-section">
+                      <div className="audio-subheading"><div><p className="eyebrow">Visual evidence</p><h3>Waveform &amp; spectrum</h3></div><span>{audioVisuals.length}</span></div>
+                      <div className="audio-visual-grid">
+                        {audioVisuals.map((view, index) => {
+                          const preview = normalizeUrl(view.preview_url) || (view.artifact_id ? `${API_BASE}/api/jobs/${jobId}/artifacts/${view.artifact_id}/preview` : '');
+                          return <button key={view.id || index} onClick={() => { setSelectedVisual({ ...view, preview_url: preview }); setActiveTab('visual'); }}><SafePreviewImage src={preview} alt={view.title || `Audio visual ${index + 1}`} /><span><strong>{view.title || `Audio visual ${index + 1}`}</strong><small>{view.category || 'signal visualization'} · open full view</small></span></button>;
+                        })}
+                        {!audioVisuals.length && <div className="empty-state large"><span>≋</span><strong>No spectral image is available</strong><p>For compressed audio, install FFmpeg or SoX and scan again.</p></div>}
+                      </div>
+                    </section>
+                    <aside className="audio-signal-panel">
+                      <div className="audio-subheading"><div><p className="eyebrow">Decoded signals</p><h3>Automatic detections</h3></div></div>
+                      <div className="audio-signal-cards">
+                        <article><span>DTMF</span><strong>{audioSignals.dtmf?.symbols || 'None'}</strong><small>{audioSignals.dtmf?.events?.length || 0} bounded event(s)</small></article>
+                        <article><span>Morse</span><strong>{audioSignals.morse?.text || 'None'}</strong><small>{audioSignals.morse?.pattern ? String(audioSignals.morse.pattern).slice(0, 70) : 'No confident keying sequence'}</small></article>
+                        <article className={audioSignals.sstv?.candidate ? 'warning' : ''}><span>SSTV</span><strong>{audioSignals.sstv?.candidate ? 'Possible transmission' : 'No preamble'}</strong><small>{audioSignals.sstv?.leader_frames || 0} leader · {audioSignals.sstv?.sync_frames || 0} sync frames</small></article>
+                        <article><span>Ultrasonic</span><strong>{audioSignals.ultrasonic_energy_ratio !== undefined ? `${(Number(audioSignals.ultrasonic_energy_ratio) * 100).toFixed(3)}%` : '—'}</strong><small>energy above 18 kHz</small></article>
+                      </div>
+                      <div className="audio-frequency-list"><span>Strong frequency peaks</span>{audioSignals.frequency_peaks?.slice(0, 8).map((peak, index) => <div key={`${peak.frequency_hz}-${index}`}><strong>{Number(peak.frequency_hz || 0).toFixed(2)} Hz</strong><small>{Number(peak.relative_db || 0).toFixed(2)} dB relative</small></div>)}{!audioSignals.frequency_peaks?.length && <p>No decoded PCM spectrum is available.</p>}</div>
+                    </aside>
+                  </div>
+                  <section className="audio-export-section">
+                    <div className="audio-subheading"><div><p className="eyebrow">Audacity-compatible evidence</p><h3>Review exports</h3></div><span>Immutable derivatives</span></div>
+                    <div className="audio-export-grid">
+                      {artifacts.filter((artifact) => /audacity|audio_(?:mono|left|right|stereo)/i.test(artifactName(artifact))).map((artifact) => <a key={artifactId(artifact)} href={normalizeUrl(artifact.download_url) || `${API_BASE}/api/jobs/${jobId}/artifacts/${artifactId(artifact)}/download`} download><span>{artifactMediaType(artifact).startsWith('audio/') ? '≋' : '⌁'}</span><div><strong>{artifactName(artifact)}</strong><small>{formatBytes(artifactSize(artifact))} · import into Audacity</small></div><em>↓</em></a>)}
+                      {!artifacts.some((artifact) => /audacity|audio_(?:mono|left|right|stereo)/i.test(artifactName(artifact))) && <div className="empty-state"><span>⌁</span><strong>No review bundle was generated</strong><p>Enable Audacity handoff or channel isolation before the next scan.</p></div>}
+                    </div>
+                  </section>
+                </section>
+              )}
+
               {activeTab === 'candidates' && (
                 <section className="tab-panel">
                   <div className="section-title"><div><p className="eyebrow">Ranked evidence</p><h2>Flag candidates</h2></div><div className="filter-pills">{(['all', 'high', 'medium', 'low'] as const).map((filter) => <button key={filter} className={candidateFilter === filter ? 'active' : ''} onClick={() => setCandidateFilter(filter)}>{filter}</button>)}</div></div>
@@ -1064,21 +1214,21 @@ function HomeWorkbench() {
                       })}
                       {!filteredArtifacts.length && <div className="empty-state large"><span>⌁</span><strong>{resultQuery ? 'No artifacts match this search' : 'No child artifacts were recovered'}</strong><p>The original evidence and method logs are still included in the report.</p></div>}
                     </div>
-                    {selectedArtifact && <aside className="artifact-inspector"><header><div><p className="eyebrow">Evidence inspector</p><h3>{artifactName(selectedArtifact)}</h3></div><button onClick={() => setSelectedArtifact(null)} aria-label="Close artifact inspector">×</button></header>{artifactPreviewUrl(selectedArtifact) ? <div className="artifact-preview"><SafePreviewImage src={artifactPreviewUrl(selectedArtifact)} alt={`Preview of ${artifactName(selectedArtifact)}`} /><small>Verified raster preview · served read-only</small></div> : null}<dl><div><dt>Type</dt><dd>{artifactMediaType(selectedArtifact)}</dd></div><div><dt>Size</dt><dd>{formatBytes(artifactSize(selectedArtifact))}</dd></div><div><dt>Origin</dt><dd>{artifactOrigin(selectedArtifact)}</dd></div><div><dt>Depth</dt><dd>{artifactDepth(selectedArtifact)}</dd></div><div className="full"><dt>SHA-256</dt><dd className="mono">{selectedArtifact.sha256 || 'Unavailable'}</dd></div>{selectedArtifact.parent_id && <div className="full"><dt>Parent</dt><dd className="mono">{selectedArtifact.parent_id}</dd></div>}</dl><details className="raw-details"><summary>Lineage &amp; metadata</summary><pre>{JSON.stringify(selectedArtifact.metadata || {}, null, 2)}</pre></details><a className="inspector-download" href={normalizeUrl(selectedArtifact.download_url) || `${API_BASE}/api/jobs/${jobId}/artifacts/${artifactId(selectedArtifact)}?download=1`} download>Download evidence ↓</a></aside>}
+                    {selectedArtifact && <aside className="artifact-inspector"><header><div><p className="eyebrow">Evidence inspector</p><h3>{artifactName(selectedArtifact)}</h3></div><button onClick={() => setSelectedArtifact(null)} aria-label="Close artifact inspector">×</button></header>{artifactPreviewUrl(selectedArtifact) ? <div className="artifact-preview"><SafePreviewImage src={artifactPreviewUrl(selectedArtifact)} alt={`Preview of ${artifactName(selectedArtifact)}`} /><small>Verified raster preview · served read-only</small></div> : artifactAudioUrl(selectedArtifact) ? <div className="artifact-audio-preview"><audio controls preload="metadata" src={artifactAudioUrl(selectedArtifact)} /><small>Content-verified local audio · served read-only</small></div> : null}<dl><div><dt>Type</dt><dd>{artifactMediaType(selectedArtifact)}</dd></div><div><dt>Size</dt><dd>{formatBytes(artifactSize(selectedArtifact))}</dd></div><div><dt>Origin</dt><dd>{artifactOrigin(selectedArtifact)}</dd></div><div><dt>Depth</dt><dd>{artifactDepth(selectedArtifact)}</dd></div><div className="full"><dt>SHA-256</dt><dd className="mono">{selectedArtifact.sha256 || 'Unavailable'}</dd></div>{selectedArtifact.parent_id && <div className="full"><dt>Parent</dt><dd className="mono">{selectedArtifact.parent_id}</dd></div>}</dl><details className="raw-details"><summary>Lineage &amp; metadata</summary><pre>{JSON.stringify(selectedArtifact.metadata || {}, null, 2)}</pre></details><a className="inspector-download" href={normalizeUrl(selectedArtifact.download_url) || `${API_BASE}/api/jobs/${jobId}/artifacts/${artifactId(selectedArtifact)}?download=1`} download>Download evidence ↓</a></aside>}
                   </div>
                 </section>
               )}
 
               {activeTab === 'visual' && (
                 <section className="tab-panel">
-                  <div className="section-title"><div><p className="eyebrow">Pixel laboratory</p><h2>Channels, bit planes &amp; frames</h2></div><span>{visuals.length} safe previews</span></div>
+                  <div className="section-title"><div><p className="eyebrow">{isAudioResult ? 'Signal visualization' : 'Pixel laboratory'}</p><h2>{isAudioResult ? 'Waveforms & spectrograms' : 'Channels, bit planes & frames'}</h2></div><span>{visuals.length} safe previews</span></div>
                   <div className="visual-layout">
                     <div className="visual-grid">
                       {filteredVisuals.map((view, index) => {
                         const preview = normalizeUrl(view.preview_url) || (view.artifact_id ? `${API_BASE}/api/jobs/${jobId}/artifacts/${view.artifact_id}/preview` : '');
                         return <button key={view.id || `${view.name}-${index}`} onClick={() => setSelectedVisual({ ...view, preview_url: preview })} className={selectedVisual?.id === view.id ? 'active' : ''}>{preview ? <SafePreviewImage src={preview} alt={view.title || view.name || `Visual derivative ${index + 1}`} /> : <span className="visual-placeholder">◫</span>}<span><strong>{view.title || view.name || `View ${index + 1}`}</strong><small>{view.kind || 'Derived image'}</small></span></button>;
                       })}
-                      {!filteredVisuals.length && <div className="empty-state large"><span>◫</span><strong>{resultQuery ? 'No visual views match this search' : 'No visual derivatives are available'}</strong><p>Pillow-based views appear here when the optional image engine is installed.</p></div>}
+                      {!filteredVisuals.length && <div className="empty-state large"><span>◫</span><strong>{resultQuery ? 'No visual views match this search' : 'No visual derivatives are available'}</strong><p>{isAudioResult ? 'Built-in WAV visuals or FFmpeg/SoX spectrograms appear here.' : 'Pillow-based views appear here when the optional image engine is installed.'}</p></div>}
                     </div>
                     {selectedVisual && <aside className="visual-focus"><button onClick={() => setSelectedVisual(null)} aria-label="Close visual preview">×</button>{selectedVisual.preview_url ? <SafePreviewImage src={selectedVisual.preview_url} alt={selectedVisual.title || selectedVisual.name || 'Selected visual derivative'} /> : null}<strong>{selectedVisual.title || selectedVisual.name}</strong><p>{selectedVisual.kind || 'Derived visual evidence'}</p></aside>}
                   </div>
@@ -1162,9 +1312,9 @@ function HomeWorkbench() {
             <p className="modal-intro">Settings are validated by the local engine and saved with the case. Fingerprinting and raw string recovery always run so every result keeps a trustworthy evidence baseline.</p>
             <div className="method-catalog settings-catalog">
               <section className="settings-section" aria-labelledby="analysis-switches">
-                <div className="settings-section-title"><div><p className="eyebrow">Analysis stages</p><h3 id="analysis-switches">Method groups</h3></div><span>{configurableMethods.filter((item) => scanOptions[item.key]).length}/{configurableMethods.length} enabled</span></div>
+                <div className="settings-section-title"><div><p className="eyebrow">Analysis stages</p><h3 id="analysis-switches">{evidenceSection === 'audio' ? 'Audio method groups' : 'Image method groups'}</h3></div><span>{(evidenceSection === 'audio' ? audioConfigurableMethods : configurableMethods).filter((item) => scanOptions[item.key]).length}/{(evidenceSection === 'audio' ? audioConfigurableMethods : configurableMethods).length} enabled</span></div>
                 <div className="method-settings-grid">
-                  {configurableMethods.map((item) => <label className="setting-toggle" key={item.key}><span><strong>{item.title}</strong><small>{item.copy}</small></span><input type="checkbox" checked={scanOptions[item.key]} onChange={(event) => setScanOptions((current) => ({ ...current, [item.key]: event.target.checked }))} /><i aria-hidden="true" /></label>)}
+                  {(evidenceSection === 'audio' ? audioConfigurableMethods : configurableMethods).map((item) => <label className="setting-toggle" key={item.key}><span><strong>{item.title}</strong><small>{item.copy}</small></span><input type="checkbox" checked={scanOptions[item.key]} onChange={(event) => setScanOptions((current) => ({ ...current, [item.key]: event.target.checked }))} /><i aria-hidden="true" /></label>)}
                 </div>
               </section>
 
@@ -1177,20 +1327,27 @@ function HomeWorkbench() {
                   <label><span>External output<small>KiB retained per tool</small></span><input type="number" min="64" max="2048" step="64" value={scanOptions.external_output_kib} onChange={(event) => setScanOptions((current) => ({ ...current, external_output_kib: Math.max(64, Math.min(2048, Number(event.target.value) || 64)) }))} /></label>
                   <label><span>Extracted files<small>Maximum child files per tool</small></span><input type="number" min="1" max="64" step="1" value={scanOptions.max_external_files} onChange={(event) => setScanOptions((current) => ({ ...current, max_external_files: Math.max(1, Math.min(64, Number(event.target.value) || 1)) }))} /></label>
                   <label><span>Foremost depth<small>Recursively carve recovered files</small></span><select value={scanOptions.foremost_depth} onChange={(event) => setScanOptions((current) => ({ ...current, foremost_depth: Math.max(1, Math.min(4, Number(event.target.value))) }))}><option value={1}>1 · Source only</option><option value={2}>2 · One recovered level</option><option value={3}>3 · Two recovered levels</option><option value={4}>4 · Maximum bounded depth</option></select></label>
-                  <label><span>Color remaps<small>Three-tone visual variants</small></span><select value={scanOptions.color_remap_variants} onChange={(event) => setScanOptions((current) => ({ ...current, color_remap_variants: Number(event.target.value) }))}>{[0, 2, 4, 6, 8].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
-                  <label><span>OCR language<small>Tesseract language code</small></span><input value={scanOptions.ocr_language} maxLength={64} pattern="[A-Za-z0-9_+\-]+" onChange={(event) => setScanOptions((current) => ({ ...current, ocr_language: event.target.value.replace(/[^A-Za-z0-9_+\-]/g, '').slice(0, 64) || 'eng' }))} /></label>
-                  <label><span>zsteg mode<small>All combos or only LSB planes</small></span><select value={scanOptions.zsteg_mode} onChange={(event) => setScanOptions((current) => ({ ...current, zsteg_mode: event.target.value as ScanOptions['zsteg_mode'] }))}><option value="all">All checks (zsteg -a)</option><option value="lsb">LSB only (zsteg --lsb)</option></select></label>
+                  {evidenceSection === 'image' ? <>
+                    <label><span>Color remaps<small>Three-tone visual variants</small></span><select value={scanOptions.color_remap_variants} onChange={(event) => setScanOptions((current) => ({ ...current, color_remap_variants: Number(event.target.value) }))}>{[0, 2, 4, 6, 8].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+                    <label><span>OCR language<small>Tesseract language code</small></span><input value={scanOptions.ocr_language} maxLength={64} pattern="[A-Za-z0-9_+\-]+" onChange={(event) => setScanOptions((current) => ({ ...current, ocr_language: event.target.value.replace(/[^A-Za-z0-9_+\-]/g, '').slice(0, 64) || 'eng' }))} /></label>
+                    <label><span>zsteg mode<small>All combos or only LSB planes</small></span><select value={scanOptions.zsteg_mode} onChange={(event) => setScanOptions((current) => ({ ...current, zsteg_mode: event.target.value as ScanOptions['zsteg_mode'] }))}><option value="all">All checks (zsteg -a)</option><option value="lsb">LSB only (zsteg --lsb)</option></select></label>
+                  </> : <>
+                    <label><span>Analyze duration<small>Decoded seconds, bounded 15–300</small></span><input type="number" min="15" max="300" step="15" value={scanOptions.audio_analysis_seconds} onChange={(event) => setScanOptions((current) => ({ ...current, audio_analysis_seconds: Math.max(15, Math.min(300, Number(event.target.value) || 15)) }))} /></label>
+                    <label><span>Spectrogram FFT<small>Frequency/time resolution</small></span><select value={scanOptions.audio_spectrogram_fft} onChange={(event) => setScanOptions((current) => ({ ...current, audio_spectrogram_fft: Number(event.target.value) as ScanOptions['audio_spectrogram_fft'] }))}>{[256, 512, 1024, 2048, 4096].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+                    <label><span>Analysis channel<small>Signal used by decoders</small></span><select value={scanOptions.audio_channel_mode} onChange={(event) => setScanOptions((current) => ({ ...current, audio_channel_mode: event.target.value as ScanOptions['audio_channel_mode'] }))}><option value="mix">Mono mix</option><option value="left">Left</option><option value="right">Right</option><option value="difference">Stereo difference</option></select></label>
+                    <label><span>PCM LSB planes<small>Least-significant sample bits</small></span><select value={scanOptions.audio_lsb_bits} onChange={(event) => setScanOptions((current) => ({ ...current, audio_lsb_bits: Number(event.target.value) }))}>{[1, 2, 3, 4].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+                  </>}
                 </div>
               </section>
 
               <section className="settings-section" aria-labelledby="external-tools">
-                <div className="settings-section-title"><div><p className="eyebrow">Installed integrations</p><h3 id="external-tools">External tool adapters</h3></div><div className="tool-header-actions"><span>{availableTools}/{capabilities.length} installed</span><button onClick={refreshToolAvailability} disabled={toolRefreshBusy || toolInstallBusy}>{toolRefreshBusy ? 'Checking…' : 'Refresh availability'}</button><button onClick={() => installMissingTools()} disabled={toolInstallBusy || toolRefreshBusy || !capabilities.length}>{toolInstallBusy ? 'Installing tools…' : 'Install all missing'}</button></div></div>
-                <p className="install-note">One click installs fixed, allowlisted packages non-interactively through Kali WSL or Windows Package Manager—no ZIP extraction or installer walkthrough. Availability is refreshed automatically when installation finishes.</p>
+                <div className="settings-section-title"><div><p className="eyebrow">Installed integrations</p><h3 id="external-tools">{evidenceSection === 'audio' ? 'Audio tool adapters' : 'Image tool adapters'}</h3></div><div className="tool-header-actions"><span>{availableTools}/{relevantCapabilities.length} installed</span><button onClick={refreshToolAvailability} disabled={toolRefreshBusy || toolInstallBusy}>{toolRefreshBusy ? 'Checking…' : 'Refresh availability'}</button><button onClick={() => installMissingTools()} disabled={toolInstallBusy || toolRefreshBusy || !relevantCapabilities.length}>{toolInstallBusy ? 'Installing tools…' : 'Install all missing'}</button></div></div>
+                <p className="install-note">One click installs fixed, allowlisted packages non-interactively through Kali WSL or Windows Package Manager—no ZIP extraction or installer walkthrough. {evidenceSection === 'audio' ? 'Audio coverage includes FFmpeg/FFprobe, SoX, MediaInfo, minimodem and multimon-ng.' : 'Availability is refreshed automatically when installation finishes.'}</p>
                 {toolInstallReport && <div className={`tool-download-report ${toolInstallReport.status || ''}`}><div><strong>{toolInstallReport.message || 'Tool installation finished.'}</strong><small>{toolInstallReport.available_count !== undefined ? `${toolInstallReport.available_count}/${toolInstallReport.requested_count || 0} requested tools detected` : 'Installation report recorded.'}{toolInstallReport.managers?.length ? ` · ${toolInstallReport.managers.join(', ')}` : ''}</small></div></div>}
                 {toolInstallReport?.items?.length ? <div className="tool-download-items" aria-label="Tool installation status"><span className="tool-download-items-title">Installation results</span>{toolInstallReport.items.map((item, index) => <div className="tool-download-item" key={`${item.id || 'tool'}-${index}`}><span><strong>{item.id || 'tool'}</strong><small>{item.message || item.status || 'recorded'}{item.channel ? ` · ${item.channel}` : ''}{item.resolved ? ` · ${item.resolved}` : ''}</small>{item.diagnostic ? <details open><summary>Installer diagnostic</summary><pre>{boundedDisplay(item.diagnostic, 2_000)}</pre></details> : null}</span><em className={item.status || ''}>{(item.status || 'unknown').replaceAll('_', ' ')}</em></div>)}</div> : null}
-                <div className="tool-selection-actions"><button onClick={() => setScanOptions((current) => ({ ...current, selected_external_tools: null }))}>Select all</button><button onClick={() => setScanOptions((current) => ({ ...current, selected_external_tools: [] }))}>Clear all</button></div>
+                <div className="tool-selection-actions"><button onClick={() => setScanOptions((current) => ({ ...current, selected_external_tools: Array.from(new Set([...(current.selected_external_tools || []), ...relevantCapabilities.map((item) => item.id).filter((item): item is string => Boolean(item))])) }))}>Select visible</button><button onClick={() => setScanOptions((current) => ({ ...current, selected_external_tools: (current.selected_external_tools || capabilities.map((item) => item.id).filter((item): item is string => Boolean(item))).filter((id) => !relevantCapabilities.some((item) => item.id === id)) }))}>Clear visible</button></div>
                 <div className="external-tool-grid">
-                  {capabilities.map((capability) => {
+                  {relevantCapabilities.map((capability) => {
                     const id = capability.id || capability.executable || capability.name || '';
                     const selected = scanOptions.selected_external_tools === null || scanOptions.selected_external_tools.includes(id);
                     const location = capability.resolved || capability.install_hint;

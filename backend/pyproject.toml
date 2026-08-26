@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "forenscope-api"
 version = "0.1.0"
-description = "Local-first image forensics and CTF analysis control plane"
+description = "Local-first image and audio forensics CTF analysis control plane"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115,<1",

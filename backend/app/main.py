@@ -237,7 +237,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     application = FastAPI(
         title="Forenscope API",
-        summary="Local-first image forensics control plane",
+        summary="Local-first image and audio forensics control plane",
         version=__version__,
         docs_url="/api/docs",
         redoc_url=None,
@@ -312,11 +312,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _invalidate_tool_capabilities()
         tools = await anyio.to_thread.run_sync(_tool_capabilities)
         return {
-            "name": "Forenscope Image Analyzer",
+            "name": "Forenscope Forensics Analyzer",
             "version": __version__,
             "max_upload_bytes": configured_settings.max_upload_bytes,
             "profiles": [profile.value for profile in ScanProfile],
-            "formats": ["PNG", "APNG", "JPEG", "MPO", "BMP", "GIF", "WebP", "TIFF", "BigTIFF", "ICO", "CUR"],
+            "formats": [
+                "PNG", "APNG", "JPEG", "MPO", "BMP", "GIF", "WebP", "TIFF", "BigTIFF", "ICO", "CUR",
+                "WAV", "AIFF", "FLAC", "Ogg", "Opus", "MP3", "AAC", "M4A", "AU", "WMA", "AMR", "CAF", "MIDI",
+            ],
             "analysis_categories": [
                 "identity",
                 "metadata",
@@ -330,6 +333,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "decoding",
                 "crypto",
                 "repair",
+                "audio-waveform",
+                "audio-spectrum",
+                "audio-signal",
+                "audio-decoding",
+                "audio-sstv",
             ],
             "exports": ["json", "html", "zip"],
             "tools": tools,
@@ -338,7 +346,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 {"id": "color_remapping", "name": "Color remapping", "category": "visual", "available": True, "formats": ["all images"]},
                 {"id": "pcrt", "name": "PCRT-compatible PNG repair", "category": "repair", "available": True, "formats": ["png"]},
                 {"id": "crypto-analysis", "name": "Encrypted payload detection and recovery", "category": "crypto", "available": True, "formats": ["extracted payloads"]},
-                {"id": "spectrogram", "name": "Spectrogram", "category": "audio", "available": False, "formats": ["audio section"]},
+                {"id": "audio-waveform", "name": "PCM waveform and statistics", "category": "audio", "available": True, "formats": ["wav"]},
+                {"id": "audio-spectrogram", "name": "Built-in STFT spectrogram", "category": "audio-spectrum", "available": True, "formats": ["wav"]},
+                {"id": "audio-pcm-lsb", "name": "PCM sample bit extraction", "category": "steganography", "available": True, "formats": ["wav"]},
+                {"id": "audio-signal-decoders", "name": "DTMF and Morse decoders", "category": "audio-decoding", "available": True, "formats": ["wav"]},
+                {"id": "audio-sstv", "name": "RX-SSTV-compatible tone scan", "category": "audio-sstv", "available": True, "formats": ["wav"]},
+                {"id": "audio-audacity", "name": "Audacity review bundle", "category": "audio", "available": True, "formats": ["wav"]},
                 {"id": "pdfinfo", "name": "pdfinfo", "category": "document", "available": False, "formats": ["document section"]},
                 {"id": "pdfid", "name": "PDFiD", "category": "document", "available": False, "formats": ["document section"]},
             ],
@@ -382,7 +395,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.post("/api/jobs", response_model=JobResponse, status_code=status.HTTP_202_ACCEPTED)
     async def create_job(
         request: Request,
-        file: UploadFile = File(..., description="Image or corrupted image evidence"),
+        file: UploadFile = File(..., description="Image, audio, or corrupted media evidence"),
         profile: ScanProfile = Form(ScanProfile.BALANCED),
         flag_prefix: str | None = Form(None, max_length=160),
         password: str | None = Form(None, max_length=4096),
@@ -456,6 +469,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     detail={"code": "empty_upload", "message": "The uploaded file is empty."},
                 )
 
+            verified_media_type, verified_previewable = await anyio.to_thread.run_sync(sniff_media_type, input_path)
             storage = _storage(request)
             job = await anyio.to_thread.run_sync(
                 partial(
@@ -482,9 +496,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         job_id=job_id,
                         original_filename=display_filename,
                         relative_path="input/source.upload",
-                        content_type=content_type,
+                        content_type=verified_media_type if verified_previewable else content_type,
                         size_bytes=size_bytes,
                         sha256=digest.hexdigest(),
+                        previewable=verified_previewable,
                     ),
                 )
             )
@@ -673,7 +688,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not artifact.get("previewable") or not previewable:
                 raise HTTPException(
                     status_code=415,
-                    detail={"code": "preview_unavailable", "message": "Only verified raster image artifacts can be previewed."},
+                    detail={"code": "preview_unavailable", "message": "Only verified raster-image and browser-safe audio artifacts can be previewed."},
                 )
             media_type = sniffed_type
         return FileResponse(

@@ -41,6 +41,14 @@ WSL_APT_PACKAGES: dict[str, tuple[str, ...]] = {
     "gifsicle": ("gifsicle",),
     "tesseract": ("tesseract-ocr",),
     "zbarimg": ("zbar-tools",),
+    "ffprobe": ("ffmpeg",),
+    "ffmpeg_spectrogram": ("ffmpeg",),
+    "ffmpeg_pcm": ("ffmpeg",),
+    "sox_stats": ("sox", "libsox-fmt-all"),
+    "sox_spectrogram": ("sox", "libsox-fmt-all"),
+    "mediainfo": ("mediainfo",),
+    "multimon_ng": ("multimon-ng",),
+    "minimodem": ("minimodem",),
 }
 
 # These identifiers are fixed package-manager coordinates. No package name or
@@ -54,6 +62,12 @@ WINGET_PACKAGE_IDS: dict[str, str] = {
     "openstego": "syvaidya.openstego",
     "7z": "7zip.7zip",
     "tesseract": "tesseract-ocr.tesseract",
+    "ffprobe": "Gyan.FFmpeg",
+    "ffmpeg_spectrogram": "Gyan.FFmpeg",
+    "ffmpeg_pcm": "Gyan.FFmpeg",
+    "sox_stats": "ChrisBagwell.SoX",
+    "sox_spectrogram": "ChrisBagwell.SoX",
+    "mediainfo": "MediaArea.MediaInfo",
 }
 
 SPECIAL_WSL_DEPENDENCIES: dict[str, tuple[str, ...]] = {
@@ -328,15 +342,19 @@ def install_tools(tool_ids: list[str]) -> dict[str, Any]:
     winget = resolve_executable("winget")
     winget_ran = False
     if winget:
+        package_targets: dict[str, list[str]] = {}
         for tool_id in missing:
             if after_wsl.get(tool_id) is not None:
                 continue
             package_id = WINGET_PACKAGE_IDS.get(tool_id)
             if not package_id:
                 continue
+            package_targets.setdefault(package_id, []).append(tool_id)
+        for package_id, target_ids in package_targets.items():
             result = _run_winget_install(winget, package_id)
-            command_results[tool_id].append(result)
-            channels[tool_id] = "Windows Package Manager"
+            for tool_id in target_ids:
+                command_results[tool_id].append(result)
+                channels[tool_id] = "Windows Package Manager"
             winget_ran = True
 
     final = _availability(requested) if winget_ran else after_wsl

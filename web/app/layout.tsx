@@ -7,18 +7,18 @@ const geistMono = Geist_Mono({ variable: '--font-geist-mono', subsets: ['latin']
 
 export const metadata: Metadata = {
   metadataBase: new URL('http://localhost:3000'),
-  title: 'Forenscope — CTF Image Forensics',
-  description: 'A private, local-first image forensics workbench for CTF investigations.',
+  title: 'Forenscope — CTF Media Forensics',
+  description: 'A private, local-first image and audio forensics workbench for CTF investigations.',
   openGraph: {
-    title: 'Forenscope — CTF Image Forensics',
-    description: 'Find what the pixels are hiding with a private, local-first forensic workbench.',
+    title: 'Forenscope — CTF Media Forensics',
+    description: 'Find what pixels and waveforms are hiding with a private, local-first forensic workbench.',
     type: 'website',
-    images: [{ url: '/og.png', width: 1672, height: 941, alt: 'Forenscope image forensics workbench' }],
+    images: [{ url: '/og.png', width: 1672, height: 941, alt: 'Forenscope media forensics workbench' }],
   },
   twitter: {
     card: 'summary_large_image',
-    title: 'Forenscope — CTF Image Forensics',
-    description: 'Find what the pixels are hiding with a private, local-first forensic workbench.',
+    title: 'Forenscope — CTF Media Forensics',
+    description: 'Find what pixels and waveforms are hiding with a private, local-first forensic workbench.',
     images: ['/og.png'],
   },
 };

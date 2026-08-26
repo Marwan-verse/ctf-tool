@@ -70,6 +70,13 @@ def test_bmp_artifacts_are_safe_inline_previews(tmp_path: Path) -> None:
     assert sniff_media_type(carved) == ("image/bmp", True)
 
 
+def test_wav_artifacts_are_verified_safe_inline_audio(tmp_path: Path) -> None:
+    recovered = tmp_path / "recovered.wav"
+    recovered.write_bytes(b"RIFF" + (4).to_bytes(4, "little") + b"WAVE")
+
+    assert sniff_media_type(recovered) == ("audio/wav", True)
+
+
 def test_zip_export_uses_generated_paths_and_skips_escape(tmp_path: Path) -> None:
     job_dir = tmp_path / "job"
     output = job_dir / "output"

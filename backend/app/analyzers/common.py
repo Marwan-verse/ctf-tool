@@ -59,6 +59,18 @@ MIME_BY_KIND = {
     "webp": "image/webp",
     "tiff": "image/tiff",
     "ico": "image/x-icon",
+    "wav": "audio/wav",
+    "aiff": "audio/aiff",
+    "flac": "audio/flac",
+    "ogg": "audio/ogg",
+    "mp3": "audio/mpeg",
+    "aac": "audio/aac",
+    "m4a": "audio/mp4",
+    "au": "audio/basic",
+    "asf": "audio/x-ms-wma",
+    "amr": "audio/amr",
+    "caf": "audio/x-caf",
+    "midi": "audio/midi",
     "zip": "application/zip",
     "gzip": "application/gzip",
     "zlib": "application/zlib",
@@ -131,6 +143,30 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "bmp"
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "webp"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "wav"
+    if len(data) >= 12 and data[:4] == b"FORM" and data[8:12] in {b"AIFF", b"AIFC"}:
+        return "aiff"
+    if data.startswith(b"fLaC"):
+        return "flac"
+    if data.startswith(b"OggS"):
+        return "ogg"
+    if data.startswith(b"ID3") or (len(data) >= 2 and data[0] == 0xFF and data[1] & 0xE6 == 0xE2):
+        return "mp3"
+    if len(data) >= 2 and data[0] == 0xFF and data[1] & 0xF6 == 0xF0:
+        return "aac"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return "m4a"
+    if data.startswith(b".snd"):
+        return "au"
+    if data.startswith(b"\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xce\x6c"):
+        return "asf"
+    if data.startswith(b"#!AMR\n"):
+        return "amr"
+    if data.startswith(b"caff"):
+        return "caf"
+    if data.startswith(b"MThd"):
+        return "midi"
     if data.startswith((b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")):
         return "tiff"
     if data.startswith(b"\x00\x00\x01\x00") or data.startswith(b"\x00\x00\x02\x00"):
@@ -156,6 +192,11 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         ".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".jpe": "jpeg",
         ".gif": "gif", ".bmp": "bmp", ".webp": "webp",
         ".tif": "tiff", ".tiff": "tiff", ".ico": "ico", ".cur": "ico",
+        ".wav": "wav", ".wave": "wav", ".aif": "aiff", ".aiff": "aiff", ".aifc": "aiff",
+        ".flac": "flac", ".ogg": "ogg", ".oga": "ogg", ".opus": "ogg",
+        ".mp3": "mp3", ".aac": "aac", ".m4a": "m4a", ".mp4": "m4a",
+        ".au": "au", ".snd": "au", ".wma": "asf", ".amr": "amr", ".caf": "caf",
+        ".mid": "midi", ".midi": "midi",
     }.get(extension, "binary")
 
 
@@ -167,6 +208,9 @@ def extension_for(kind: str) -> str:
     return {
         "png": ".png", "jpeg": ".jpg", "gif": ".gif", "bmp": ".bmp",
         "webp": ".webp", "tiff": ".tiff", "ico": ".ico", "zip": ".zip",
+        "wav": ".wav", "aiff": ".aiff", "flac": ".flac", "ogg": ".ogg",
+        "mp3": ".mp3", "aac": ".aac", "m4a": ".m4a", "au": ".au",
+        "asf": ".wma", "amr": ".amr", "caf": ".caf", "midi": ".mid",
         "gzip": ".gz", "zlib": ".zlib", "bzip2": ".bz2", "xz": ".xz", "zstd": ".zst",
         "pdf": ".pdf", "text": ".txt",
     }.get(kind, ".bin")

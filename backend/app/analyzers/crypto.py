@@ -25,7 +25,10 @@ _FLAG_PATTERN = re.compile(
 )
 _BASE64_PATTERN = re.compile(r"^[A-Za-z0-9+/\s]*={0,2}$")
 _HEX_PATTERN = re.compile(r"^[0-9A-Fa-f\s]+$")
-_IMAGE_KINDS = {"png", "jpeg", "gif", "bmp", "webp", "tiff", "ico"}
+_MEDIA_CONTAINER_KINDS = {
+    "png", "jpeg", "gif", "bmp", "webp", "tiff", "ico",
+    "audio", "wav", "aiff", "flac", "ogg", "mp3", "aac", "m4a", "au", "asf", "amr", "caf", "midi",
+}
 _MAX_INPUT_BYTES = 4 * 1024 * 1024
 _MAX_INPUTS = 96
 _MAX_ATTEMPTS = 192
@@ -197,7 +200,7 @@ def analyze_encrypted_payloads(
         # Image containers and rendered derivatives are already covered by the
         # pixel/LSB stages; their compressed bytes are expected to be high
         # entropy and would create noisy ciphertext signals here.
-        if kind in _IMAGE_KINDS:
+        if kind in _MEDIA_CONTAINER_KINDS:
             continue
         data = raw[:max_input_bytes]
         for encoding, blob in _unwrap_candidates(data):

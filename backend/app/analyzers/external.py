@@ -42,12 +42,16 @@ class ResolvedTool:
         return f"WSL: {self.executable}"
 
 
+IMAGE_KINDS = frozenset({"png", "jpeg", "gif", "bmp", "webp", "tiff", "ico"})
+AUDIO_KINDS = frozenset({"audio", "wav", "aiff", "flac", "ogg", "mp3", "aac", "m4a", "au", "asf", "amr", "caf", "midi"})
+
+
 TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("file", "file", "libmagic file identification", "identity", None, frozenset({"quick", "balanced", "deep"})),
     ToolSpec("exiftool", "exiftool", "ExifTool metadata", "metadata", None, frozenset({"quick", "balanced", "deep"})),
-    ToolSpec("exiv2", "exiv2", "Exiv2 metadata cross-check", "metadata", None, frozenset({"balanced", "deep"})),
+    ToolSpec("exiv2", "exiv2", "Exiv2 metadata cross-check", "metadata", IMAGE_KINDS, frozenset({"balanced", "deep"})),
     ToolSpec("strings", "strings", "GNU/Unix strings cross-check", "strings", None, frozenset({"quick", "balanced", "deep"})),
-    ToolSpec("identify", "identify", "ImageMagick decoded-image inspection", "identity", None, frozenset({"balanced", "deep"})),
+    ToolSpec("identify", "identify", "ImageMagick decoded-image inspection", "identity", IMAGE_KINDS, frozenset({"balanced", "deep"})),
     ToolSpec("pngcheck", "pngcheck", "pngcheck structure validation", "structure", frozenset({"png"}), frozenset({"quick", "balanced", "deep"})),
     ToolSpec("pngcrush", "pngcrush", "pngcrush lossless validation", "structure", frozenset({"png"}), frozenset({"deep"})),
     ToolSpec("jpeginfo", "jpeginfo", "jpeginfo structure validation", "structure", frozenset({"jpeg"}), frozenset({"quick", "balanced", "deep"})),
@@ -55,7 +59,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("djpeg", "djpeg", "libjpeg pixel decode validation", "structure", frozenset({"jpeg"}), frozenset({"deep"})),
     ToolSpec("zsteg", "zsteg", "zsteg lossless steganography", "steganography", frozenset({"png", "bmp"}), frozenset({"balanced", "deep"})),
     ToolSpec("stegseek", "stegseek", "Stegseek JPEG extraction", "steganography", frozenset({"jpeg"}), frozenset({"balanced", "deep"})),
-    ToolSpec("steghide", "steghide", "Steghide password extraction", "steganography", frozenset({"jpeg", "bmp"}), frozenset({"balanced", "deep"})),
+    ToolSpec("steghide", "steghide", "Steghide password extraction", "steganography", frozenset({"jpeg", "bmp", "wav", "au"}), frozenset({"balanced", "deep"})),
     ToolSpec("outguess", "outguess", "OutGuess password extraction", "steganography", frozenset({"jpeg"}), frozenset({"balanced", "deep"})),
     ToolSpec("jpseek", "jpseek", "JPHide/JPSeek payload extraction", "steganography", frozenset({"jpeg"}), frozenset({"balanced", "deep"})),
     ToolSpec("jsteg", "jsteg", "JSteg JPEG coefficient extraction", "steganography", frozenset({"jpeg"}), frozenset({"balanced", "deep"})),
@@ -68,8 +72,16 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("webpinfo", "webpinfo", "WebP RIFF inspection", "structure", frozenset({"webp"}), frozenset({"quick", "balanced", "deep"})),
     ToolSpec("webpmux", "webpmux", "WebP container and animation inspection", "structure", frozenset({"webp"}), frozenset({"balanced", "deep"})),
     ToolSpec("gifsicle", "gifsicle", "Gifsicle animation inspection", "animation", frozenset({"gif"}), frozenset({"balanced", "deep"})),
-    ToolSpec("tesseract", "tesseract", "Tesseract OCR command-line cross-check", "ocr", None, frozenset({"balanced", "deep"})),
-    ToolSpec("zbarimg", "zbarimg", "ZBar barcode command-line cross-check", "barcodes", None, frozenset({"balanced", "deep"})),
+    ToolSpec("tesseract", "tesseract", "Tesseract OCR command-line cross-check", "ocr", IMAGE_KINDS, frozenset({"balanced", "deep"})),
+    ToolSpec("zbarimg", "zbarimg", "ZBar barcode command-line cross-check", "barcodes", IMAGE_KINDS, frozenset({"balanced", "deep"})),
+    ToolSpec("ffprobe", "ffprobe", "FFprobe stream and codec inspection", "audio-metadata", AUDIO_KINDS, frozenset({"quick", "balanced", "deep"})),
+    ToolSpec("ffmpeg_spectrogram", "ffmpeg", "FFmpeg full-band spectrogram", "audio-spectrum", AUDIO_KINDS, frozenset({"quick", "balanced", "deep"})),
+    ToolSpec("ffmpeg_pcm", "ffmpeg", "FFmpeg Audacity-compatible PCM conversion", "audio", AUDIO_KINDS, frozenset({"balanced", "deep"})),
+    ToolSpec("sox_stats", "sox", "SoX signal statistics", "audio-signal", AUDIO_KINDS, frozenset({"balanced", "deep"})),
+    ToolSpec("sox_spectrogram", "sox", "SoX high-resolution spectrogram", "audio-spectrum", AUDIO_KINDS, frozenset({"deep"})),
+    ToolSpec("mediainfo", "mediainfo", "MediaInfo audio container inspection", "audio-metadata", AUDIO_KINDS, frozenset({"balanced", "deep"})),
+    ToolSpec("multimon_ng", "multimon-ng", "multimon-ng DTMF and AFSK decoder", "audio-decoding", frozenset({"wav"}), frozenset({"deep"})),
+    ToolSpec("minimodem", "minimodem", "minimodem 1200-baud FSK decoder", "audio-decoding", frozenset({"wav"}), frozenset({"deep"})),
 )
 
 
@@ -175,6 +187,15 @@ def _well_known_tool_directories(executable: str) -> tuple[str, ...]:
         directories.extend(root / "Git" / "usr" / "bin" for root in program_roots)
     elif executable == "strings":
         directories.extend(root / "Sysinternals" for root in program_roots)
+    elif executable in {"ffmpeg", "ffprobe"}:
+        directories.extend(root / "FFmpeg" / "bin" for root in [*user_program_roots, *program_roots])
+        directories.append(Path("C:/ffmpeg/bin"))
+    elif executable == "mediainfo":
+        directories.extend(root / "MediaInfo" for root in [*user_program_roots, *program_roots])
+    elif executable == "sox":
+        for root in program_roots:
+            if root.is_dir():
+                directories.extend(root.glob("sox-*"))
 
     # Common portable/package-manager shims cover tools such as zsteg and
     # steghide without recursively scanning arbitrary user directories.
@@ -347,7 +368,7 @@ class ExternalToolRunner:
             if selected_tools is not None and spec.tool_id not in selected_tools:
                 results.append(self._not_run(spec, "skipped", "Disabled in this job's analysis settings."))
                 continue
-            if not allow_extraction and spec.tool_id in {"foremost", "jpseek", "openstego", "outguess", "steghide", "stegseek"}:
+            if not allow_extraction and spec.tool_id in {"foremost", "jpseek", "openstego", "outguess", "steghide", "stegseek", "ffmpeg_spectrogram", "ffmpeg_pcm", "sox_spectrogram"}:
                 results.append(self._not_run(spec, "skipped", "External payload extraction is disabled in this job's settings."))
                 continue
             if spec.kinds is not None and kind not in spec.kinds:
@@ -481,6 +502,35 @@ class ExternalToolRunner:
                 argv = [executable, str(input_path), "stdout", "-l", ocr_language, "--psm", "6"]
             elif spec.tool_id == "zbarimg":
                 argv = [executable, "--quiet", "--raw", str(input_path)]
+            elif spec.tool_id == "ffprobe":
+                argv = [executable, "-v", "error", "-show_format", "-show_streams", "-of", "json", str(input_path)]
+            elif spec.tool_id == "ffmpeg_spectrogram":
+                extracted_path = temp_dir / "ffmpeg_spectrogram.png"
+                argv = [
+                    executable, "-hide_banner", "-nostdin", "-y", "-i", str(input_path),
+                    "-lavfi", "showspectrumpic=s=1600x800:legend=1:scale=log:color=channel",
+                    "-frames:v", "1", str(extracted_path),
+                ]
+            elif spec.tool_id == "ffmpeg_pcm":
+                extracted_path = temp_dir / "ffmpeg_audacity_review.wav"
+                argv = [
+                    executable, "-hide_banner", "-nostdin", "-y", "-i", str(input_path),
+                    "-vn", "-c:a", "pcm_s16le", str(extracted_path),
+                ]
+            elif spec.tool_id == "sox_stats":
+                argv = [executable, str(input_path), "-n", "stats"]
+            elif spec.tool_id == "sox_spectrogram":
+                extracted_path = temp_dir / "sox_spectrogram.png"
+                argv = [
+                    executable, str(input_path), "-n", "spectrogram", "-x", "1600", "-y", "800",
+                    "-z", "120", "-o", str(extracted_path),
+                ]
+            elif spec.tool_id == "mediainfo":
+                argv = [executable, "--Output=JSON", str(input_path)]
+            elif spec.tool_id == "multimon_ng":
+                argv = [executable, "-q", "-a", "DTMF", "-a", "AFSK1200", "-a", "AFSK2400", "-t", "wav", str(input_path)]
+            elif spec.tool_id == "minimodem":
+                argv = [executable, "--rx", "1200", "-f", str(input_path)]
             else:
                 return self._not_run(spec, "skipped", "No fixed invocation is registered.", executable=resolution.display)
 
@@ -587,13 +637,15 @@ class ExternalToolRunner:
                 ),
                 "extracted": [],
             }
-            if spec.tool_id == "exiftool" and stdout:
+            if spec.tool_id in {"exiftool", "ffprobe", "mediainfo"} and stdout:
                 try:
                     parsed = json.loads(stdout)
-                    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                    if spec.tool_id == "exiftool" and isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
                         metadata = dict(parsed[0])
                         metadata.pop("SourceFile", None)
                         method["metadata"] = normalize_json(metadata)
+                    elif spec.tool_id in {"ffprobe", "mediainfo"} and isinstance(parsed, dict):
+                        method["metadata"] = normalize_json(parsed)
                 except (ValueError, TypeError) as exc:
                     method["metadata_parse_error"] = f"{type(exc).__name__}: {display_text(exc, 200)}"
             if extracted_path and extracted_path.is_file():
@@ -608,6 +660,9 @@ class ExternalToolRunner:
                             "jpegtran": ("jpegtran_normalized", "losslessly normalize JPEG markers and entropy stream"),
                             "djpeg": ("djpeg_decoded", "decode JPEG pixels to a PPM validation artifact"),
                             "jpseek": ("jpseek_payload", "extract a JPHide payload with JPSeek"),
+                            "ffmpeg_spectrogram": ("ffmpeg_spectrogram", "render a full-band FFmpeg spectrogram"),
+                            "ffmpeg_pcm": ("ffmpeg_audacity_review", "convert decoded audio to Audacity-compatible 16-bit PCM WAV"),
+                            "sox_spectrogram": ("sox_spectrogram", "render a high-resolution SoX spectrogram"),
                         }
                         label, transformation = labels.get(spec.tool_id, (f"{spec.tool_id}_output", "external tool output"))
                         method["extracted"].append({
@@ -842,6 +897,9 @@ class ExternalToolRunner:
             "outguess": ["-h"], "7z": [], "tiffdump": ["--version"], "webpmux": ["-version"],
             "tesseract": ["--version"], "zbarimg": ["--version"],
             "foremost": ["-V"], "jpseek": [], "jsteg": ["--help"], "openstego": ["--version"],
+            "ffprobe": ["-version"], "ffmpeg_spectrogram": ["-version"], "ffmpeg_pcm": ["-version"],
+            "sox_stats": ["--version"], "sox_spectrogram": ["--version"],
+            "mediainfo": ["--Version"], "multimon_ng": ["--help"], "minimodem": ["--version"],
         }.get(spec.tool_id, ["--version"])
         result = self._execute(self._launch_argv(resolution, version_args), cwd=cwd, timeout=4)
         combined = (result["stdout"] or result["stderr"]).strip().splitlines()

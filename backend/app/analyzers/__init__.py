@@ -1,4 +1,4 @@
-"""Built-in image forensics analyzers.
+"""Built-in image and audio forensics analyzers.
 
 The modules in this package deliberately have no mandatory third-party
 dependencies.  Optional Python packages and command line tools are detected at
