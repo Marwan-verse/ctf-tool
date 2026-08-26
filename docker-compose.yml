@@ -1,0 +1,62 @@
+name: forenscope
+
+services:
+  backend:
+    build:
+      context: ./backend
+    environment:
+      FORENSCOPE_ALLOWED_HOSTS: "localhost,127.0.0.1,[::1],backend,testserver"
+      FORENSCOPE_ALLOWED_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000"
+      FORENSCOPE_DATA_DIR: /data
+      FORENSCOPE_DB_PATH: /data/forenscope.sqlite3
+      FORENSCOPE_MAX_UPLOAD_BYTES: ${FORENSCOPE_MAX_UPLOAD_BYTES:-104857600}
+      FORENSCOPE_MAX_WORKERS: ${FORENSCOPE_MAX_WORKERS:-2}
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - forenscope-data:/data
+    networks:
+      - forenscope-local
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=256m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2.0
+    stop_grace_period: 20s
+
+  web:
+    build:
+      context: ./web
+    environment:
+      HOST: 0.0.0.0
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      PORT: "3000"
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - forenscope-local
+    depends_on:
+      backend:
+        condition: service_healthy
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 1.0
+    stop_grace_period: 15s
+
+networks:
+  forenscope-local:
+    internal: true
+
+volumes:
+  forenscope-data:

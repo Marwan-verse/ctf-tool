@@ -1,0 +1,53 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# ForenScope runtime evidence and reports
+data/
+backend/data/
+backend/.data/
+backend/reports/
+backend/artifacts/
+*.sqlite
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Node / local web builds
+node_modules/
+web/.next/
+web/.vinext/
+web/.wrangler/
+web/.open-next/
+web/coverage/
+web/dist/
+*.tsbuildinfo
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.tmp
+*.log
