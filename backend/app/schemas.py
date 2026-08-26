@@ -39,6 +39,7 @@ class AnalysisOptions(BaseModel):
     barcodes: bool = True
     recursive_extraction: bool = True
     decoders: bool = True
+    crypto_analysis: bool = True
     repairs: bool = True
     external_tools: bool = True
     external_extraction: bool = True

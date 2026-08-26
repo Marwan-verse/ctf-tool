@@ -29,7 +29,7 @@ Alternatively, run `docker compose up --build`. Both published ports bind to loo
 
 ## Image analysis coverage
 
-Built-in analyzers cover hashing, magic signatures, entropy, ASCII/UTF-16 strings, PNG/JPEG/GIF/BMP/WebP/TIFF/ICO structure, embedded objects and trailers, bounded carving, nested archives, Base encodings, compression layers, visual channels, bit planes, animation frames, transparency, LSB permutations, OCR, QR/barcodes, and non-destructive repair candidates.
+Built-in analyzers cover hashing, magic signatures, entropy, ASCII/UTF-16 strings, PNG/JPEG/GIF/BMP/WebP/TIFF/ICO structure, embedded objects and trailers, bounded carving, nested archives, Base encodings, compression layers, visual channels, bit planes, animation frames, transparency, LSB permutations, OCR, QR/barcodes, possible encrypted-payload detection, passphrase-based recovery, and non-destructive repair candidates.
 
 The bounded CLI adapter library currently includes:
 
@@ -45,7 +45,7 @@ Audio-only spectrogram and document-only `pdfinfo`/PDFiD analyzers are represent
 
 ## Configurable scan settings
 
-The settings panel controls structure parsing, visual analysis, LSB streams, OCR, barcodes, recursive extraction, decoders, repair generation, external tools, and external payload extraction. It also sets the recursion depth, artifact ceiling, per-tool timeout, external output budget, extracted-file ceiling, color-remap variants, OCR language, zsteg mode, and the exact external adapters to run. Settings are server-validated and saved with the job; passphrases are never persisted.
+The settings panel controls structure parsing, visual analysis, LSB streams, OCR, barcodes, recursive extraction, decoders, encrypted-payload recovery, repair generation, external tools, and external payload extraction. It also sets the recursion depth, artifact ceiling, per-tool timeout, external output budget, extracted-file ceiling, color-remap variants, OCR language, zsteg mode, and the exact external adapters to run. Settings are server-validated and saved with the job; passphrases are never persisted. When a ciphertext-like payload is detected, the engine reports the signal and, if a passphrase was supplied, tries only bounded repeating-key XOR and OpenSSL salted AES-256-CBC recovery. Successful plaintext is written as a hashed child artifact and scanned for flag candidates.
 
 Results can be searched across flag candidates, provenance, metadata paths and values, artifact names and hashes, method summaries, and bounded tool output. JSON, standalone HTML, and ZIP case exports preserve the same evidence record.
 

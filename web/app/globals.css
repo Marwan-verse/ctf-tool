@@ -170,6 +170,8 @@ button.nav-item:disabled { opacity: 1; }
 .error-banner > span { width: 23px; height: 23px; display: grid; place-items: center; border-radius: 7px; color: #fff; background: #e11d48; font-size: 11px; font-weight: 800; }.error-banner p { margin: 0; font-size: 10px; }.error-banner button { border: 0; color: #9f1239; background: transparent; font-size: 17px; cursor: pointer; }.error-banner.wide { max-width: 1260px; margin: -18px auto 18px; }
 .password-toggle { display: block; margin: 10px 0 0; padding: 0; border: 0; color: var(--green-2); background: transparent; font-size: 8px; font-weight: 700; cursor: pointer; }
 .password-input { width: 100%; height: 36px; margin-top: 8px; padding: 0 10px; border: 1px solid #d8e0da; border-radius: 9px; outline: none; background: #fff; font-size: 9px; }
+.password-hint { display: block; margin: 5px 1px 0; color: #7b887f; font-size: 7px; line-height: 1.4; }
+.password-hint code { padding: 1px 3px; border-radius: 3px; color: #456452; background: #eef4ef; font-family: var(--font-geist-mono); font-size: 6px; }
 .password-input:focus, .input-shell:focus-within { border-color: #659278; box-shadow: 0 0 0 3px rgba(31,106,72,.08); }
 .engine-offline { background: #45242d; }
 

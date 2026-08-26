@@ -6,7 +6,7 @@ type Profile = 'quick' | 'balanced' | 'deep';
 type Screen = 'setup' | 'running' | 'results';
 type ResultTab = 'overview' | 'candidates' | 'artifacts' | 'visual' | 'metadata' | 'tools' | 'methods';
 type MethodFilter = 'all' | 'completed' | 'missing' | 'skipped' | 'failed';
-type BooleanOptionKey = 'structure_analysis' | 'visual_analysis' | 'lsb_analysis' | 'ocr' | 'barcodes' | 'recursive_extraction' | 'decoders' | 'repairs' | 'external_tools' | 'external_extraction';
+type BooleanOptionKey = 'structure_analysis' | 'visual_analysis' | 'lsb_analysis' | 'ocr' | 'barcodes' | 'recursive_extraction' | 'decoders' | 'crypto_analysis' | 'repairs' | 'external_tools' | 'external_extraction';
 
 type ScanOptions = {
   structure_analysis: boolean;
@@ -16,6 +16,7 @@ type ScanOptions = {
   barcodes: boolean;
   recursive_extraction: boolean;
   decoders: boolean;
+  crypto_analysis: boolean;
   repairs: boolean;
   external_tools: boolean;
   external_extraction: boolean;
@@ -180,9 +181,9 @@ const API_BASE = (
 ).replace(/\/$/, '');
 const TERMINAL = new Set(['completed', 'succeeded', 'partial', 'failed', 'cancelled', 'expired']);
 const profileOptionDefaults: Record<Profile, ScanOptions> = {
-  quick: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 2, max_artifacts: 45, tool_timeout_seconds: 20, external_output_kib: 512, max_external_files: 16, color_remap_variants: 4, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
-  balanced: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 3, max_artifacts: 100, tool_timeout_seconds: 60, external_output_kib: 1024, max_external_files: 32, color_remap_variants: 8, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
-  deep: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 4, max_artifacts: 220, tool_timeout_seconds: 180, external_output_kib: 2048, max_external_files: 64, color_remap_variants: 8, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
+  quick: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 2, max_artifacts: 45, tool_timeout_seconds: 20, external_output_kib: 512, max_external_files: 16, color_remap_variants: 4, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
+  balanced: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 3, max_artifacts: 100, tool_timeout_seconds: 60, external_output_kib: 1024, max_external_files: 32, color_remap_variants: 8, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
+  deep: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 4, max_artifacts: 220, tool_timeout_seconds: 180, external_output_kib: 2048, max_external_files: 64, color_remap_variants: 8, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
 };
 const configurableMethods: Array<{ key: BooleanOptionKey; title: string; copy: string }> = [
   { key: 'structure_analysis', title: 'Structure & metadata', copy: 'Chunks, markers, EXIF, comments, trailers and embedded objects.' },
@@ -192,6 +193,7 @@ const configurableMethods: Array<{ key: BooleanOptionKey; title: string; copy: s
   { key: 'barcodes', title: 'Barcode & QR decoding', copy: 'ZBar and OpenCV QR cross-checks.' },
   { key: 'recursive_extraction', title: 'Carving & recursion', copy: 'Embedded signatures, archives and nested image structures.' },
   { key: 'decoders', title: 'Encoding decoders', copy: 'Base encodings and bounded compression chains.' },
+  { key: 'crypto_analysis', title: 'Encrypted payload recovery', copy: 'Detect ciphertext signals and try a supplied passphrase on bounded payloads.' },
   { key: 'repairs', title: 'Repair candidates', copy: 'Hashed repair copies while preserving the original.' },
   { key: 'external_tools', title: 'External CLI tools', copy: 'Run installed command-line analyzers in bounded subprocesses.' },
   { key: 'external_extraction', title: 'External payload extraction', copy: 'Allow password-gated stego tools to write bounded child artifacts.' },
@@ -412,7 +414,7 @@ export default function Home() {
       const next = await readJson(await fetch(`${API_BASE}/api/jobs/${id}`, { cache: 'no-store' })) as Job;
       setJob(next);
       if (next.profile) setProfile(next.profile);
-      if (next.options) setScanOptions(next.options);
+      if (next.options) setScanOptions({ ...profileOptionDefaults[next.profile || 'balanced'], ...next.options });
       if (TERMINAL.has(next.status.toLowerCase())) {
         setScreen('results');
         refreshRecent();
@@ -503,7 +505,7 @@ export default function Home() {
   const filteredFindings = findings.filter((finding) => queryMatches(finding.title, finding.description, finding.summary, finding.category, finding.method_id));
   const filteredVisuals = visuals.filter((view) => queryMatches(view.title, view.name, view.kind, view.category));
   const availableTools = capabilities.filter((capability) => capability.available === true).length;
-  const armedMethodCount = 9 + availableTools;
+  const armedMethodCount = 10 + availableTools;
 
   function selectFile(file?: File | null) {
     setError('');
@@ -607,7 +609,7 @@ export default function Home() {
   async function openRecent(recent: Job) {
     setJob(recent);
     if (recent.profile) setProfile(recent.profile);
-    if (recent.options) setScanOptions(recent.options);
+    if (recent.options) setScanOptions({ ...profileOptionDefaults[recent.profile || 'balanced'], ...recent.options });
     const id = getJobId(recent);
     if (id) await refreshJob(id);
     setScreen(TERMINAL.has(recent.status.toLowerCase()) ? 'results' : 'running');
@@ -720,8 +722,8 @@ export default function Home() {
                   <label htmlFor="flag-prefix-mobile">Flag prefix <span>Optional</span></label>
                   <div className="input-shell"><input id="flag-prefix-mobile" value={flagPrefix} onChange={(event) => setFlagPrefix(event.target.value.slice(0, 64))} placeholder="e.g. picoCTF, HTB, flag" /><kbd>{'{…}'}</kbd></div>
                   <p>Specific prefixes rank true flags above decoys.</p>
-                  <button className="password-toggle" onClick={() => setShowPassword((open) => !open)}>{showPassword ? 'Hide passphrase' : '+ Add a stego passphrase'}</button>
-                  {showPassword && <input className="password-input" type="password" value={password} autoComplete="off" onChange={(event) => setPassword(event.target.value.slice(0, 256))} placeholder="Optional passphrase" />}
+                  <button className="password-toggle" onClick={() => setShowPassword((open) => !open)}>{showPassword ? 'Hide passphrase / key' : '+ Add a passphrase or key'}</button>
+                  {showPassword && <><input className="password-input" type="password" value={password} autoComplete="off" onChange={(event) => setPassword(event.target.value.slice(0, 256))} placeholder="Optional stego or decryption passphrase" /><small className="password-hint">Used only for this scan. Supports OpenSSL salted AES and passphrase-based XOR checks; prefix a raw key with <code>hex:</code>.</small></>}
                 </div>
                 {recentJobs.length > 0 && (
                   <section className="mobile-recent-scans" aria-labelledby="mobile-recent-title">
@@ -757,8 +759,8 @@ export default function Home() {
                   <label htmlFor="flag-prefix">Flag prefix <span>Optional</span></label>
                   <div className="input-shell"><input id="flag-prefix" value={flagPrefix} onChange={(event) => setFlagPrefix(event.target.value.slice(0, 64))} placeholder="e.g. picoCTF, HTB, flag" /><kbd>{'{…}'}</kbd></div>
                   <p>Specific prefixes rank true flags above decoys.</p>
-                  <button className="password-toggle" onClick={() => setShowPassword((open) => !open)}>{showPassword ? 'Hide passphrase' : '+ Add a stego passphrase'}</button>
-                  {showPassword && <input className="password-input" type="password" value={password} autoComplete="off" onChange={(event) => setPassword(event.target.value.slice(0, 256))} placeholder="Optional passphrase" />}
+                  <button className="password-toggle" onClick={() => setShowPassword((open) => !open)}>{showPassword ? 'Hide passphrase / key' : '+ Add a passphrase or key'}</button>
+                  {showPassword && <><input className="password-input" type="password" value={password} autoComplete="off" onChange={(event) => setPassword(event.target.value.slice(0, 256))} placeholder="Optional stego or decryption passphrase" /><small className="password-hint">Used only for this scan. Supports OpenSSL salted AES and passphrase-based XOR checks; prefix a raw key with <code>hex:</code>.</small></>}
                 </div>
                 <div className={`engine-status ${engineOnline === false ? 'engine-offline' : ''}`}>
                   <span className="pulse-ring"><i /></span>

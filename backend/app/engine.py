@@ -31,6 +31,7 @@ from .analyzers.common import (
     utc_now,
 )
 from .analyzers.core import BoundedDecoder, CandidateCollector, inspect_bytes
+from .analyzers.crypto import analyze_encrypted_payloads
 from .analyzers.external import ExternalToolRunner, TOOL_SPECS
 from .analyzers.formats import analyze_format
 from .analyzers.visual import analyze_visual
@@ -199,6 +200,7 @@ class AnalysisEngine:
             "barcodes": True,
             "recursive_extraction": True,
             "decoders": True,
+            "crypto_analysis": True,
             "repairs": True,
             "external_tools": True,
             "external_extraction": True,
@@ -448,7 +450,7 @@ class AnalysisEngine:
                             elif reason:
                                 log("warning", f"Skipped nested artifact {extracted['label']}: {reason}", "recursive-structure")
                 if artifact_kind in {"zip", "gzip", "bzip2", "xz"} and depth < limits["recursion_depth"]:
-                    members = self._expand_archive(artifact_data, artifact_kind, artifact_id, depth, store, derived_queue, add_finding, log)
+                    members = self._expand_archive(artifact_data, artifact_kind, artifact_id, depth, store, derived_queue, add_finding, log, password=password)
                     archive_members += members
             methods.append({
                 "id": "recursive-analysis", "name": "Recursive artifact and archive analysis", "category": "embedded-data",
@@ -672,6 +674,118 @@ class AnalysisEngine:
                     log("warning", method["summary"], method_id, return_code=method.get("return_code"))
                 methods.append(_public_method(method))
 
+            self._emit(progress_callback, 90, "crypto", "Detecting possible encrypted payloads and trying bounded recovery")
+            check_cancelled(is_cancelled)
+            crypto_start = time.monotonic()
+            crypto_inputs: list[dict[str, Any]] = ([{
+                "artifact_id": source_id, "label": "source", "kind": source_kind, "data": source_data,
+            }] if analysis_options["crypto_analysis"] else [])
+            crypto_budget = 64 * 1024 * 1024
+            # Image containers are skipped by the crypto analyzer itself; do
+            # not let their large compressed byte buffer consume the payload
+            # budget needed for metadata, LSB, and extracted artifacts.
+            crypto_bytes = (
+                min(len(source_data), 4 * 1024 * 1024)
+                if analysis_options["crypto_analysis"] and source_kind not in {"png", "jpeg", "gif", "bmp", "webp", "tiff", "ico"}
+                else 0
+            )
+            known_artifact_ids = {str(artifact.get("id")) for artifact in store.artifacts}
+            if analysis_options["crypto_analysis"]:
+                for seed in all_string_seeds[:2_000]:
+                    text_value = str(seed.get("text") or "").encode("utf-8", "replace")
+                    if not text_value or crypto_bytes + len(text_value) > crypto_budget:
+                        continue
+                    crypto_inputs.append({
+                        "artifact_id": seed.get("artifact_id") or source_id,
+                        "label": f"{seed.get('source') or 'extracted string'}",
+                        "kind": "text", "data": text_value,
+                    })
+                    crypto_bytes += len(text_value)
+                for artifact in store.artifacts[1:]:
+                    if crypto_bytes >= crypto_budget:
+                        break
+                    relative_path = artifact.get("relative_path")
+                    if not relative_path:
+                        continue
+                    try:
+                        artifact_path = (destination / str(relative_path)).resolve(strict=True)
+                        if not _is_relative_to(artifact_path, destination) or not artifact_path.is_file():
+                            continue
+                        read_limit = min(4 * 1024 * 1024, crypto_budget - crypto_bytes)
+                        artifact_data, _ = bounded_read(artifact_path, read_limit)
+                    except (OSError, ValueError):
+                        continue
+                    if not artifact_data:
+                        continue
+                    crypto_inputs.append({
+                        "artifact_id": artifact.get("id") or source_id,
+                        "label": artifact.get("name") or "derived artifact",
+                        "kind": artifact.get("detected_type") or "binary", "data": artifact_data,
+                    })
+                    crypto_bytes += len(artifact_data)
+            crypto_result = analyze_encrypted_payloads(
+                crypto_inputs,
+                passphrase=password,
+                enabled=bool(analysis_options["crypto_analysis"]),
+            )
+            crypto_detections = crypto_result.pop("detections", [])
+            crypto_decryptions = crypto_result.pop("decryptions", [])
+            crypto_artifact_ids: list[str] = []
+            if crypto_detections:
+                add_finding({
+                    "severity": "info", "category": "crypto", "title": "Possible encrypted payload detected",
+                    "description": "One or more extracted payloads have ciphertext-like signals. Supply a passphrase in scan setup to attempt bounded recovery.",
+                    "details": {"payload_count": len(crypto_detections), "decrypted_count": len(crypto_decryptions)},
+                }, source_id, "crypto-analysis")
+            for decryption in crypto_decryptions:
+                plaintext = decryption.pop("data", b"")
+                if not isinstance(plaintext, bytes) or not plaintext:
+                    continue
+                parent_id = str(decryption.get("artifact_id") or source_id)
+                if parent_id not in known_artifact_ids:
+                    parent_id = source_id
+                algorithm = str(decryption.get("algorithm") or "bounded decryption")
+                artifact_id, _, reason = store.add_bytes(
+                    plaintext,
+                    label=f"decrypted_{algorithm}",
+                    parent_id=parent_id,
+                    producer="crypto-analysis",
+                    transformation=f"decrypt {algorithm}",
+                    kind=sniff_kind(plaintext),
+                    parameters={"algorithm": algorithm, "encoding": decryption.get("encoding")},
+                )
+                if artifact_id:
+                    crypto_artifact_ids.append(artifact_id)
+                    hits = collector.scan_bytes(
+                        plaintext, source_artifact_id=artifact_id, method="crypto-decryption",
+                        transform_chain=[algorithm], confidence_hint=18,
+                    )
+                    if hits:
+                        add_finding({
+                            "severity": "high", "category": "crypto", "title": "Flag-like text recovered by decryption",
+                            "description": "A bounded decryption attempt produced flag-shaped text; inspect the linked decrypted artifact and candidate provenance.",
+                            "details": {"algorithm": algorithm, "decrypted_artifact_id": artifact_id},
+                        }, parent_id, "crypto-decryption")
+                elif reason:
+                    log("warning", f"Skipped decrypted artifact: {reason}", "crypto-analysis")
+            methods.append({
+                "id": "crypto-analysis", "name": "Encrypted payload detection and recovery", "category": "crypto",
+                "status": "completed" if analysis_options["crypto_analysis"] else "skipped", "applicable": True,
+                "started_at": utc_now() if analysis_options["crypto_analysis"] else None,
+                "duration_ms": int((time.monotonic() - crypto_start) * 1000),
+                "summary": crypto_result.get("summary", "Encrypted-payload analysis was skipped."),
+                "tool": {"executable": "Python stdlib + cryptography", "resolved": None, "version": None},
+                "artifact_ids": crypto_artifact_ids,
+                "details": {
+                    "detections": crypto_detections[:100],
+                    "decryption_results": crypto_decryptions[:64],
+                    "attempts": crypto_result.get("attempts", 0),
+                    "dependency_missing": crypto_result.get("dependency_missing", False),
+                    "input_count": len(crypto_inputs),
+                    "input_bytes": crypto_bytes,
+                },
+            })
+
             # Metadata collected late can contain layered encoding; run a small second pass.
             late_seeds = [seed for seed in all_string_seeds if str(seed.get("source", "")).startswith("metadata:")]
             if late_seeds and analysis_options["decoders"]:
@@ -816,6 +930,7 @@ class AnalysisEngine:
     def _expand_archive(
         data: bytes, kind: str, parent_id: str, depth: int, store: ArtifactStore,
         queue: deque[tuple[str, bytes, str, int]], add_finding: Callable[..., None], log: Callable[..., None],
+        *, password: str | None = None,
     ) -> int:
         count = 0
         if kind == "zip":
@@ -835,8 +950,9 @@ class AnalysisEngine:
                             log("warning", f"Skipped symbolic-link ZIP member {display_text(info.filename, 200)}", "recursive-analysis")
                             continue
                         if info.flag_bits & 0x1:
-                            log("info", f"Skipped encrypted ZIP member {display_text(info.filename, 200)}; no archive password workflow was requested.", "recursive-analysis")
-                            continue
+                            if not password:
+                                log("info", f"Skipped encrypted ZIP member {display_text(info.filename, 200)}; no archive password was supplied.", "recursive-analysis")
+                                continue
                         if info.file_size > store.limits["max_single_artifact"]:
                             log("warning", f"Skipped oversized ZIP member {display_text(info.filename, 200)}", "recursive-analysis", size=info.file_size)
                             continue
@@ -844,7 +960,8 @@ class AnalysisEngine:
                             log("warning", f"Skipped extreme-ratio ZIP member {display_text(info.filename, 200)}", "recursive-analysis", ratio=info.file_size / info.compress_size)
                             continue
                         try:
-                            with archive.open(info, "r") as member:
+                            member_password = password.encode("utf-8") if info.flag_bits & 0x1 and password else None
+                            with archive.open(info, "r", pwd=member_password) as member:
                                 payload = member.read(store.limits["max_single_artifact"] + 1)
                         except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
                             log("warning", f"Could not read ZIP member {display_text(info.filename, 200)}: {display_text(exc, 300)}", "recursive-analysis")

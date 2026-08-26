@@ -30,6 +30,7 @@ def test_engine_honors_disabled_stages_and_custom_budgets(clean_png: Path, tmp_p
             "visual_analysis": False,
             "recursive_extraction": False,
             "decoders": False,
+            "crypto_analysis": False,
             "external_tools": False,
             "repairs": False,
             "max_recursion_depth": 1,
@@ -48,6 +49,7 @@ def test_engine_honors_disabled_stages_and_custom_budgets(clean_png: Path, tmp_p
     assert methods["color_remapping"]["status"] == "skipped"
     assert methods["spectrogram"]["status"] == "skipped"
     assert methods["bounded-decoder"]["status"] == "skipped"
+    assert methods["crypto-analysis"]["status"] == "skipped"
     assert all(methods[spec_id]["status"] == "skipped" for spec_id in report["coverage"]["optional_tools_declared"])
     assert report["coverage"]["limits"]["recursion_depth"] == 1
     assert report["coverage"]["limits"]["max_artifacts"] == 25
