@@ -182,6 +182,8 @@ def sniff_media_type(path: Path) -> tuple[str, bool]:
         return "image/jpeg", True
     if head.startswith((b"GIF87a", b"GIF89a")):
         return "image/gif", True
+    if head.startswith(b"BM"):
+        return "image/bmp", True
     if len(head) >= 12 and head.startswith(b"RIFF") and head[8:12] == b"WEBP":
         return "image/webp", True
     guessed, _ = mimetypes.guess_type(path.name)

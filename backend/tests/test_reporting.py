@@ -4,7 +4,7 @@ import json
 import zipfile
 from pathlib import Path
 
-from app.reporting import normalize_report, render_html_report, report_csp, write_report_zip
+from app.reporting import normalize_report, render_html_report, report_csp, sniff_media_type, write_report_zip
 
 
 def test_normalized_report_redacts_passwords_and_private_paths(tmp_path: Path) -> None:
@@ -61,6 +61,13 @@ def test_html_report_escapes_untrusted_values_and_has_hash_only_style_csp() -> N
     assert "&lt;script&gt;" in document
     assert "style-src 'sha256-" in csp
     assert "'unsafe-inline'" not in csp
+
+
+def test_bmp_artifacts_are_safe_inline_previews(tmp_path: Path) -> None:
+    carved = tmp_path / "carved.bmp"
+    carved.write_bytes(b"BM" + b"\0" * 14)
+
+    assert sniff_media_type(carved) == ("image/bmp", True)
 
 
 def test_zip_export_uses_generated_paths_and_skips_escape(tmp_path: Path) -> None:

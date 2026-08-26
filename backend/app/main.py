@@ -6,18 +6,16 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import re
 import shutil
-import subprocess
 import tempfile
+import threading
 import time
-import zipfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import anyio
@@ -30,8 +28,9 @@ from starlette.background import BackgroundTask
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import __version__
-from .analyzers.external import TOOL_SPECS
+from .analyzers.external import TOOL_SPECS, discover_wsl_tools, resolve_tool
 from .config import MEBIBYTE, Settings, settings as default_settings
+from .hexview import inspect_file
 from .jobs import JobManager
 from .reporting import (
     artifact_public_record,
@@ -53,7 +52,7 @@ from .schemas import (
     JobStatus,
     ScanProfile,
     TERMINAL_STATUSES,
-    ToolDownloadRequest,
+    ToolInstallRequest,
 )
 from .security import (
     OriginValidationMiddleware,
@@ -67,56 +66,14 @@ from .security import (
     validate_short_text,
 )
 from .storage import Storage
-
-
-# Static, HTTPS-only project pages used by the GUI's missing-tool install links.
-# The server never downloads or executes these binaries automatically.
-TOOL_DOWNLOAD_URLS: dict[str, str] = {
-    "file": "https://darwinsys.com/file/",
-    "exiftool": "https://exiftool.org/",
-    "exiv2": "https://exiv2.org/download.html",
-    "strings": "https://sourceware.org/binutils/",
-    "identify": "https://imagemagick.org/script/download.php",
-    "pngcheck": "https://libpng.org/pub/png/apps/pngcheck.html",
-    "pngcrush": "https://pmt.sourceforge.net/pngcrush/",
-    "jpeginfo": "https://github.com/tjko/jpeginfo",
-    "jpegtran": "https://libjpeg-turbo.org/Downloads",
-    "djpeg": "https://libjpeg-turbo.org/Downloads",
-    "zsteg": "https://github.com/zed-0xff/zsteg",
-    "stegseek": "https://github.com/RickdeJager/stegseek",
-    "steghide": "https://steghide.sourceforge.net/download.php",
-    "outguess": "https://github.com/resurrecting-open-source-projects/outguess",
-    "jpseek": "https://github.com/search?q=jpseek&type=repositories",
-    "jsteg": "https://github.com/lukechampine/jsteg",
-    "openstego": "https://www.openstego.com/download.html",
-    "binwalk": "https://github.com/ReFirmLabs/binwalk",
-    "foremost": "https://github.com/korczis/foremost",
-    "7z": "https://www.7-zip.org/download.html",
-    "tiffinfo": "https://libtiff.gitlab.io/libtiff/",
-    "tiffdump": "https://libtiff.gitlab.io/libtiff/",
-    "webpinfo": "https://developers.google.com/speed/webp/download",
-    "webpmux": "https://developers.google.com/speed/webp/download",
-    "gifsicle": "https://www.lcdf.org/gifsicle/",
-    "tesseract": "https://github.com/tesseract-ocr/tesseract",
-    "zbarimg": "https://github.com/mchehab/zbar",
-}
-
-# Winget package IDs are deliberately fixed. The download endpoint never
-# accepts package names or URLs from the browser and never runs the installers.
-WINGET_PACKAGE_IDS: dict[str, str] = {
-    "exiftool": "OliverBetz.ExifTool",
-    "exiv2": "Exiv2.Exiv2",
-    "identify": "ImageMagick.ImageMagick",
-    "openstego": "syvaidya.openstego",
-    "7z": "7zip.7zip",
-    "tesseract": "tesseract-ocr.tesseract",
-}
-MAX_TOOL_DOWNLOAD_BYTES = 512 * MEBIBYTE
-MAX_TOOL_DOWNLOAD_FILE_BYTES = 256 * MEBIBYTE
+from .tool_installation import INSTALLABLE_TOOL_IDS, install_strategy, install_tools
 
 
 logger = logging.getLogger(__name__)
 _SSE_EVENT_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,47}$")
+_TOOL_CAPABILITY_CACHE_SECONDS = 300.0
+_tool_capability_cache_lock = threading.Lock()
+_tool_capability_cache: tuple[float, list[dict[str, Any]]] | None = None
 
 
 def _detail(code: str, message: str) -> dict[str, dict[str, str]]:
@@ -168,180 +125,45 @@ def _artifact_path(settings: Settings, job_id: str, artifact: dict[str, Any]) ->
         ) from exc
 
 
+def _tool_capability(spec: Any, wsl_tools: dict[str, str]) -> dict[str, Any]:
+    resolved = resolve_tool(spec.executable, wsl_tools=wsl_tools)
+    return {
+        "id": spec.tool_id,
+        "name": spec.name,
+        "executable": spec.executable,
+        "category": spec.category,
+        "available": resolved is not None,
+        "resolved": resolved.display if resolved else None,
+        "source": resolved.source if resolved else None,
+        "profiles": sorted(spec.profiles),
+        "formats": sorted(spec.kinds) if spec.kinds is not None else ["all"],
+        "installable": spec.tool_id in INSTALLABLE_TOOL_IDS,
+        "install_strategy": install_strategy(spec.tool_id),
+        "install_hint": (
+            f"Detected through {resolved.source}: {resolved.display}."
+            if resolved
+            else "Install automatically from Scan settings, then refresh availability."
+        ),
+    }
+
+
 def _tool_capabilities() -> list[dict[str, Any]]:
-    return [
-        {
-            "id": spec.tool_id,
-            "name": spec.name,
-            "executable": spec.executable,
-            "category": spec.category,
-            "available": shutil.which(spec.executable) is not None,
-            "profiles": sorted(spec.profiles),
-            "formats": sorted(spec.kinds) if spec.kinds is not None else ["all"],
-            "download_url": TOOL_DOWNLOAD_URLS.get(spec.tool_id),
-            "install_hint": "Open the project page for install instructions; Forenscope will detect it after restart.",
-        }
-        for spec in TOOL_SPECS
-    ]
+    global _tool_capability_cache
+    now = time.monotonic()
+    with _tool_capability_cache_lock:
+        if _tool_capability_cache and now - _tool_capability_cache[0] < _TOOL_CAPABILITY_CACHE_SECONDS:
+            return [dict(item) for item in _tool_capability_cache[1]]
+    wsl_tools = discover_wsl_tools(tuple(spec.executable for spec in TOOL_SPECS))
+    capabilities = [_tool_capability(spec, wsl_tools) for spec in TOOL_SPECS]
+    with _tool_capability_cache_lock:
+        _tool_capability_cache = (time.monotonic(), capabilities)
+    return [dict(item) for item in capabilities]
 
 
-def _tool_download_root(settings: Settings) -> Path:
-    root = (settings.data_dir / "tool-downloads").resolve()
-    data_root = settings.data_dir.resolve()
-    if data_root not in root.parents:
-        raise RuntimeError("Tool download directory escaped the configured data directory")
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-
-def _run_winget_download(executable: str, package_id: str, target: Path) -> dict[str, Any]:
-    """Download one allowlisted package with a bounded, non-interactive process."""
-
-    command = [
-        executable,
-        "download",
-        "--id",
-        package_id,
-        "--exact",
-        "--source",
-        "winget",
-        "--download-directory",
-        str(target),
-        "--accept-source-agreements",
-        "--accept-package-agreements",
-        "--disable-interactivity",
-    ]
-    output_limit = 64 * 1024
-    started = time.monotonic()
-    with tempfile.TemporaryFile(mode="w+b") as output_file:
-        kwargs: dict[str, Any] = {
-            "args": command,
-            "cwd": str(target),
-            "stdin": subprocess.DEVNULL,
-            "stdout": output_file,
-            "stderr": subprocess.STDOUT,
-            "shell": False,
-            "close_fds": True,
-        }
-        if os.name == "nt":
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        try:
-            process = subprocess.Popen(**kwargs)
-        except OSError as exc:
-            return {"status": "failed", "return_code": None, "output": f"{type(exc).__name__}: {str(exc)[:400]}"}
-        status = "completed"
-        try:
-            process.wait(timeout=120)
-        except subprocess.TimeoutExpired:
-            status = "timed_out"
-            try:
-                process.terminate()
-                process.wait(timeout=2)
-            except (OSError, subprocess.TimeoutExpired):
-                process.kill()
-                process.wait(timeout=2)
-        output_file.seek(0)
-        output = output_file.read(output_limit + 1).decode("utf-8", "replace")
-        if len(output) > output_limit:
-            output = output[:output_limit] + "\n… output truncated"
-        return {
-            "status": status if status != "completed" or process.returncode == 0 else "failed",
-            "return_code": process.returncode,
-            "output": output.strip(),
-            "duration_ms": int((time.monotonic() - started) * 1000),
-        }
-
-
-def _download_tool_installers(settings: Settings, tool_ids: list[str]) -> dict[str, Any]:
-    root = _tool_download_root(settings)
-    bundle_id = f"bundle-{uuid4().hex}"
-    batch_dir = (root / f"batch-{uuid4().hex}").resolve()
-    if root not in batch_dir.parents:
-        raise RuntimeError("Tool download batch escaped its root")
-    batch_dir.mkdir(parents=True, exist_ok=False)
-    manager = shutil.which("winget")
-    items: list[dict[str, Any]] = []
-    downloaded_files: list[Path] = []
-    total_bytes = 0
-    try:
-        for tool_id in tool_ids:
-            package_id = WINGET_PACKAGE_IDS.get(tool_id)
-            base_item = {
-                "id": tool_id,
-                "download_url": TOOL_DOWNLOAD_URLS.get(tool_id),
-            }
-            spec = next((candidate for candidate in TOOL_SPECS if candidate.tool_id == tool_id), None)
-            if spec is not None and shutil.which(spec.executable) is not None:
-                items.append({**base_item, "status": "already_available", "message": "Tool is already available on PATH."})
-                continue
-            if package_id is None:
-                items.append({
-                    **base_item,
-                    "status": "manual",
-                    "message": "No safe package-manager mapping is available; use the project download page.",
-                })
-                continue
-            if manager is None:
-                items.append({
-                    **base_item,
-                    "status": "manager_unavailable",
-                    "message": "The supported package manager (winget) is not installed on this host.",
-                })
-                continue
-            result = _run_winget_download(manager, package_id, batch_dir)
-            new_files: list[Path] = []
-            for candidate in sorted(batch_dir.rglob("*")):
-                if candidate.is_symlink() or not candidate.is_file() or candidate in downloaded_files:
-                    continue
-                try:
-                    size = candidate.stat().st_size
-                except OSError:
-                    continue
-                if size <= 0 or size > MAX_TOOL_DOWNLOAD_FILE_BYTES or total_bytes + size > MAX_TOOL_DOWNLOAD_BYTES:
-                    continue
-                new_files.append(candidate)
-                downloaded_files.append(candidate)
-                total_bytes += size
-            item_status = "downloaded" if result["status"] == "completed" and new_files else result["status"]
-            items.append({
-                **base_item,
-                "status": item_status,
-                "message": "Installer downloaded." if item_status == "downloaded" else (result.get("output") or "Package download did not produce an installer."),
-                "package_id": package_id,
-                "files": [file.name for file in new_files],
-                "duration_ms": result.get("duration_ms", 0),
-            })
-
-        bundle_path = (root / f"{bundle_id}.zip").resolve()
-        if root not in bundle_path.parents:
-            raise RuntimeError("Tool bundle escaped its root")
-        if downloaded_files:
-            with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-                for file in downloaded_files:
-                    archive.write(file, arcname=file.name)
-        else:
-            bundle_id = ""
-        downloaded_count = sum(item.get("status") == "downloaded" for item in items)
-        if downloaded_count and downloaded_count == len(items):
-            status = "completed"
-        elif downloaded_count:
-            status = "partial"
-        else:
-            status = "unavailable"
-        return {
-            "status": status,
-            "manager": "winget" if manager else None,
-            "bundle_url": f"/api/tools/download-bundles/{bundle_id}" if bundle_id else None,
-            "downloaded_count": downloaded_count,
-            "total_bytes": total_bytes,
-            "items": items,
-            "message": "Downloaded installers are packaged in one bundle. Install them, then restart the local API." if downloaded_count else "No installers were downloaded; use the per-tool project links.",
-        }
-    finally:
-        try:
-            shutil.rmtree(batch_dir)
-        except OSError:
-            logger.warning("Could not remove temporary tool download directory %s", batch_dir)
+def _invalidate_tool_capabilities() -> None:
+    global _tool_capability_cache
+    with _tool_capability_cache_lock:
+        _tool_capability_cache = None
 
 
 def _parse_analysis_options(raw: str | None, profile: ScanProfile, *, max_artifacts: int) -> AnalysisOptions:
@@ -407,6 +229,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         application.state.storage = storage
         application.state.jobs = manager
         application.state.started_at = time.monotonic()
+        application.state.tool_install_lock = asyncio.Lock()
         try:
             yield
         finally:
@@ -483,8 +306,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @application.get("/api/capabilities", response_model=CapabilitiesResponse)
-    async def capabilities(request: Request) -> dict[str, Any]:
+    async def capabilities(request: Request, refresh: bool = Query(default=False)) -> dict[str, Any]:
         configured_settings = _settings(request)
+        if refresh:
+            _invalidate_tool_capabilities()
         tools = await anyio.to_thread.run_sync(_tool_capabilities)
         return {
             "name": "Forenscope Image Analyzer",
@@ -529,34 +354,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
         }
 
-    @application.post("/api/tools/download")
-    async def download_tools(request: Request, payload: ToolDownloadRequest) -> dict[str, Any]:
+    @application.post("/api/tools/install")
+    async def install_missing_tools(request: Request, payload: ToolInstallRequest) -> dict[str, Any]:
         if not payload.confirmed:
             raise HTTPException(
                 status_code=400,
-                detail={"code": "confirmation_required", "message": "Confirm the explicit tool download request before continuing."},
+                detail={"code": "confirmation_required", "message": "Confirm the automatic installation request before continuing."},
             )
         declared_tools = {spec.tool_id for spec in TOOL_SPECS}
         unknown = sorted(set(payload.tool_ids) - declared_tools)
         if unknown:
             raise HTTPException(
                 status_code=422,
-                detail={"code": "unknown_tool", "message": f"Unknown tool download request: {unknown[0]}"},
+                detail={"code": "unknown_tool", "message": f"Unknown tool installation request: {unknown[0]}"},
             )
-        return await anyio.to_thread.run_sync(
-            partial(_download_tool_installers, _settings(request), payload.tool_ids)
-        )
-
-    @application.get("/api/tools/download-bundles/{bundle_id}")
-    async def download_tool_bundle(request: Request, bundle_id: str) -> FileResponse:
-        if not re.fullmatch(r"bundle-[0-9a-f]{32}", bundle_id):
-            raise _not_found("Tool bundle")
-        try:
-            root = _tool_download_root(_settings(request))
-            bundle = require_regular_file(root, f"{bundle_id}.zip")
-        except (OSError, UnsafePathError, ValueError) as exc:
-            raise _not_found("Tool bundle") from exc
-        return FileResponse(bundle, media_type="application/zip", filename="forenscope-tool-installers.zip")
+        lock: asyncio.Lock = request.app.state.tool_install_lock
+        if lock.locked():
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "installation_in_progress", "message": "Another tool installation is already running."},
+            )
+        async with lock:
+            report = await anyio.to_thread.run_sync(partial(install_tools, payload.tool_ids))
+            _invalidate_tool_capabilities()
+            return report
 
     @application.post("/api/jobs", response_model=JobResponse, status_code=status.HTTP_202_ACCEPTED)
     async def create_job(
@@ -882,6 +703,57 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.get("/api/jobs/{job_id}/artifacts/{artifact_id}/preview")
     async def preview_artifact(request: Request, job_id: UUID, artifact_id: UUID) -> FileResponse:
         return await artifact_file_response(request, job_id, artifact_id, inline=True)
+
+    @application.get("/api/jobs/{job_id}/hex")
+    async def hex_view(
+        request: Request,
+        job_id: UUID,
+        artifact_id: UUID | None = Query(None),
+        offset: int = Query(0, ge=0, le=1_000_000_000_000),
+        length: int = Query(8192, ge=16, le=64 * 1024),
+        search: str | None = Query(None, max_length=256),
+        search_mode: Literal["text", "hex"] = Query("text"),
+        include_anomalies: bool = Query(True),
+    ) -> dict[str, Any]:
+        """Return a bounded read-only byte window and anomaly hints."""
+
+        identifier = str(job_id)
+        storage = _storage(request)
+        _get_job_or_404(storage, identifier)
+        if artifact_id is None:
+            artifacts = await anyio.to_thread.run_sync(storage.list_artifacts, identifier)
+            artifact = next((item for item in artifacts if item.get("kind") == "original"), None)
+            if artifact is None:
+                raise _not_found("Source artifact")
+        else:
+            artifact = await anyio.to_thread.run_sync(storage.get_artifact, identifier, str(artifact_id))
+            if artifact is None:
+                raise _not_found("Artifact")
+        path = _artifact_path(_settings(request), identifier, artifact)
+        try:
+            payload = await anyio.to_thread.run_sync(
+                partial(
+                    inspect_file,
+                    path,
+                    offset=offset,
+                    length=length,
+                    search=search,
+                    search_mode=search_mode,
+                    include_anomalies=include_anomalies,
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "invalid_hex_search", "message": str(exc)},
+            ) from exc
+        except OSError as exc:
+            raise HTTPException(
+                status_code=410,
+                detail={"code": "artifact_unavailable", "message": "This artifact is no longer available on disk."},
+            ) from exc
+        payload["artifact"] = artifact_public_record(artifact)
+        return payload
 
     async def export_context(request: Request, job_id: UUID) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
         identifier = str(job_id)

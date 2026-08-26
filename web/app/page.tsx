@@ -1,10 +1,10 @@
 'use client';
 
-import { type CSSProperties, type DragEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type CSSProperties, type DragEvent, type FormEvent, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 
 type Profile = 'quick' | 'balanced' | 'deep';
 type Screen = 'setup' | 'running' | 'results';
-type ResultTab = 'overview' | 'candidates' | 'artifacts' | 'visual' | 'metadata' | 'tools' | 'methods';
+type ResultTab = 'overview' | 'candidates' | 'artifacts' | 'visual' | 'metadata' | 'hex' | 'tools' | 'methods';
 type MethodFilter = 'all' | 'completed' | 'missing' | 'skipped' | 'failed';
 type BooleanOptionKey = 'structure_analysis' | 'visual_analysis' | 'lsb_analysis' | 'ocr' | 'barcodes' | 'recursive_extraction' | 'decoders' | 'crypto_analysis' | 'repairs' | 'external_tools' | 'external_extraction';
 
@@ -25,6 +25,7 @@ type ScanOptions = {
   tool_timeout_seconds: number;
   external_output_kib: number;
   max_external_files: number;
+  foremost_depth: number;
   color_remap_variants: number;
   zsteg_mode: 'all' | 'lsb';
   ocr_language: string;
@@ -100,6 +101,21 @@ type MethodRun = {
   details?: Record<string, unknown>;
 };
 
+type HexRow = { offset: number; hex: string; ascii: string; length: number };
+type HexMatch = { offset: number; length: number };
+type HexAnomaly = { kind: string; title: string; description: string; offset: number; length: number; severity?: string; details?: Record<string, unknown> };
+type HexView = {
+  artifact?: Artifact;
+  offset: number;
+  length: number;
+  total_size: number;
+  rows: HexRow[];
+  matches: HexMatch[];
+  anomalies: HexAnomaly[];
+  search?: { query?: string; mode?: string; byte_length?: number; match_count?: number };
+  anomaly_scan?: { enabled?: boolean; count?: number; bounded?: boolean };
+};
+
 type Finding = {
   id?: string;
   category?: string;
@@ -170,8 +186,8 @@ type Job = {
   [key: string]: unknown;
 };
 
-type Capability = { id?: string; name?: string; executable?: string; available?: boolean; version?: string; category?: string; profiles?: string[]; formats?: string[]; download_url?: string; install_hint?: string };
-type ToolDownloadReport = { status?: string; manager?: string | null; bundle_url?: string | null; downloaded_count?: number; total_bytes?: number; message?: string; items?: Array<{ id?: string; status?: string; message?: string; download_url?: string; files?: string[] }> };
+type Capability = { id?: string; name?: string; executable?: string; available?: boolean; resolved?: string | null; source?: string | null; version?: string; category?: string; profiles?: string[]; formats?: string[]; install_hint?: string; installable?: boolean; install_strategy?: string | null };
+type ToolInstallReport = { status?: string; installed_count?: number; already_available_count?: number; available_count?: number; requested_count?: number; unresolved_count?: number; managers?: string[]; message?: string; items?: Array<{ id?: string; status?: string; message?: string; channel?: string | null; source?: string | null; resolved?: string | null; diagnostic?: string | null }> };
 type ActivityItem = { at: string; message: string; stage?: string };
 type MetadataRow = { path: string; value: string };
 
@@ -181,9 +197,9 @@ const API_BASE = (
 ).replace(/\/$/, '');
 const TERMINAL = new Set(['completed', 'succeeded', 'partial', 'failed', 'cancelled', 'expired']);
 const profileOptionDefaults: Record<Profile, ScanOptions> = {
-  quick: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 2, max_artifacts: 45, tool_timeout_seconds: 20, external_output_kib: 512, max_external_files: 16, color_remap_variants: 4, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
-  balanced: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 3, max_artifacts: 100, tool_timeout_seconds: 60, external_output_kib: 1024, max_external_files: 32, color_remap_variants: 8, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
-  deep: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 4, max_artifacts: 220, tool_timeout_seconds: 180, external_output_kib: 2048, max_external_files: 64, color_remap_variants: 8, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
+  quick: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 2, max_artifacts: 45, tool_timeout_seconds: 20, external_output_kib: 512, max_external_files: 16, foremost_depth: 1, color_remap_variants: 4, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
+  balanced: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 3, max_artifacts: 100, tool_timeout_seconds: 60, external_output_kib: 1024, max_external_files: 32, foremost_depth: 2, color_remap_variants: 8, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
+  deep: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, max_recursion_depth: 4, max_artifacts: 220, tool_timeout_seconds: 180, external_output_kib: 2048, max_external_files: 64, foremost_depth: 4, color_remap_variants: 8, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
 };
 const configurableMethods: Array<{ key: BooleanOptionKey; title: string; copy: string }> = [
   { key: 'structure_analysis', title: 'Structure & metadata', copy: 'Chunks, markers, EXIF, comments, trailers and embedded objects.' },
@@ -215,6 +231,7 @@ const resultTabs: Array<{ id: ResultTab; label: string }> = [
   { id: 'artifacts', label: 'Artifacts' },
   { id: 'visual', label: 'Visual lab' },
   { id: 'metadata', label: 'Metadata' },
+  { id: 'hex', label: 'Hex view' },
   { id: 'tools', label: 'Tool results' },
   { id: 'methods', label: 'Coverage & logs' },
 ];
@@ -256,6 +273,9 @@ function formatBytes(value?: number) {
   let index = 0;
   while (size >= 1024 && index < units.length - 1) { size /= 1024; index += 1; }
   return `${size.toFixed(size >= 10 ? 1 : 2)} ${units[index]}`;
+}
+function formatHexOffset(value: number) {
+  return `0x${Math.max(0, Math.floor(value)).toString(16).padStart(8, '0')}`;
 }
 function formatDuration(ms?: number) {
   if (ms === undefined) return '—';
@@ -303,6 +323,20 @@ function normalizeUrl(url?: string) {
   if (/^https?:\/\//i.test(url)) return url;
   return `${API_BASE}${url.startsWith('/') ? '' : '/'}${url}`;
 }
+const SAFE_PREVIEW_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp']);
+function artifactPreviewUrl(artifact: Artifact) {
+  const raw = artifact.preview_url;
+  const mediaType = artifactMediaType(artifact).split(';', 1)[0].trim().toLowerCase();
+  if (!raw || !SAFE_PREVIEW_MIME_TYPES.has(mediaType)) return '';
+  if (/^https?:\/\//i.test(raw)) {
+    try {
+      if (new URL(raw).origin !== new URL(API_BASE).origin) return '';
+    } catch {
+      return '';
+    }
+  }
+  return normalizeUrl(raw);
+}
 function evidenceText(value: unknown) {
   if (typeof value === 'string') return value;
   if (value && typeof value === 'object') return Object.entries(value).map(([key, entry]) => `${key}: ${String(entry)}`).join(' · ');
@@ -344,6 +378,14 @@ function methodStatusGroup(method: MethodRun): Exclude<MethodFilter, 'all'> {
   return 'failed';
 }
 
+function methodStatusLabel(method: MethodRun) {
+  const status = (method.status || 'recorded').toLowerCase();
+  if (status === 'no_findings') return 'No findings';
+  if (status === 'timed_out') return 'Timed out';
+  if (status === 'not_applicable') return 'Not applicable';
+  return status.replaceAll('_', ' ');
+}
+
 async function readJson<T = unknown>(response: Response): Promise<T> {
   if (response.ok) return await response.json() as T;
   let message = `Request failed (${response.status})`;
@@ -359,7 +401,7 @@ async function readJson<T = unknown>(response: Response): Promise<T> {
   throw new Error(message);
 }
 
-export default function Home() {
+function HomeWorkbench() {
   const fileInput = useRef<HTMLInputElement>(null);
   const [screen, setScreen] = useState<Screen>('setup');
   const [profile, setProfile] = useState<Profile>('balanced');
@@ -373,8 +415,9 @@ export default function Home() {
   const [job, setJob] = useState<Job | null>(null);
   const [recentJobs, setRecentJobs] = useState<Job[]>([]);
   const [capabilities, setCapabilities] = useState<Capability[]>([]);
-  const [toolDownloadReport, setToolDownloadReport] = useState<ToolDownloadReport | null>(null);
-  const [toolDownloadBusy, setToolDownloadBusy] = useState(false);
+  const [toolInstallReport, setToolInstallReport] = useState<ToolInstallReport | null>(null);
+  const [toolInstallBusy, setToolInstallBusy] = useState(false);
+  const [toolRefreshBusy, setToolRefreshBusy] = useState(false);
   const [engineOnline, setEngineOnline] = useState<boolean | null>(null);
   const [error, setError] = useState('');
   const [activity, setActivity] = useState<ActivityItem[]>([]);
@@ -384,6 +427,16 @@ export default function Home() {
   const [resultQuery, setResultQuery] = useState('');
   const [selectedVisual, setSelectedVisual] = useState<VisualView | null>(null);
   const [selectedArtifact, setSelectedArtifact] = useState<Artifact | null>(null);
+  const [hexArtifactId, setHexArtifactId] = useState('');
+  const [hexOffset, setHexOffset] = useState(0);
+  const [hexOffsetInput, setHexOffsetInput] = useState('0');
+  const [hexSearchInput, setHexSearchInput] = useState('');
+  const [hexSearch, setHexSearch] = useState('');
+  const [hexSearchMode, setHexSearchMode] = useState<'text' | 'hex'>('text');
+  const [hexView, setHexView] = useState<HexView | null>(null);
+  const [hexLoading, setHexLoading] = useState(false);
+  const [hexError, setHexError] = useState('');
+  const hexRequestRef = useRef(0);
 
   const refreshRecent = useCallback(async () => {
     try {
@@ -391,6 +444,14 @@ export default function Home() {
       const record = payload && typeof payload === 'object' ? payload as { items?: Job[]; jobs?: Job[] } : {};
       setRecentJobs(Array.isArray(payload) ? payload as Job[] : record.items || record.jobs || []);
     } catch { /* the engine indicator already explains offline state */ }
+  }, []);
+
+  const refreshCapabilities = useCallback(async () => {
+    const capabilityPayload = await readJson<unknown>(await fetch(`${API_BASE}/api/capabilities?refresh=true`, { cache: 'no-store' }));
+    const record = capabilityPayload && typeof capabilityPayload === 'object' ? capabilityPayload as { capabilities?: Capability[]; tools?: Capability[] } : {};
+    const next = Array.isArray(capabilityPayload) ? capabilityPayload as Capability[] : record.capabilities || record.tools || [];
+    setCapabilities(next);
+    return next;
   }, []);
 
   useEffect(() => {
@@ -460,6 +521,37 @@ export default function Home() {
   const result = job?.result;
   const candidates = useMemo(() => getCandidates(result).slice().sort((a, b) => scoreOf(b) - scoreOf(a)), [result]);
   const artifacts = useMemo(() => job?.artifacts?.length ? job.artifacts : getArtifacts(result), [job, result]);
+  const hexArtifactChoices = useMemo(() => artifacts.filter((artifact) => artifactId(artifact)), [artifacts]);
+  const defaultHexArtifactId = artifactId(hexArtifactChoices.find((artifact) => artifact.kind === 'original') || hexArtifactChoices[0] || {});
+  const effectiveHexArtifactId = hexArtifactChoices.some((artifact) => artifactId(artifact) === hexArtifactId) ? hexArtifactId : defaultHexArtifactId;
+  const loadHexView = useCallback(async (artifactKey: string, offsetValue: number, searchValue: string, mode: 'text' | 'hex') => {
+    if (!activeJobId || !artifactKey) return;
+    const requestId = ++hexRequestRef.current;
+    setHexLoading(true);
+    setHexError('');
+    const params = new URLSearchParams({ artifact_id: artifactKey, offset: String(Math.max(0, Math.floor(offsetValue))), length: '8192', include_anomalies: 'true' });
+    if (searchValue.trim()) {
+      params.set('search', searchValue);
+      params.set('search_mode', mode);
+    }
+    try {
+      const payload = await readJson<HexView>(await fetch(`${API_BASE}/api/jobs/${activeJobId}/hex?${params.toString()}`, { cache: 'no-store' }));
+      if (requestId !== hexRequestRef.current) return;
+      setHexView(payload);
+      setHexOffset(payload.offset);
+      setHexOffsetInput(String(payload.offset));
+    } catch (caught) {
+      if (requestId !== hexRequestRef.current) return;
+      setHexView(null);
+      setHexError(caught instanceof Error ? caught.message : 'The hex view could not be loaded.');
+    } finally {
+      if (requestId === hexRequestRef.current) setHexLoading(false);
+    }
+  }, [activeJobId]);
+  useEffect(() => {
+    if (activeTab !== 'hex' || !activeJobId || !effectiveHexArtifactId) return;
+    void Promise.resolve().then(() => loadHexView(effectiveHexArtifactId, hexOffset, hexSearch, hexSearchMode));
+  }, [activeTab, activeJobId, effectiveHexArtifactId, hexOffset, hexSearch, hexSearchMode, loadHexView]);
   const methods = useMemo(() => getMethods(result), [result]);
   const publicArtifactsByEngineId = useMemo(() => {
     const map = new Map<string, Artifact>();
@@ -559,8 +651,50 @@ export default function Home() {
     setActiveTab('overview');
     setSelectedVisual(null);
     setSelectedArtifact(null);
+    setHexArtifactId('');
+    setHexOffset(0);
+    setHexOffsetInput('0');
+    setHexSearchInput('');
+    setHexSearch('');
+    setHexView(null);
+    setHexError('');
     setResultQuery('');
     setMethodFilter('all');
+  }
+
+  function selectHexArtifact(value: string) {
+    setHexArtifactId(value);
+    setHexOffset(0);
+    setHexOffsetInput('0');
+    setHexSearchInput('');
+    setHexSearch('');
+    setHexView(null);
+    setHexError('');
+  }
+
+  function submitHexSearch(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setHexOffset(0);
+    setHexOffsetInput('0');
+    setHexSearch(hexSearchInput.trim());
+  }
+
+  function goToHexOffset() {
+    const value = hexOffsetInput.trim();
+    const parsed = /^0x[0-9a-f]+$/i.test(value) ? Number.parseInt(value.slice(2), 16) : Number(value);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      setHexError('Enter a valid byte offset, such as 0 or 0x400.');
+      return;
+    }
+    setHexError('');
+    setHexOffset(Math.floor(parsed));
+  }
+
+  function jumpToHexOffset(value: number) {
+    const next = Math.max(0, Math.floor(value));
+    setHexError('');
+    setHexOffset(next);
+    setHexOffsetInput(String(next));
   }
 
   function chooseProfile(next: Profile) {
@@ -571,6 +705,7 @@ export default function Home() {
       max_recursion_depth: defaults.max_recursion_depth,
       max_artifacts: defaults.max_artifacts,
       tool_timeout_seconds: defaults.tool_timeout_seconds,
+      foremost_depth: defaults.foremost_depth,
     }));
   }
 
@@ -583,26 +718,41 @@ export default function Home() {
     });
   }
 
-  async function downloadMissingTools() {
-    const missing = capabilities.filter((capability) => capability.available !== true).map((capability) => capability.id || capability.executable).filter((id): id is string => Boolean(id));
+  async function installMissingTools(requested?: string[]) {
+    const missing = requested || capabilities.filter((capability) => capability.available !== true).map((capability) => capability.id || capability.executable).filter((id): id is string => Boolean(id));
     if (!missing.length) {
-      setToolDownloadReport({ status: 'completed', downloaded_count: 0, message: 'All declared tools are already available.' });
+      setToolInstallReport({ status: 'completed', installed_count: 0, message: 'All declared tools are already available.' });
       return;
     }
-    if (!window.confirm(`Download installers for ${missing.length} missing tool${missing.length === 1 ? '' : 's'}?`)) return;
-    setToolDownloadBusy(true);
-    setToolDownloadReport(null);
+    if (!window.confirm(`Install ${missing.length} missing forensic tool${missing.length === 1 ? '' : 's'} automatically? The local API will use fixed packages from Kali WSL and Windows Package Manager. This can take several minutes.`)) return;
+    setToolInstallBusy(true);
+    setToolInstallReport(null);
     try {
-      const response = await fetch(`${API_BASE}/api/tools/download`, {
+      const response = await fetch(`${API_BASE}/api/tools/install`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tool_ids: missing, confirmed: true }),
       });
-      const report = await readJson<ToolDownloadReport>(response);
-      setToolDownloadReport(report);
+      const report = await readJson<ToolInstallReport>(response);
+      setToolInstallReport(report);
+      try { await refreshCapabilities(); } catch { /* keep the install report when refresh is unavailable */ }
     } catch (caught) {
-      setToolDownloadReport({ status: 'failed', message: caught instanceof Error ? caught.message : 'The tool download could not be started.' });
+      setToolInstallReport({ status: 'failed', message: caught instanceof Error ? caught.message : 'Automatic tool installation could not be started.' });
     } finally {
-      setToolDownloadBusy(false);
+      setToolInstallBusy(false);
+    }
+  }
+
+  async function refreshToolAvailability() {
+    setToolRefreshBusy(true);
+    try {
+      await refreshCapabilities();
+      setEngineOnline(true);
+      setError('');
+    } catch (caught) {
+      setEngineOnline(false);
+      setError(caught instanceof Error ? caught.message : 'Could not refresh tool availability.');
+    } finally {
+      setToolRefreshBusy(false);
     }
   }
 
@@ -723,7 +873,7 @@ export default function Home() {
                   <div className="input-shell"><input id="flag-prefix-mobile" value={flagPrefix} onChange={(event) => setFlagPrefix(event.target.value.slice(0, 64))} placeholder="e.g. picoCTF, HTB, flag" /><kbd>{'{…}'}</kbd></div>
                   <p>Specific prefixes rank true flags above decoys.</p>
                   <button className="password-toggle" onClick={() => setShowPassword((open) => !open)}>{showPassword ? 'Hide passphrase / key' : '+ Add a passphrase or key'}</button>
-                  {showPassword && <><input className="password-input" type="password" value={password} autoComplete="off" onChange={(event) => setPassword(event.target.value.slice(0, 256))} placeholder="Optional stego or decryption passphrase" /><small className="password-hint">Used only for this scan. Supports OpenSSL salted AES and passphrase-based XOR checks; prefix a raw key with <code>hex:</code>.</small></>}
+                  {showPassword && <><input className="password-input" type="password" value={password} autoComplete="off" onChange={(event) => setPassword(event.target.value.slice(0, 256))} placeholder="Optional stego or decryption passphrase" /><small className="password-hint">Used only for this scan. Steghide, Stegseek and OutGuess use it for bounded extraction; encrypted payload checks also support OpenSSL salted AES and passphrase-based XOR. Prefix a raw key with <code>hex:</code>.</small></>}
                 </div>
                 {recentJobs.length > 0 && (
                   <section className="mobile-recent-scans" aria-labelledby="mobile-recent-title">
@@ -760,7 +910,7 @@ export default function Home() {
                   <div className="input-shell"><input id="flag-prefix" value={flagPrefix} onChange={(event) => setFlagPrefix(event.target.value.slice(0, 64))} placeholder="e.g. picoCTF, HTB, flag" /><kbd>{'{…}'}</kbd></div>
                   <p>Specific prefixes rank true flags above decoys.</p>
                   <button className="password-toggle" onClick={() => setShowPassword((open) => !open)}>{showPassword ? 'Hide passphrase / key' : '+ Add a passphrase or key'}</button>
-                  {showPassword && <><input className="password-input" type="password" value={password} autoComplete="off" onChange={(event) => setPassword(event.target.value.slice(0, 256))} placeholder="Optional stego or decryption passphrase" /><small className="password-hint">Used only for this scan. Supports OpenSSL salted AES and passphrase-based XOR checks; prefix a raw key with <code>hex:</code>.</small></>}
+                  {showPassword && <><input className="password-input" type="password" value={password} autoComplete="off" onChange={(event) => setPassword(event.target.value.slice(0, 256))} placeholder="Optional stego or decryption passphrase" /><small className="password-hint">Used only for this scan. Steghide, Stegseek and OutGuess use it for bounded extraction; encrypted payload checks also support OpenSSL salted AES and passphrase-based XOR. Prefix a raw key with <code>hex:</code>.</small></>}
                 </div>
                 <div className={`engine-status ${engineOnline === false ? 'engine-offline' : ''}`}>
                   <span className="pulse-ring"><i /></span>
@@ -914,7 +1064,7 @@ export default function Home() {
                       })}
                       {!filteredArtifacts.length && <div className="empty-state large"><span>⌁</span><strong>{resultQuery ? 'No artifacts match this search' : 'No child artifacts were recovered'}</strong><p>The original evidence and method logs are still included in the report.</p></div>}
                     </div>
-                    {selectedArtifact && <aside className="artifact-inspector"><header><div><p className="eyebrow">Evidence inspector</p><h3>{artifactName(selectedArtifact)}</h3></div><button onClick={() => setSelectedArtifact(null)} aria-label="Close artifact inspector">×</button></header><dl><div><dt>Type</dt><dd>{artifactMediaType(selectedArtifact)}</dd></div><div><dt>Size</dt><dd>{formatBytes(artifactSize(selectedArtifact))}</dd></div><div><dt>Origin</dt><dd>{artifactOrigin(selectedArtifact)}</dd></div><div><dt>Depth</dt><dd>{artifactDepth(selectedArtifact)}</dd></div><div className="full"><dt>SHA-256</dt><dd className="mono">{selectedArtifact.sha256 || 'Unavailable'}</dd></div>{selectedArtifact.parent_id && <div className="full"><dt>Parent</dt><dd className="mono">{selectedArtifact.parent_id}</dd></div>}</dl><details className="raw-details"><summary>Lineage &amp; metadata</summary><pre>{JSON.stringify(selectedArtifact.metadata || {}, null, 2)}</pre></details><a className="inspector-download" href={normalizeUrl(selectedArtifact.download_url) || `${API_BASE}/api/jobs/${jobId}/artifacts/${artifactId(selectedArtifact)}?download=1`} download>Download evidence ↓</a></aside>}
+                    {selectedArtifact && <aside className="artifact-inspector"><header><div><p className="eyebrow">Evidence inspector</p><h3>{artifactName(selectedArtifact)}</h3></div><button onClick={() => setSelectedArtifact(null)} aria-label="Close artifact inspector">×</button></header>{artifactPreviewUrl(selectedArtifact) ? <div className="artifact-preview"><SafePreviewImage src={artifactPreviewUrl(selectedArtifact)} alt={`Preview of ${artifactName(selectedArtifact)}`} /><small>Verified raster preview · served read-only</small></div> : null}<dl><div><dt>Type</dt><dd>{artifactMediaType(selectedArtifact)}</dd></div><div><dt>Size</dt><dd>{formatBytes(artifactSize(selectedArtifact))}</dd></div><div><dt>Origin</dt><dd>{artifactOrigin(selectedArtifact)}</dd></div><div><dt>Depth</dt><dd>{artifactDepth(selectedArtifact)}</dd></div><div className="full"><dt>SHA-256</dt><dd className="mono">{selectedArtifact.sha256 || 'Unavailable'}</dd></div>{selectedArtifact.parent_id && <div className="full"><dt>Parent</dt><dd className="mono">{selectedArtifact.parent_id}</dd></div>}</dl><details className="raw-details"><summary>Lineage &amp; metadata</summary><pre>{JSON.stringify(selectedArtifact.metadata || {}, null, 2)}</pre></details><a className="inspector-download" href={normalizeUrl(selectedArtifact.download_url) || `${API_BASE}/api/jobs/${jobId}/artifacts/${artifactId(selectedArtifact)}?download=1`} download>Download evidence ↓</a></aside>}
                   </div>
                 </section>
               )}
@@ -946,18 +1096,42 @@ export default function Home() {
                 </section>
               )}
 
+              {activeTab === 'hex' && (
+                <section className="tab-panel hex-panel">
+                  <div className="section-title"><div><p className="eyebrow">Read-only byte evidence</p><h2>Hex editor</h2></div><span>{hexView ? `${formatBytes(hexView.total_size)} · ${hexView.anomalies.length} anomalies` : 'Select an artifact'}</span></div>
+                  <p className="panel-lede">Inspect raw bytes without modifying evidence. Search text or hexadecimal patterns across the complete artifact, jump to matches, and review bounded heuristic anomaly signals.</p>
+                  <div className="hex-toolbar">
+                    <label><span>Artifact</span><select value={effectiveHexArtifactId} onChange={(event) => selectHexArtifact(event.target.value)} disabled={!hexArtifactChoices.length}><option value="">Choose an artifact…</option>{hexArtifactChoices.map((artifact) => <option key={artifactId(artifact)} value={artifactId(artifact)}>{artifactName(artifact)} · {formatBytes(artifactSize(artifact))}</option>)}</select></label>
+                    <form onSubmit={submitHexSearch} className="hex-search-form"><label><span>Search</span><input value={hexSearchInput} onChange={(event) => setHexSearchInput(event.target.value.slice(0, 256))} placeholder={hexSearchMode === 'hex' ? '89 50 4e 47 or PK:03:04' : 'flag{…} or readable text'} disabled={!effectiveHexArtifactId} /></label><select aria-label="Hex search mode" value={hexSearchMode} onChange={(event) => setHexSearchMode(event.target.value as 'text' | 'hex')} disabled={!effectiveHexArtifactId}><option value="text">Text</option><option value="hex">Hex bytes</option></select><button type="submit" disabled={!effectiveHexArtifactId || hexLoading}>Search</button></form>
+                    <div className="hex-offset-control"><label><span>Offset</span><input value={hexOffsetInput} onChange={(event) => setHexOffsetInput(event.target.value.slice(0, 24))} onKeyDown={(event) => { if (event.key === 'Enter') goToHexOffset(); }} disabled={!effectiveHexArtifactId} /></label><button onClick={goToHexOffset} disabled={!effectiveHexArtifactId}>Go</button><button onClick={() => jumpToHexOffset(Math.max(0, hexOffset - 8192))} disabled={!hexView || hexOffset <= 0} aria-label="Previous hex page">←</button><button onClick={() => jumpToHexOffset(hexOffset + 8192)} disabled={!hexView || hexOffset + hexView.length >= hexView.total_size} aria-label="Next hex page">→</button></div>
+                  </div>
+                  {hexError && <div className="error-banner" role="alert"><span>!</span><p>{hexError}</p><button onClick={() => setHexError('')} aria-label="Dismiss hex error">×</button></div>}
+                  {hexLoading && <div className="hex-loading"><span className="spinner" />Reading bytes and checking anomalies…</div>}
+                  {!hexLoading && !hexArtifactChoices.length && <div className="empty-state large"><span>⌘</span><strong>No artifact is available for hex inspection</strong><p>Run an analysis first so the immutable source and recovered files can be selected.</p></div>}
+                  {!hexLoading && hexView && <>
+                    <div className="hex-stat-row"><div><strong>{formatHexOffset(hexView.offset)}</strong><small>window start</small></div><div><strong>{formatBytes(hexView.length)}</strong><small>bytes shown</small></div><div><strong>{hexView.search?.match_count || 0}</strong><small>search matches</small></div><div><strong>{hexView.anomalies.length}</strong><small>heuristic anomalies</small></div></div>
+                    <div className="hex-layout">
+                      <div className="hex-table" role="table" aria-label="Hex byte window"><div className="hex-table-head" role="row"><span>Offset</span><span>Hex bytes</span><span>ASCII</span></div>{hexView.rows.map((row) => { const matched = hexView.matches.some((match) => match.offset < row.offset + row.length && match.offset + match.length > row.offset); return <div className={`hex-row ${matched ? 'matched' : ''}`} role="row" key={row.offset}><span className="hex-row-offset">{formatHexOffset(row.offset)}</span><code>{row.hex}</code><code className="hex-row-ascii">{row.ascii}</code></div>; })}{!hexView.rows.length && <div className="hex-empty">The selected offset is at end-of-file.</div>}</div>
+                      <aside className="hex-findings"><section><div className="hex-subheading"><div><p className="eyebrow">Pattern search</p><h3>Matches</h3></div><span>{hexView.matches.length}</span></div>{hexView.matches.length ? <div className="hex-match-list">{hexView.matches.map((match) => <button key={match.offset} onClick={() => jumpToHexOffset(Math.max(0, match.offset - 64))}><strong>{formatHexOffset(match.offset)}</strong><small>{match.length} byte{match.length === 1 ? '' : 's'} · jump here</small></button>)}</div> : <p className="hex-muted">{hexSearch ? 'No matches found in this artifact.' : 'Enter text or hex bytes above to search.'}</p>}</section><section><div className="hex-subheading"><div><p className="eyebrow">Automated review</p><h3>Anomalies</h3></div><span>{hexView.anomalies.length}</span></div>{hexView.anomalies.length ? <div className="hex-anomaly-list">{hexView.anomalies.map((anomaly, index) => <button key={`${anomaly.kind}-${anomaly.offset}-${index}`} onClick={() => jumpToHexOffset(Math.max(0, anomaly.offset - 64))}><div><strong>{anomaly.title}</strong><em className={anomaly.severity || 'info'}>{anomaly.severity || 'info'}</em></div><small>{formatHexOffset(anomaly.offset)} · {formatBytes(anomaly.length)}</small><p>{anomaly.description}</p></button>)}</div> : <p className="hex-muted">No heuristic anomalies were detected. This is a signal only; format-aware review still matters.</p>}</section></aside>
+                    </div>
+                  </>}
+                </section>
+              )}
+
               {activeTab === 'tools' && (
                 <section className="tab-panel tool-results-panel">
                   <div className="section-title"><div><p className="eyebrow">Raw analyzer evidence</p><h2>Tool results</h2></div><span>{toolMethods.length} analyzers · {availableTools} external tools installed</span></div>
-                  <p className="panel-lede">Every built-in and external analyzer is recorded, including skipped and missing tools. Expand a result to inspect the redacted command, bounded stdout/stderr, and any recovered payloads.</p>
+                  <p className="panel-lede">Every built-in and external analyzer is recorded, including clean negative checks, skipped methods, and missing tools. Command output is open by default so the evidence and diagnostics are immediately visible.</p>
                   <div className="tool-results-list">
                     {filteredToolMethods.map((method, index) => {
                       const status = methodStatusGroup(method);
                       const linkedArtifacts = (method.artifact_ids || []).map((id) => publicArtifactsByEngineId.get(id)).filter((item): item is Artifact => Boolean(item));
+                      const imageArtifacts = linkedArtifacts.map((artifact) => ({ artifact, preview: artifactPreviewUrl(artifact) })).filter((item): item is { artifact: Artifact; preview: string } => Boolean(item.preview));
                       return <article className={`tool-result-card ${status}`} key={method.id || `${methodName(method)}-${index}`}>
-                        <div className="tool-result-heading"><span className={`coverage-status ${method.status || 'unknown'}`}>{status === 'completed' ? '✓' : status === 'failed' ? '!' : '·'}</span><div><strong>{methodName(method)}</strong><p>{method.summary || method.error || 'No additional commentary.'}</p><small>{declaredExternalToolIds.has(method.id || method.tool_id || '') ? 'external adapter' : 'built-in analyzer'} · {method.tool?.executable || 'forensics engine'}{method.tool?.version ? ` · v${method.tool.version}` : ''}{method.duration_ms !== undefined ? ` · ${formatDuration(method.duration_ms)}` : ''}{method.extracted_count ? ` · ${method.extracted_count} artifact${method.extracted_count === 1 ? '' : 's'}` : ''}</small></div><em>{method.status || 'recorded'}</em></div>
-                        {status === 'missing' && capabilitiesById.get(method.id || method.tool_id || '')?.download_url ? <a className="missing-tool-link" href={capabilitiesById.get(method.id || method.tool_id || '')?.download_url} target="_blank" rel="noreferrer">Download tool ↗</a> : null}
+                        <div className="tool-result-heading"><span className={`coverage-status ${method.status || 'unknown'}`}>{status === 'completed' ? '✓' : status === 'failed' ? '!' : '·'}</span><div><strong>{methodName(method)}</strong><p>{method.summary || method.error || 'No additional commentary.'}</p><small>{declaredExternalToolIds.has(method.id || method.tool_id || '') ? 'external adapter' : 'built-in analyzer'} · {method.tool?.executable || 'forensics engine'}{method.tool?.resolved ? ` · ${method.tool.resolved}` : ''}{method.tool?.version ? ` · v${method.tool.version}` : ''}{method.duration_ms !== undefined ? ` · ${formatDuration(method.duration_ms)}` : ''}{method.extracted_count ? ` · ${method.extracted_count} artifact${method.extracted_count === 1 ? '' : 's'}` : ''}</small></div><em>{methodStatusLabel(method)}</em></div>
+                        {status === 'missing' && capabilitiesById.get(method.id || method.tool_id || '')?.installable ? <button className="missing-tool-link" disabled={toolInstallBusy} onClick={() => installMissingTools([method.id || method.tool_id || ''])}>{toolInstallBusy ? 'Installing…' : 'Install this tool'}</button> : null}
                         <details open className="tool-result-details"><summary>Inspect command &amp; output</summary>{method.command?.length ? <div className="tool-command"><span>Command</span><code>{method.command.join(' ')}</code></div> : null}{method.stdout ? <div className="tool-output"><span>stdout</span><pre>{boundedDisplay(method.stdout)}</pre></div> : null}{method.stderr ? <div className="tool-output"><span>stderr</span><pre>{boundedDisplay(method.stderr)}</pre></div> : null}{method.details && Object.keys(method.details).length ? <div className="tool-output"><span>details</span><pre>{boundedDisplay(JSON.stringify(method.details, null, 2))}</pre></div> : null}{method.output_truncated ? <p className="output-note">Output was capped by the configured external-output budget; the full process was not retained.</p> : null}</details>
+                        {imageArtifacts.length ? <div className="tool-image-gallery"><span>{method.id === 'foremost' ? 'Foremost carved image previews' : 'Recovered image previews'} · {imageArtifacts.length}</span><div className="tool-image-grid">{imageArtifacts.map(({ artifact, preview }) => <button key={artifactId(artifact)} onClick={() => { setSelectedArtifact(artifact); setActiveTab('artifacts'); }} aria-label={`Open preview of ${artifactName(artifact)}`}><SafePreviewImage src={preview} alt={`Preview of ${artifactName(artifact)}`} /><small>{artifactName(artifact)}</small></button>)}</div></div> : null}
                         {linkedArtifacts.length ? <div className="tool-artifacts"><span>Recovered by this tool</span>{linkedArtifacts.map((artifact) => <button key={artifactId(artifact)} onClick={() => { setSelectedArtifact(artifact); setActiveTab('artifacts'); }}><strong>{artifactName(artifact)}</strong><small>{formatBytes(artifactSize(artifact))} · {artifactMediaType(artifact)}</small></button>)}</div> : null}
                       </article>;
                     })}
@@ -970,7 +1144,7 @@ export default function Home() {
                 <section className="tab-panel">
                   <div className="section-title"><div><p className="eyebrow">Coverage statement</p><h2>Every applicable method</h2></div><div className="filter-pills">{(['all', 'completed', 'missing', 'skipped', 'failed'] as const).map((filter) => <button key={filter} className={methodFilter === filter ? 'active' : ''} onClick={() => setMethodFilter(filter)}>{filter}</button>)}</div></div>
                   <div className="coverage-list">
-                    {filteredMethods.map((method, index) => <article key={method.id || `${methodName(method)}-${index}`}><span className={`coverage-status ${method.status || 'unknown'}`}>{methodStatusGroup(method) === 'completed' ? '✓' : methodStatusGroup(method) === 'failed' ? '!' : '·'}</span><div><strong>{methodName(method)}</strong><p>{method.summary || method.error || 'Method completed without additional commentary.'}</p><small>{method.tool?.version || method.version ? `v${method.tool?.version || method.version} · ` : ''}{formatDuration(method.duration_ms)}{method.findings !== undefined ? ` · ${method.findings} findings` : ''}</small>{(method.command?.length || method.stdout || method.stderr || method.details) ? <details open className="method-details"><summary>Inspect output</summary>{method.command?.length ? <code>{method.command.join(' ')}</code> : null}{method.stdout ? <pre>{boundedDisplay(method.stdout)}</pre> : null}{method.stderr ? <pre>{boundedDisplay(method.stderr)}</pre> : null}{method.details ? <pre>{boundedDisplay(JSON.stringify(method.details, null, 2))}</pre> : null}</details> : null}</div><em>{method.status || 'recorded'}</em></article>)}
+                    {filteredMethods.map((method, index) => <article key={method.id || `${methodName(method)}-${index}`}><span className={`coverage-status ${method.status || 'unknown'}`}>{methodStatusGroup(method) === 'completed' ? '✓' : methodStatusGroup(method) === 'failed' ? '!' : '·'}</span><div><strong>{methodName(method)}</strong><p>{method.summary || method.error || 'Method completed without additional commentary.'}</p><small>{method.tool?.version || method.version ? `v${method.tool?.version || method.version} · ` : ''}{formatDuration(method.duration_ms)}{method.findings !== undefined ? ` · ${method.findings} findings` : ''}</small>{(method.command?.length || method.stdout || method.stderr || method.details) ? <details open className="method-details"><summary>Inspect output</summary>{method.command?.length ? <code>{method.command.join(' ')}</code> : null}{method.stdout ? <pre>{boundedDisplay(method.stdout)}</pre> : null}{method.stderr ? <pre>{boundedDisplay(method.stderr)}</pre> : null}{method.details ? <pre>{boundedDisplay(JSON.stringify(method.details, null, 2))}</pre> : null}</details> : null}</div><em>{methodStatusLabel(method)}</em></article>)}
                     {!filteredMethods.length && <div className="empty-state large"><span>⌘</span><strong>No coverage records match these filters</strong><p>Clear the search or choose another status filter.</p></div>}
                   </div>
                   {result?.logs?.length ? <details className="raw-details"><summary>Sanitized tool logs</summary><pre>{JSON.stringify(result.logs, null, 2)}</pre></details> : null}
@@ -1002,6 +1176,7 @@ export default function Home() {
                   <label><span>Tool timeout<small>Seconds per external tool</small></span><input type="number" min="5" max="180" step="5" value={scanOptions.tool_timeout_seconds} onChange={(event) => setScanOptions((current) => ({ ...current, tool_timeout_seconds: Math.max(5, Math.min(180, Number(event.target.value) || 5)) }))} /></label>
                   <label><span>External output<small>KiB retained per tool</small></span><input type="number" min="64" max="2048" step="64" value={scanOptions.external_output_kib} onChange={(event) => setScanOptions((current) => ({ ...current, external_output_kib: Math.max(64, Math.min(2048, Number(event.target.value) || 64)) }))} /></label>
                   <label><span>Extracted files<small>Maximum child files per tool</small></span><input type="number" min="1" max="64" step="1" value={scanOptions.max_external_files} onChange={(event) => setScanOptions((current) => ({ ...current, max_external_files: Math.max(1, Math.min(64, Number(event.target.value) || 1)) }))} /></label>
+                  <label><span>Foremost depth<small>Recursively carve recovered files</small></span><select value={scanOptions.foremost_depth} onChange={(event) => setScanOptions((current) => ({ ...current, foremost_depth: Math.max(1, Math.min(4, Number(event.target.value))) }))}><option value={1}>1 · Source only</option><option value={2}>2 · One recovered level</option><option value={3}>3 · Two recovered levels</option><option value={4}>4 · Maximum bounded depth</option></select></label>
                   <label><span>Color remaps<small>Three-tone visual variants</small></span><select value={scanOptions.color_remap_variants} onChange={(event) => setScanOptions((current) => ({ ...current, color_remap_variants: Number(event.target.value) }))}>{[0, 2, 4, 6, 8].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
                   <label><span>OCR language<small>Tesseract language code</small></span><input value={scanOptions.ocr_language} maxLength={64} pattern="[A-Za-z0-9_+\-]+" onChange={(event) => setScanOptions((current) => ({ ...current, ocr_language: event.target.value.replace(/[^A-Za-z0-9_+\-]/g, '').slice(0, 64) || 'eng' }))} /></label>
                   <label><span>zsteg mode<small>All combos or only LSB planes</small></span><select value={scanOptions.zsteg_mode} onChange={(event) => setScanOptions((current) => ({ ...current, zsteg_mode: event.target.value as ScanOptions['zsteg_mode'] }))}><option value="all">All checks (zsteg -a)</option><option value="lsb">LSB only (zsteg --lsb)</option></select></label>
@@ -1009,25 +1184,41 @@ export default function Home() {
               </section>
 
               <section className="settings-section" aria-labelledby="external-tools">
-                <div className="settings-section-title"><div><p className="eyebrow">Installed integrations</p><h3 id="external-tools">External tool adapters</h3></div><div className="tool-header-actions"><span>{availableTools}/{capabilities.length} installed</span><button onClick={downloadMissingTools} disabled={toolDownloadBusy || !capabilities.length}>{toolDownloadBusy ? 'Downloading…' : 'Download all missing'}</button></div></div>
-                <p className="install-note">Download all missing collects safe package-manager installers into one bundle; it never runs them. Other tools stay available through their project page. After installing, restart the local API and refresh this panel.</p>
-                {toolDownloadReport && <div className={`tool-download-report ${toolDownloadReport.status || ''}`}><div><strong>{toolDownloadReport.message || 'Tool download finished.'}</strong><small>{toolDownloadReport.downloaded_count ? `${toolDownloadReport.downloaded_count} installer${toolDownloadReport.downloaded_count === 1 ? '' : 's'} downloaded` : 'No installers were downloaded automatically.'}</small></div>{toolDownloadReport.bundle_url ? <a href={`${API_BASE}${toolDownloadReport.bundle_url}`} download>Download bundle ↓</a> : null}</div>}
-                {toolDownloadReport?.items?.length ? <div className="tool-download-items" aria-label="Tool download status"><span className="tool-download-items-title">Download status</span>{toolDownloadReport.items.map((item, index) => <div className="tool-download-item" key={`${item.id || 'tool'}-${index}`}><span><strong>{item.id || 'tool'}</strong><small>{item.message || item.status || 'recorded'}</small></span><em className={item.status || ''}>{item.status || 'unknown'}</em>{item.download_url ? <a href={item.download_url} target="_blank" rel="noreferrer">Project page ↗</a> : null}</div>)}</div> : null}
+                <div className="settings-section-title"><div><p className="eyebrow">Installed integrations</p><h3 id="external-tools">External tool adapters</h3></div><div className="tool-header-actions"><span>{availableTools}/{capabilities.length} installed</span><button onClick={refreshToolAvailability} disabled={toolRefreshBusy || toolInstallBusy}>{toolRefreshBusy ? 'Checking…' : 'Refresh availability'}</button><button onClick={() => installMissingTools()} disabled={toolInstallBusy || toolRefreshBusy || !capabilities.length}>{toolInstallBusy ? 'Installing tools…' : 'Install all missing'}</button></div></div>
+                <p className="install-note">One click installs fixed, allowlisted packages non-interactively through Kali WSL or Windows Package Manager—no ZIP extraction or installer walkthrough. Availability is refreshed automatically when installation finishes.</p>
+                {toolInstallReport && <div className={`tool-download-report ${toolInstallReport.status || ''}`}><div><strong>{toolInstallReport.message || 'Tool installation finished.'}</strong><small>{toolInstallReport.available_count !== undefined ? `${toolInstallReport.available_count}/${toolInstallReport.requested_count || 0} requested tools detected` : 'Installation report recorded.'}{toolInstallReport.managers?.length ? ` · ${toolInstallReport.managers.join(', ')}` : ''}</small></div></div>}
+                {toolInstallReport?.items?.length ? <div className="tool-download-items" aria-label="Tool installation status"><span className="tool-download-items-title">Installation results</span>{toolInstallReport.items.map((item, index) => <div className="tool-download-item" key={`${item.id || 'tool'}-${index}`}><span><strong>{item.id || 'tool'}</strong><small>{item.message || item.status || 'recorded'}{item.channel ? ` · ${item.channel}` : ''}{item.resolved ? ` · ${item.resolved}` : ''}</small>{item.diagnostic ? <details open><summary>Installer diagnostic</summary><pre>{boundedDisplay(item.diagnostic, 2_000)}</pre></details> : null}</span><em className={item.status || ''}>{(item.status || 'unknown').replaceAll('_', ' ')}</em></div>)}</div> : null}
                 <div className="tool-selection-actions"><button onClick={() => setScanOptions((current) => ({ ...current, selected_external_tools: null }))}>Select all</button><button onClick={() => setScanOptions((current) => ({ ...current, selected_external_tools: [] }))}>Clear all</button></div>
                 <div className="external-tool-grid">
                   {capabilities.map((capability) => {
                     const id = capability.id || capability.executable || capability.name || '';
                     const selected = scanOptions.selected_external_tools === null || scanOptions.selected_external_tools.includes(id);
-                    return <label key={id} className={!capability.available ? 'missing' : ''}><input type="checkbox" disabled={!scanOptions.external_tools} checked={selected} onChange={(event) => toggleExternalTool(id, event.target.checked)} /><span><strong>{capability.name || id}</strong><small>{capability.category || 'forensics'} · {(capability.formats || ['all']).join(', ')}</small></span><em>{capability.available ? 'Installed' : 'Missing'}</em>{!capability.available && capability.download_url ? <a className="tool-download" href={capability.download_url} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>Download</a> : null}</label>;
+                    const location = capability.resolved || capability.install_hint;
+                    return <label key={id} className={!capability.available ? 'missing' : ''} title={location || undefined}><input type="checkbox" disabled={!scanOptions.external_tools} checked={selected} onChange={(event) => toggleExternalTool(id, event.target.checked)} /><span><strong>{capability.name || id}</strong><small>{capability.category || 'forensics'} · {(capability.formats || ['all']).join(', ')}{capability.available ? ` · ${capability.source || 'native'} · ${capability.resolved || 'detected'}` : capability.install_strategy ? ` · ${capability.install_strategy}` : ''}</small></span><em>{capability.available ? 'Installed' : capability.installable ? 'Ready to install' : 'Unavailable'}</em>{!capability.available && capability.installable ? <button className="tool-download" disabled={toolInstallBusy} onClick={(event) => { event.preventDefault(); event.stopPropagation(); installMissingTools([id]); }}>Install</button> : null}</label>;
                   })}
                   {!capabilities.length && <p className="tool-empty">Start the local API to inspect optional tool availability.</p>}
                 </div>
               </section>
             </div>
-            <footer><div><span className="status-dot" /><p><strong>{configurableMethods.filter((item) => scanOptions[item.key]).length} method groups enabled</strong><small>{scanOptions.max_artifacts} artifacts · {scanOptions.max_recursion_depth} levels · {scanOptions.tool_timeout_seconds}s/tool · zsteg {scanOptions.zsteg_mode === 'lsb' ? '--lsb' : '-a'}</small></p></div><button onClick={() => setShowAdvanced(false)}>Apply settings</button></footer>
+            <footer><div><span className="status-dot" /><p><strong>{configurableMethods.filter((item) => scanOptions[item.key]).length} method groups enabled</strong><small>{scanOptions.max_artifacts} artifacts · {scanOptions.max_recursion_depth} levels · Foremost depth {scanOptions.foremost_depth} · {scanOptions.tool_timeout_seconds}s/tool · zsteg {scanOptions.zsteg_mode === 'lsb' ? '--lsb' : '-a'}</small></p></div><button onClick={() => setShowAdvanced(false)}>Apply settings</button></footer>
           </section>
         </div>
       )}
     </main>
   );
+}
+
+// Browser extensions can inject nodes into the server-rendered document before
+// React hydrates it. Keep the SSR snapshot deliberately small and stable, then
+// mount the interactive workbench on the client after hydration has completed.
+const subscribeToNothing = () => () => {};
+const getClientSnapshot = () => true;
+const getServerSnapshot = () => false;
+
+export default function Home() {
+  const hydrated = useSyncExternalStore(subscribeToNothing, getClientSnapshot, getServerSnapshot);
+  if (!hydrated) {
+    return <main className="app-shell app-shell-loading" aria-busy="true" suppressHydrationWarning><div><span className="loading-mark">F</span><p>Loading forensic workbench…</p></div></main>;
+  }
+  return <HomeWorkbench />;
 }

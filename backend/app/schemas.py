@@ -48,6 +48,7 @@ class AnalysisOptions(BaseModel):
     tool_timeout_seconds: int = Field(default=60, ge=5, le=180)
     external_output_kib: int = Field(default=1024, ge=64, le=2048)
     max_external_files: int = Field(default=32, ge=1, le=64)
+    foremost_depth: int = Field(default=2, ge=1, le=4)
     color_remap_variants: int = Field(default=8, ge=0, le=8)
     zsteg_mode: Literal["all", "lsb"] = "all"
     ocr_language: str = Field(default="eng", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_+\-]+$")
@@ -62,12 +63,14 @@ class AnalysisOptions(BaseModel):
             "deep": (4, 220, 180, 2048, 64, 8),
         }
         recursion, artifacts, timeout, output_kib, external_files, remaps = budgets.get(profile_name, budgets["balanced"])
+        foremost_depth = {"quick": 1, "balanced": 2, "deep": 4}.get(profile_name, 2)
         return cls(
             max_recursion_depth=recursion,
             max_artifacts=artifacts,
             tool_timeout_seconds=timeout,
             external_output_kib=output_kib,
             max_external_files=external_files,
+            foremost_depth=foremost_depth,
             color_remap_variants=remaps,
         )
 
@@ -161,8 +164,8 @@ class CapabilitiesResponse(BaseModel):
     limits: dict[str, int | float]
 
 
-class ToolDownloadRequest(BaseModel):
-    """Explicit request to download allowlisted tool installers."""
+class ToolInstallRequest(BaseModel):
+    """Explicit request to install a fixed allowlist of forensic tools."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 

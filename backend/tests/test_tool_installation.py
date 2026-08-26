@@ -1,0 +1,58 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from app.analyzers.external import ResolvedTool
+from app.schemas import ToolInstallRequest
+from app import tool_installation
+
+
+def test_tool_install_request_is_strict_and_deduplicated() -> None:
+    request = ToolInstallRequest.model_validate(
+        {"tool_ids": [" PNGCHECK ", "pngcheck"], "confirmed": True}
+    )
+    assert request.tool_ids == ["pngcheck"]
+
+    with pytest.raises(ValidationError):
+        ToolInstallRequest.model_validate({"tool_ids": ["pngcheck"], "confirmed": "yes"})
+
+
+def test_install_uses_only_fixed_wsl_package_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    wsl = Path("C:/Windows/System32/wsl.exe")
+    installed = ResolvedTool(source="wsl", launcher=wsl, executable="/usr/bin/pngcheck")
+    availability = iter(({"pngcheck": None}, {"pngcheck": installed}, {"pngcheck": installed}))
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(tool_installation, "_availability", lambda _ids=None: next(availability))
+    monkeypatch.setattr(tool_installation, "resolve_executable", lambda name: wsl if name == "wsl" else None)
+    monkeypatch.setattr(tool_installation, "_wsl_root_available", lambda _wsl: True)
+
+    def fake_wsl(_wsl: Path, arguments: list[str], *, timeout: int) -> dict[str, object]:
+        commands.append(arguments)
+        return {"status": "completed", "return_code": 0, "output": "ok", "duration_ms": 1}
+
+    monkeypatch.setattr(tool_installation, "_run_wsl", fake_wsl)
+
+    report = tool_installation.install_tools(["pngcheck"])
+
+    assert report["status"] == "completed"
+    assert report["installed_count"] == 1
+    assert report["items"][0]["status"] == "installed"
+    install_command = next(command for command in commands if "install" in command)
+    assert install_command[-1] == "pngcheck"
+    assert "shell" not in install_command
+
+
+def test_unknown_id_never_becomes_a_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    availability = iter(({}, {}, {}))
+    monkeypatch.setattr(tool_installation, "_availability", lambda _ids=None: next(availability))
+    monkeypatch.setattr(tool_installation, "resolve_executable", lambda _name: None)
+
+    report = tool_installation.install_tools(["not-a-real-package; whoami"])
+
+    assert report["status"] == "failed"
+    assert report["items"][0]["status"] == "unavailable"
+    assert report["items"][0]["channel"] is None

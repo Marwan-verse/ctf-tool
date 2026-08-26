@@ -2,7 +2,7 @@
 
 Forenscope is a local-first CTF image-forensics workbench. Upload an image or damaged image candidate, choose a scan profile, and inspect ranked flag candidates, metadata, extracted artifacts, visual derivatives, and a complete method-coverage record.
 
-The source file is copied into an isolated job directory, hashed, and never modified. Derived evidence is bounded, hashed, and linked to its parent. The application makes no analysis-time network calls.
+The source file is copied into an isolated job directory, hashed, and never modified. Derived evidence is bounded, hashed, and linked to its parent. Scans make no network calls; network access is used only when you explicitly confirm automatic tool installation.
 
 ## Run locally
 
@@ -45,11 +45,17 @@ Audio-only spectrogram and document-only `pdfinfo`/PDFiD analyzers are represent
 
 ## Configurable scan settings
 
-The settings panel controls structure parsing, visual analysis, LSB streams, OCR, barcodes, recursive extraction, decoders, encrypted-payload recovery, repair generation, external tools, and external payload extraction. It also sets the recursion depth, artifact ceiling, per-tool timeout, external output budget, extracted-file ceiling, color-remap variants, OCR language, zsteg mode, and the exact external adapters to run. Settings are server-validated and saved with the job; passphrases are never persisted. When a ciphertext-like payload is detected, the engine reports the signal and, if a passphrase was supplied, tries only bounded repeating-key XOR and OpenSSL salted AES-256-CBC recovery. Successful plaintext is written as a hashed child artifact and scanned for flag candidates.
+The settings panel controls structure parsing, visual analysis, LSB streams, OCR, barcodes, recursive extraction, decoders, encrypted-payload recovery, repair generation, external tools, and external payload extraction. It also sets the recursion depth, Foremost carving depth (1–4 bounded passes), artifact ceiling, per-tool timeout, external output budget, extracted-file ceiling, color-remap variants, OCR language, zsteg mode, and the exact external adapters to run. Settings are server-validated and saved with the job; passphrases are never persisted. When a ciphertext-like payload is detected, the engine reports the signal and, if a passphrase was supplied, tries only bounded repeating-key XOR and OpenSSL salted AES-256-CBC recovery. Successful plaintext is written as a hashed child artifact and scanned for flag candidates.
+
+Foremost-carved PNG, JPEG, GIF, WebP, and BMP files appear as inline thumbnails in **Tool results**. Selecting a thumbnail opens the artifact inspector with a larger verified preview; other recovered formats remain available through the artifact download and lineage views.
+
+The **Hex view** is a read-only byte inspector for the original upload and every recovered artifact. It supports bounded text or hexadecimal searches across the full artifact, clickable match offsets, page navigation, and heuristic anomaly hints for long zero/repeated-byte runs, embedded file signatures, and high-entropy blocks. The displayed bytes are never edited, which preserves the evidentiary source.
 
 Results can be searched across flag candidates, provenance, metadata paths and values, artifact names and hashes, method summaries, and bounded tool output. JSON, standalone HTML, and ZIP case exports preserve the same evidence record.
 
-The settings panel also includes **Download all missing**. It uses fixed, allowlisted Winget package IDs where available, downloads installer files into one ZIP bundle, and never executes them. Tools without a safe package mapping remain available through their project page link; after installing, restart the local API so availability is detected again.
+The settings panel also includes **Install all missing**. After an explicit confirmation, the local API installs only fixed, allowlisted packages: Linux-native forensic tools come from Kali WSL's package manager, while supported native utilities use silent Windows Package Manager installs. ZSteg, JSteg, and JPSeek use fixed-version or pinned-source managed installs. No package name, URL, archive, or command comes from the browser, and no manual ZIP extraction is required. The app re-detects every requested command when installation finishes and shows a per-tool diagnostic for anything still unavailable.
+
+Detection checks native Windows PATH values, standard install folders, Ruby command wrappers, and the default WSL distribution. A tool found in WSL runs transparently against the uploaded file through its `/mnt/<drive>/...` path. The automatic Linux installer requires a working WSL distribution with root package access; on this Windows setup, Kali WSL is supported directly. For an existing portable Windows directory elsewhere, set `FORENSCOPE_TOOL_PATHS` to a semicolon-separated list of folders before launching the API.
 
 ## Verification
 

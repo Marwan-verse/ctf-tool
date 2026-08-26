@@ -206,6 +206,7 @@ class AnalysisEngine:
             "external_extraction": True,
             "external_output_kib": 1024,
             "max_external_files": 32,
+            "foremost_depth": 2,
             "color_remap_variants": 8,
             "zsteg_mode": "all",
             "ocr_language": "eng",
@@ -643,6 +644,7 @@ class AnalysisEngine:
                 zsteg_mode=str(analysis_options["zsteg_mode"]),
                 allow_extraction=bool(analysis_options["external_extraction"]),
                 max_extracted_files=int(analysis_options["max_external_files"]),
+                foremost_depth=int(analysis_options["foremost_depth"]),
             )
             for method in external_results:
                 check_cancelled(is_cancelled) if method["status"] not in {"cancelled"} else None
