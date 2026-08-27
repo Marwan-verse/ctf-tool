@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from app.analyzers.external import ExternalToolRunner, TOOL_SPECS, resolve_executable
+from app.analyzers.external import ExternalToolRunner, ResolvedTool, TOOL_SPECS, resolve_executable
 
 
 def test_missing_optional_tools_are_reported_without_failing(
@@ -137,6 +137,83 @@ def test_zsteg_mode_uses_explicit_all_or_lsb_switch(monkeypatch, clean_png: Path
     assert next(method for method in lsb_result if method["id"] == "zsteg")["command"][1] == "--lsb"
 
 
+def test_wsl_tools_run_from_stable_job_directory(monkeypatch, clean_png: Path, tmp_path: Path) -> None:
+    """Do not leave WSL holding the disposable per-tool output directory."""
+
+    def fake_resolve(executable: str, **_kwargs: object) -> ResolvedTool | None:
+        if executable == "pngcheck":
+            return ResolvedTool(source="wsl", launcher=Path("C:/Windows/System32/wsl.exe"), executable="/usr/bin/pngcheck")
+        return None
+
+    monkeypatch.setattr("app.analyzers.external.resolve_tool", fake_resolve)
+    runner = ExternalToolRunner(timeout=1)
+    working_directories: list[Path] = []
+
+    def fake_execute(argv, *, cwd, timeout=None, stdin_data=None):
+        working_directories.append(cwd)
+        return {"status": "completed", "return_code": 0, "stdout": "pngcheck 3.0", "stderr": "", "output_truncated": False}
+
+    monkeypatch.setattr(runner, "_execute", fake_execute)
+    methods = runner.run_all(
+        clean_png,
+        kind="png",
+        profile="quick",
+        password=None,
+        work_dir=tmp_path,
+        selected_tools={"pngcheck"},
+    )
+
+    result = next(method for method in methods if method["id"] == "pngcheck")
+    assert result["status"] == "completed"
+    assert working_directories and all(directory == tmp_path for directory in working_directories)
+
+
+def test_web_repair_tools_use_fixed_output_paths_and_emit_derived_artifacts(
+    monkeypatch, clean_png: Path, tmp_path: Path
+) -> None:
+    def fake_resolve(executable: str, **_kwargs: object) -> ResolvedTool:
+        return ResolvedTool(source="native", launcher=Path(sys.executable), executable=executable)
+
+    monkeypatch.setattr("app.analyzers.external.resolve_tool", fake_resolve)
+    runner = ExternalToolRunner(timeout=1)
+    invocations: list[list[str]] = []
+
+    def fake_execute(argv, *, cwd, timeout=None, stdin_data=None):
+        invocations.append(list(argv))
+        if any(flag in argv for flag in ("--version", "-version")):
+            return {"status": "completed", "return_code": 0, "stdout": "repair-tool 1", "stderr": "", "output_truncated": False}
+        if "--out" in argv:
+            output_path = Path(argv[argv.index("--out") + 1])
+        elif any(argument.startswith("--out=") for argument in argv):
+            output_path = Path(next(argument.split("=", 1)[1] for argument in argv if argument.startswith("--out=")))
+        else:
+            output_path = Path(argv[argv.index("-out") + 1])
+        output_path.write_bytes(clean_png.read_bytes())
+        return {"status": "completed", "return_code": 0, "stdout": "rewritten", "stderr": "", "output_truncated": False}
+
+    monkeypatch.setattr(runner, "_execute", fake_execute)
+    for tool_id in ("pngfix", "optipng"):
+        result = next(
+            method
+            for method in runner.run_all(
+                clean_png,
+                kind="png",
+                profile="deep",
+                password=None,
+                work_dir=tmp_path,
+                selected_tools={tool_id},
+            )
+            if method["id"] == tool_id
+        )
+        assert result["status"] == "completed"
+        assert result["extracted"]
+        assert result["extracted"][0]["producer"] == tool_id
+        assert result["extracted"][0]["kind"] == "png"
+
+    assert any(any(argument.startswith("--out=") for argument in argv) for argv in invocations)
+    assert any("-out" in argv for argv in invocations)
+
+
 def test_tool_output_scrubs_supplied_password(tmp_path: Path) -> None:
     scrubbed = ExternalToolRunner._sanitize(  # noqa: SLF001 - output redaction contract
         "tool echoed super-secret-passphrase", tmp_path / "input.jpg", tmp_path / "private", "super-secret-passphrase"
@@ -232,11 +309,22 @@ def test_foremost_depth_recurses_over_recovered_files(
     assert len([argv for argv in invocations if "-o" in argv]) == 3
 
 
-def test_steghide_requires_a_passphrase_before_launch(
+def test_steghide_automatically_tries_empty_passphrase(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(shutil, "which", lambda name: sys.executable if name == "steghide" else None)
     runner = ExternalToolRunner(timeout=1)
+    launched: list[list[str]] = []
+
+    def fake_execute(argv, *, cwd, timeout=None, stdin_data=None):
+        launched.append(list(argv))
+        if "--version" in argv:
+            return {"status": "completed", "return_code": 0, "stdout": "steghide 0.5.1", "stderr": "", "output_truncated": False}
+        output_path = Path(argv[argv.index("-xf") + 1])
+        output_path.write_bytes(b"ZeroDays{synthetic_empty_passphrase_test}")
+        return {"status": "completed", "return_code": 0, "stdout": "embedded file extracted", "stderr": "", "output_truncated": False}
+
+    monkeypatch.setattr(runner, "_execute", fake_execute)
 
     methods = runner.run_all(
         tmp_path / "input.jpg",
@@ -248,9 +336,27 @@ def test_steghide_requires_a_passphrase_before_launch(
     )
     result = next(method for method in methods if method["id"] == "steghide")
 
-    assert result["status"] == "skipped"
-    assert "passphrase" in result["summary"]
-    assert result["command"] == []
+    assert result["status"] == "completed"
+    assert result["details"]["passphrase_strategy"] == "automatic_empty"
+    assert result["extracted"][0]["data"] == b"ZeroDays{synthetic_empty_passphrase_test}"
+    extraction = next(argv for argv in launched if "extract" in argv)
+    assert extraction[extraction.index("-p") + 1] == ""
+    assert "<redacted>" in result["command"]
+
+
+def test_steghide_resolution_checks_managed_tools_directory(monkeypatch, tmp_path: Path) -> None:
+    tool_dir = tmp_path / "steghide" / "bin"
+    tool_dir.mkdir(parents=True)
+    executable = tool_dir / ("steghide.exe" if os.name == "nt" else "steghide")
+    executable.write_bytes(b"placeholder")
+
+    monkeypatch.setenv("FORENSCOPE_TOOLS_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "app.analyzers.external.shutil.which",
+        lambda name, path=None: str(executable) if name == "steghide" and path and str(tool_dir) in path else None,
+    )
+
+    assert resolve_executable("steghide") == executable
 
 
 def test_steghide_extracts_payload_and_redacts_passphrase(

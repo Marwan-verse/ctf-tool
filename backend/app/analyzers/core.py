@@ -5,6 +5,7 @@ import binascii
 import bz2
 import codecs
 import gzip
+import html
 import io
 import lzma
 import re
@@ -191,7 +192,9 @@ def inspect_bytes(data: bytes, *, max_strings: int) -> dict[str, Any]:
     ascii_records = list(iter_ascii_strings(data, minimum=4, limit=max_strings))
     remaining = max(0, max_strings - len(ascii_records))
     utf16_records = list(iter_utf16_strings(data, minimum=4, limit=min(remaining, max_strings // 2)))
-    records = sorted(ascii_records + utf16_records, key=lambda item: (item["offset"], item["encoding"]))
+    remaining = max(0, max_strings - len(ascii_records) - len(utf16_records))
+    svg_records = _svg_text_records(data, limit=min(remaining, 2_000))
+    records = sorted(ascii_records + utf16_records + svg_records, key=lambda item: (item["offset"], item["encoding"]))
     byte_counts = [0] * 256
     for byte in data:
         byte_counts[byte] += 1
@@ -202,6 +205,40 @@ def inspect_bytes(data: bytes, *, max_strings: int) -> dict[str, Any]:
         "strings": records,
         "strings_truncated": len(records) >= max_strings,
     }
+
+
+def _svg_text_records(data: bytes, *, limit: int) -> list[dict[str, Any]]:
+    """Extract ordered SVG text nodes without invoking an XML parser.
+
+    SVG is frequently used as an image container in CTFs, with one flag
+    character per ``<text>`` node.  A bounded tag regex avoids XXE/entity
+    expansion and network resolution while still recovering visible text.
+    """
+
+    if limit <= 0:
+        return []
+    sample = data[: min(len(data), 8 * 1024 * 1024)]
+    lowered = sample.lower()
+    if b"<svg" not in lowered or b"<text" not in lowered:
+        return []
+    node_pattern = re.compile(rb"<text\b[^>]*>(.*?)</text\s*>", re.IGNORECASE | re.DOTALL)
+    node_values: list[tuple[int, str]] = []
+    records: list[dict[str, Any]] = []
+    for match in node_pattern.finditer(sample):
+        if len(node_values) >= limit:
+            break
+        raw = re.sub(rb"<[^>]{0,512}>", b"", match.group(1))
+        text = html.unescape(raw.decode("utf-8", "replace")).strip()
+        if not text:
+            continue
+        offset = int(match.start(1))
+        node_values.append((offset, text))
+        records.append({"source": "SVG text node", "offset": offset, "encoding": "svg-text", "text": display_text(text, 16_384), "confidence_hint": 8})
+    if len(node_values) >= 2:
+        joined = "".join(value for _, value in node_values)
+        if joined and len(records) < limit:
+            records.append({"source": "SVG ordered text nodes", "offset": node_values[0][0], "encoding": "svg-text-joined", "text": display_text(joined, 2_000_000), "confidence_hint": 10})
+    return records
 
 
 @dataclass(slots=True)

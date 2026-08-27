@@ -55,6 +55,100 @@ def _finding(severity: str, category: str, title: str, description: str, **detai
     }
 
 
+def _valid_png_ihdr(data: bytes) -> bool:
+    """Return whether bytes at the canonical PNG IHDR location are plausible.
+
+    This is deliberately stricter than looking for the ASCII string ``IHDR``:
+    the dimensions, colour model, and following chunk boundary must all be
+    reasonable before a repair candidate is offered.
+    """
+
+    if len(data) < 49 or data[12:16] != b"IHDR":
+        return False
+    try:
+        width, height, bit_depth, color_type, compression, filtering, interlace = struct.unpack(">IIBBBBB", data[16:29])
+    except struct.error:
+        return False
+    if not (1 <= width <= 100_000 and 1 <= height <= 100_000):
+        return False
+    if width * height > 256_000_000:
+        return False
+    if bit_depth not in {1, 2, 4, 8, 16} or color_type not in {0, 2, 3, 4, 6}:
+        return False
+    if compression != 0 or filtering != 0 or interlace not in {0, 1}:
+        return False
+    next_type = data[37:41]
+    if len(next_type) != 4 or not all(byte in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" for byte in next_type):
+        return False
+    # The first chunk's CRC is at 29:33; the next chunk starts at 33.  A
+    # complete next chunk gives us a strong anti-false-positive boundary.
+    next_length = int.from_bytes(data[33:37], "big")
+    return next_length <= 0x7FFFFFFF and 45 + next_length <= len(data)
+
+
+def propose_header_repairs(data: bytes, *, profile: str = "balanced") -> list[dict[str, Any]]:
+    """Propose conservative copy-only repairs for damaged media signatures.
+
+    CTF corruption challenges commonly alter only the magic bytes or the
+    first PNG chunk length.  These candidates are emitted only when internal
+    format evidence proves the intended layout; no arbitrary byte guessing is
+    performed.  The caller owns persistence, hashing, and re-validation.
+    """
+
+    if not isinstance(data, (bytes, bytearray)) or len(data) > 192 * 1024 * 1024:
+        return []
+    payload = bytes(data)
+    candidates: list[dict[str, Any]] = []
+
+    if _valid_png_ihdr(payload):
+        bad_signature = payload[:8] != b"\x89PNG\r\n\x1a\n"
+        bad_length = payload[8:12] != b"\x00\x00\x00\r"
+        if bad_signature or bad_length:
+            fixed = bytearray(payload)
+            changes: list[str] = []
+            if bad_signature:
+                fixed[:8] = b"\x89PNG\r\n\x1a\n"
+                changes.append("restore PNG signature")
+            if bad_length:
+                fixed[8:12] = b"\x00\x00\x00\r"
+                changes.append("restore canonical IHDR length")
+            computed_crc = binascii.crc32(b"IHDR" + bytes(fixed[16:29])) & 0xFFFFFFFF
+            if bytes(fixed[29:33]) != computed_crc.to_bytes(4, "big"):
+                fixed[29:33] = computed_crc.to_bytes(4, "big")
+                changes.append("recompute IHDR CRC-32")
+            candidates.append({
+                "label": "png_header_recovered",
+                "data": bytes(fixed),
+                "kind": "png",
+                "producer": "png-recovery",
+                "transformation": "; ".join(changes),
+                "reason": "The IHDR marker, dimensions, colour model, and following chunk boundary prove a PNG layout despite damaged header bytes.",
+                "details": {"signature_repaired": bad_signature, "ihdr_length_repaired": bad_length},
+            })
+
+    # JPEG SOI corruption is often visible as a literal ``\\x`` prefix or two
+    # arbitrary bytes immediately before a valid APP0/APP1 JFIF/Exif segment.
+    if len(payload) >= 20 and payload[:2] != b"\xff\xd8" and payload[2:3] == b"\xff" and 0xE0 <= payload[3] <= 0xEF:
+        declared = int.from_bytes(payload[4:6], "big")
+        app_payload_end = 6 + max(0, declared - 2)
+        marker_text = payload[6:12]
+        known_app = (payload[3] == 0xE0 and payload[6:11] == b"JFIF\x00") or (payload[3] == 0xE1 and marker_text == b"Exif\x00\x00")
+        next_marker = payload[app_payload_end:app_payload_end + 2]
+        if 8 <= declared <= 0xFFFF and app_payload_end <= len(payload) and known_app and next_marker[:1] == b"\xff":
+            fixed = bytearray(payload)
+            fixed[:2] = b"\xff\xd8"
+            candidates.append({
+                "label": "jpeg_soi_recovered",
+                "data": bytes(fixed),
+                "kind": "jpeg",
+                "producer": "jpeg-recovery",
+                "transformation": "restore JPEG start-of-image marker (FF D8)",
+                "reason": "A valid JFIF/Exif APP segment and following JPEG marker prove the two missing SOI bytes.",
+                "details": {"app_marker": f"FF{payload[3]:02X}", "declared_segment_length": declared},
+            })
+    return candidates
+
+
 def _bounded_zlib(data: bytes, maximum: int = 2 * 1024 * 1024) -> bytes:
     decoder = zlib.decompressobj()
     output = decoder.decompress(data, maximum + 1)
@@ -506,6 +600,100 @@ def _gif_subblocks(data: bytes, cursor: int) -> tuple[bytes, int, bool]:
     return bytes(payload), cursor, False
 
 
+_BMP_INTERLEAVED_SCAN_LIMIT = 32 * 1024 * 1024
+
+
+def _trim_interleaved_zip(stream: bytes) -> bytes | None:
+    """Return a structurally bounded ZIP prefix from a noisy byte lane.
+
+    Python's ZIP reader only searches for an end record near the physical end
+    of a file.  Steganography challenges commonly interleave a short archive
+    with an entire image-sized lane, leaving far more than 65 KiB of unrelated
+    bytes after the archive.  Validate the central-directory bounds before
+    discarding that carrier tail so random ``PK`` bytes do not become artifacts.
+    """
+
+    if not stream.startswith((b"PK\x03\x04", b"PK\x05\x06")):
+        return None
+    cursor = 0
+    while True:
+        eocd = stream.find(b"PK\x05\x06", cursor)
+        if eocd < 0:
+            return None
+        cursor = eocd + 1
+        if eocd + 22 > len(stream):
+            continue
+        disk_number, central_disk, disk_entries, total_entries = struct.unpack_from("<HHHH", stream, eocd + 4)
+        central_size, central_offset = struct.unpack_from("<II", stream, eocd + 12)
+        comment_length = int.from_bytes(stream[eocd + 20:eocd + 22], "little")
+        archive_end = eocd + 22 + comment_length
+        if archive_end > len(stream):
+            continue
+        if disk_number != 0 or central_disk != 0 or disk_entries != total_entries:
+            continue
+        if central_offset + central_size > eocd:
+            continue
+        if total_entries and stream[central_offset:central_offset + 4] != b"PK\x01\x02":
+            continue
+        return stream[:archive_end]
+
+
+def _bmp_bitfield_masks(data: bytes, dib_size: int, pixel_offset: int, compression: int | None) -> list[int]:
+    """Read RGB(A) masks from BITFIELDS BMP headers without trusting offsets."""
+
+    if compression not in (3, 6) or dib_size < 40:
+        return []
+    mask_offset = 14 + 40
+    mask_count = 4 if (dib_size >= 56 or compression == 6) else 3
+    available_end = min(len(data), pixel_offset, 14 + max(dib_size, 40))
+    # BITMAPINFOHEADER stores its masks immediately after the 40-byte DIB,
+    # whereas V2/V3/V4/V5 headers include them at the same absolute offset.
+    if dib_size == 40:
+        available_end = min(len(data), pixel_offset)
+    if mask_offset + mask_count * 4 > available_end:
+        return []
+    return [int.from_bytes(data[mask_offset + index * 4:mask_offset + index * 4 + 4], "little") for index in range(mask_count)]
+
+
+def _extract_bmp_interleaved_words(
+    data: bytes,
+    *,
+    pixel_offset: int,
+    pixel_end: int,
+    pixel_count: int,
+) -> list[dict[str, Any]]:
+    """Detect file signatures split across either 16-bit word of 32-bit pixels."""
+
+    if pixel_count <= 0 or pixel_end > len(data) or pixel_offset < 0:
+        return []
+    scan_pixels = min(pixel_count, _BMP_INTERLEAVED_SCAN_LIMIT // 2)
+    pixel_bytes = data[pixel_offset:pixel_offset + scan_pixels * 4]
+    if len(pixel_bytes) != scan_pixels * 4:
+        return []
+    recovered: list[dict[str, Any]] = []
+    for word_lane in (0, 1):
+        byte_offset = word_lane * 2
+        stream = bytearray(scan_pixels * 2)
+        stream[0::2] = pixel_bytes[byte_offset::4]
+        stream[1::2] = pixel_bytes[byte_offset + 1::4]
+        lane_data = bytes(stream)
+        kind = sniff_kind(lane_data)
+        if kind == "zip":
+            payload = _trim_interleaved_zip(lane_data)
+        else:
+            payload = None
+        if payload:
+            recovered.append({
+                "word_lane": word_lane,
+                "byte_positions": [byte_offset, byte_offset + 1],
+                "data": payload,
+                "kind": kind,
+                "scanned_bytes": len(lane_data),
+                "discarded_carrier_tail": len(lane_data) - len(payload),
+            })
+    return recovered
+
+
 def parse_bmp(data: bytes, profile: str = "balanced") -> dict[str, Any]:
     result = _result("bmp")
     if len(data) < 26 or not data.startswith(b"BM"):
@@ -529,12 +717,19 @@ def parse_bmp(data: bytes, profile: str = "balanced") -> dict[str, Any]:
     else:
         result["findings"].append(_finding("warning", "structure", "Unsupported BMP DIB header", "The DIB header type is truncated or uncommon.", dib_size=dib_size))
 
+    masks = _bmp_bitfield_masks(data, dib_size, pixel_offset, compression)
+    used_mask = 0
+    for mask in masks:
+        used_mask |= mask
+    unused_mask = ((1 << bpp) - 1) & ~used_mask if bpp and masks and 0 < bpp <= 32 else None
     result["properties"].update({
         "declared_file_size": declared_size, "actual_file_size": len(data), "pixel_offset": pixel_offset,
         "dib_header_size": dib_size, "width": width, "height": height, "top_down": top_down,
         "planes": planes, "bits_per_pixel": bpp, "compression": compression,
         "declared_image_size": image_size, "colors_used": colors_used,
         "reserved_words": [reserved1, reserved2],
+        "bitfield_masks": [f"0x{mask:08x}" for mask in masks],
+        "unused_pixel_mask": f"0x{unused_mask:08x}" if unused_mask is not None else None,
     })
     if reserved1 or reserved2:
         result["findings"].append(_finding("info", "structure", "Non-zero BMP reserved fields", "The two reserved header words contain data.", reserved1=reserved1, reserved2=reserved2))
@@ -557,6 +752,41 @@ def parse_bmp(data: bytes, profile: str = "balanced") -> dict[str, Any]:
         padding_size = row_stride - row_payload
         expected_end = pixel_offset + row_stride * height
         result["properties"].update({"row_stride": row_stride, "row_padding_bytes": padding_size, "expected_pixel_end": expected_end})
+        if masks:
+            result["findings"].append(_finding(
+                "info", "structure", "BMP bitfield channel masks",
+                "The bitmap uses explicit channel masks; unassigned pixel bits and byte lanes were inspected for hidden data.",
+                masks=[f"0x{mask:08x}" for mask in masks],
+                unused_mask=f"0x{unused_mask:08x}" if unused_mask is not None else None,
+            ))
+        if bpp == 32 and padding_size == 0 and expected_end <= len(data):
+            interleaved = _extract_bmp_interleaved_words(
+                data,
+                pixel_offset=pixel_offset,
+                pixel_end=expected_end,
+                pixel_count=abs(width) * height,
+            )
+            for item in interleaved:
+                lane = item["word_lane"]
+                payload = item["data"]
+                result["findings"].append(_finding(
+                    "warning", "embedded-data", "File hidden in a BMP word lane",
+                    "Taking the same two bytes from every 32-bit pixel produced a validated embedded file.",
+                    word_lane=lane,
+                    byte_positions=item["byte_positions"],
+                    detected_kind=item["kind"],
+                    extracted_size=len(payload),
+                    scanned_bytes=item["scanned_bytes"],
+                    discarded_carrier_tail=item["discarded_carrier_tail"],
+                ))
+                result["extracted"].append({
+                    "label": f"bmp_word_lane_{lane}_{item['kind']}",
+                    "data": payload,
+                    "producer": "bmp-word-lane-parser",
+                    "transformation": f"concatenate byte positions {lane * 2} and {lane * 2 + 1} from every 32-bit pixel, then validate and trim the {item['kind'].upper()} container",
+                    "offset": pixel_offset + lane * 2,
+                    "kind": item["kind"],
+                })
         if padding_size > 0 and expected_end <= len(data) and height <= 2_000_000:
             padding = bytearray()
             for row in range(height):

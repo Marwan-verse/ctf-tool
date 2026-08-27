@@ -116,6 +116,44 @@ def test_corrupted_deep_scan_creates_copy_only_png_repair(malformed_png: Path, t
     assert malformed_png.read_bytes() == source_bytes
 
 
+def test_engine_replays_recovered_png_for_pixel_analysis(clean_png: Path, tmp_path: Path) -> None:
+    source = tmp_path / "headerless-image.bin"
+    damaged = bytearray(clean_png.read_bytes())
+    damaged[:8] = b"\x89PB\x11\r\n\x1a\n"
+    damaged[8:12] = b"\x00\x12\x13\x14"
+    source.write_bytes(bytes(damaged))
+
+    report = AnalysisEngine().run(
+        input_path=source,
+        output_dir=tmp_path / "output",
+        profile="quick",
+        flag_prefix=None,
+        password=None,
+        progress_callback=None,
+        is_cancelled=lambda: False,
+        options={
+            "evidence_type": "corrupted",
+            "external_tools": False,
+            "lsb_analysis": False,
+            "ocr": False,
+            "barcodes": False,
+            "recursive_extraction": False,
+            "decoders": False,
+            "crypto_analysis": False,
+        },
+    )
+
+    structure = next(method for method in report["methods"] if method["id"] == "built-in-structure")
+    repairs = [artifact for artifact in report["artifacts"] if artifact["repair_candidate"]]
+    assert report["status"] == "completed"
+    assert report["source"]["detected_type"] == "binary"
+    assert structure["details"]["analyzed_type"] == "png"
+    assert structure["details"]["header_recovery_used"] is True
+    assert repairs and repairs[0]["detected_type"] == "png"
+    assert report["visual_views"]
+    assert source.read_bytes() == bytes(damaged)
+
+
 def test_engine_honors_disabled_stages_and_custom_budgets(clean_png: Path, tmp_path: Path) -> None:
     report = AnalysisEngine().run(
         input_path=clean_png,

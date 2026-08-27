@@ -34,7 +34,7 @@ from .analyzers.audio import AUDIO_KINDS, analyze_audio
 from .analyzers.core import BoundedDecoder, CandidateCollector, inspect_bytes
 from .analyzers.crypto import analyze_encrypted_payloads
 from .analyzers.external import ExternalToolRunner, TOOL_SPECS
-from .analyzers.formats import analyze_format
+from .analyzers.formats import analyze_format, propose_header_repairs
 from .analyzers.visual import analyze_visual
 
 
@@ -304,6 +304,11 @@ class AnalysisEngine:
         processed_artifacts: set[str] = set()
         all_string_seeds: list[dict[str, Any]] = []
         repair_artifact_ids: list[str] = []
+        analysis_data = source_data
+        analysis_kind = source_kind
+        analysis_parent_id = source_id
+        header_recovery_used = False
+        header_repairs: list[dict[str, Any]] = []
 
         try:
             self._emit(progress_callback, 6, "core", "Scanning raw bytes, signatures, entropy, and strings")
@@ -343,10 +348,45 @@ class AnalysisEngine:
                 structure_summary = "Structural parsing was skipped because the profile did not read the complete source."
                 format_root = None
             else:
-                format_root = analyze_format(source_kind, source_data, profile=profile)
-                structure_status = "completed" if source_kind in {"png", "jpeg", "gif", "bmp", "webp", "tiff", "ico"} else "skipped"
+                header_repairs = propose_header_repairs(source_data, profile=profile)
+                if header_repairs:
+                    # Use the highest-confidence deterministic reconstruction
+                    # for analysis while keeping the immutable source as the
+                    # report's identity and parent evidence.
+                    primary = header_repairs[0]
+                    analysis_data = bytes(primary["data"])
+                    analysis_kind = str(primary.get("kind") or sniff_kind(analysis_data))
+                    header_recovery_used = True
+                    if analysis_options["repairs"]:
+                        artifact_id, created, reason = store.add_bytes(
+                            analysis_data, label=str(primary["label"]), parent_id=source_id,
+                            producer=str(primary.get("producer") or "format-recovery"),
+                            transformation=str(primary.get("transformation") or "deterministic header recovery"),
+                            kind=analysis_kind, depth=1, repair_candidate=True, reason=str(primary.get("reason") or "Recovered from internal format evidence."),
+                            parameters=primary.get("details"),
+                        )
+                        if artifact_id:
+                            analysis_parent_id = artifact_id
+                            repair_artifact_ids.append(artifact_id)
+                            if created:
+                                derived_queue.append((artifact_id, analysis_data, analysis_kind, 1))
+                            add_finding({
+                                "severity": "info", "category": "repair", "title": "Probable format header recovered",
+                                "description": "Internal markers proved a deterministic header reconstruction; the original evidence was preserved and a separate candidate was created.",
+                                "details": {"repair_artifact_id": artifact_id, "format": analysis_kind, "transformation": primary.get("transformation"), "reason": primary.get("reason")},
+                            }, source_id, "header-recovery")
+                        elif reason:
+                            log("warning", f"Skipped header recovery candidate: {reason}", "header-recovery")
+                    else:
+                        add_finding({
+                            "severity": "info", "category": "repair", "title": "Deterministic header recovery available",
+                            "description": "Internal markers prove a copy-only header reconstruction. Repair generation is disabled, so the candidate remains in memory for analysis only.",
+                            "details": {"format": analysis_kind, "transformation": primary.get("transformation"), "reason": primary.get("reason")},
+                        }, source_id, "header-recovery")
+                format_root = analyze_format(analysis_kind, analysis_data, profile=profile)
+                structure_status = "completed" if analysis_kind in {"png", "jpeg", "gif", "bmp", "webp", "tiff", "ico"} else "skipped"
                 structure_summary = (
-                    f"Parsed {source_kind} structure with {len(format_root['findings'])} notable finding(s), "
+                    f"Parsed {analysis_kind} structure with {len(format_root['findings'])} notable finding(s), "
                     f"{len(format_root['extracted'])} extracted object(s), and {len(format_root['repairs'])} repair candidate(s)."
                     if structure_status == "completed" else f"No image-specific parser is registered for detected type {source_kind}."
                 )
@@ -379,10 +419,16 @@ class AnalysisEngine:
                         repair["data"], label=repair["label"], parent_id=source_id,
                         producer=repair.get("producer", "built-in-structure"),
                         transformation=repair.get("transformation", "create repair candidate"),
-                        kind=source_kind, depth=1, repair_candidate=True, reason=repair.get("reason"),
+                        kind=str(repair.get("kind") or analysis_kind), depth=1, repair_candidate=True, reason=repair.get("reason"),
                     )
                     if artifact_id:
                         repair_artifact_ids.append(artifact_id)
+                        if not header_recovery_used and analysis_parent_id == source_id and isinstance(repair.get("data"), (bytes, bytearray)):
+                            analysis_data = bytes(repair["data"])
+                            analysis_kind = str(repair.get("kind") or analysis_kind)
+                            analysis_parent_id = artifact_id
+                        if artifact_id and artifact_id not in processed_artifacts and isinstance(repair.get("data"), (bytes, bytearray)):
+                            derived_queue.append((artifact_id, bytes(repair["data"]), str(repair.get("kind") or analysis_kind), 1))
                         add_finding({
                             "severity": "info", "category": "repair", "title": "Derived repair candidate created",
                             "description": "A separate, hashed repair candidate was written; the original evidence was not modified.",
@@ -395,9 +441,22 @@ class AnalysisEngine:
                 "status": structure_status, "applicable": structure_status != "skipped",
                 "started_at": utc_now(), "duration_ms": int((time.monotonic() - structure_start) * 1000),
                 "summary": structure_summary, "tool": {"executable": "Python stdlib", "resolved": None, "version": None},
-                "details": normalize_json({"detected_type": source_kind, "properties": format_root["properties"] if format_root else {}}),
+                "details": normalize_json({"detected_type": source_kind, "analyzed_type": analysis_kind, "header_recovery_used": header_recovery_used, "properties": format_root["properties"] if format_root else {}}),
             })
-            pcrt_applicable = source_kind == "png" and format_root is not None
+            methods.append({
+                "id": "header-recovery", "name": "Internal signature and header recovery", "category": "repair",
+                "status": "completed" if header_repairs and not read_truncated and analysis_options["structure_analysis"] else "skipped",
+                "applicable": True, "started_at": utc_now() if header_repairs and not read_truncated and analysis_options["structure_analysis"] else None,
+                "duration_ms": 0,
+                "summary": (
+                    f"Proved {len(header_repairs)} copy-only header reconstruction candidate(s) from internal format markers."
+                    if header_repairs and not read_truncated and analysis_options["structure_analysis"]
+                    else "No unambiguous damaged signature/header reconstruction was available."
+                ),
+                "tool": {"executable": "Forenscope built-in", "resolved": "built-in", "version": "1"},
+                "details": {"candidate_count": len(header_repairs), "recovery_used_for_analysis": header_recovery_used},
+            })
+            pcrt_applicable = analysis_kind == "png" and format_root is not None
             pcrt_repairs = len(format_root["repairs"]) if pcrt_applicable else 0
             methods.append({
                 "id": "pcrt", "name": "PCRT-compatible PNG check and repair", "category": "repair",
@@ -487,8 +546,9 @@ class AnalysisEngine:
 
             self._emit(progress_callback, 46, "visual", "Generating safe pixel, channel, bit-plane, frame, OCR, and barcode views")
             check_cancelled(is_cancelled)
+            visual_input: Any = source_path if analysis_data is source_data else io.BytesIO(analysis_data)
             visual_result = analyze_visual(
-                source_path,
+                visual_input,
                 profile=profile,
                 max_megapixels=limits["visual_megapixels"],
                 enabled=bool(analysis_options["visual_analysis"]),
@@ -499,14 +559,14 @@ class AnalysisEngine:
                 color_remap_variants=int(analysis_options["color_remap_variants"]),
             )
             for item in visual_result.pop("findings", []):
-                add_finding(item, source_id, "pillow-visual")
+                add_finding(item, analysis_parent_id, "pillow-visual")
             metadata.update({f"pillow:{key}": value for key, value in visual_result.get("metadata", {}).items()})
             visual_records = visual_result.pop("text_records", [])
             all_string_seeds.extend(visual_records[: limits["max_strings"]])
             for record in visual_records:
                 method_name = _text_method(record.get("source", "visual"))
                 collector.scan_text(
-                    record.get("text", ""), source_artifact_id=source_id, method=method_name,
+                    record.get("text", ""), source_artifact_id=analysis_parent_id, method=method_name,
                     offset=record.get("offset"), transform_chain=record.get("transform_chain"),
                     confidence_hint=int(record.get("confidence_hint", 0)),
                 )
@@ -514,7 +574,7 @@ class AnalysisEngine:
             visual_submethods = visual_result.pop("submethods", [])
             for order, item in enumerate(raw_visuals):
                 artifact_id, _, reason = store.add_bytes(
-                    item["data"], label=item["label"], parent_id=source_id,
+                    item["data"], label=item["label"], parent_id=analysis_parent_id,
                     producer=item.get("producer", "Pillow"), transformation=item.get("transformation", "visual transform"),
                     kind="png", safe_preview=True, parameters=item.get("parameters"),
                 )
@@ -533,11 +593,11 @@ class AnalysisEngine:
             stego_streams = visual_result.pop("stego_streams", [])
             for stream in stego_streams:
                 hits = collector.scan_bytes(
-                    stream["data"], source_artifact_id=source_id, method="built-in-lsb",
+                    stream["data"], source_artifact_id=analysis_parent_id, method="built-in-lsb",
                     transform_chain=[stream["transformation"]], confidence_hint=5,
                 )
                 artifact_id, _, reason = store.add_bytes(
-                    stream["data"], label=stream["label"], parent_id=source_id,
+                    stream["data"], label=stream["label"], parent_id=analysis_parent_id,
                     producer=stream.get("producer", "built-in-lsb"),
                     transformation=stream["transformation"], kind=stream.get("kind"),
                     parameters=stream.get("parameters"),
@@ -547,7 +607,7 @@ class AnalysisEngine:
                         "severity": "info", "category": "steganography", "title": "Flag-like text in pixel bitstream",
                         "description": "A bounded channel/bit-order extraction produced flag-like text.",
                         "details": {"stream_artifact_id": artifact_id, "transformation": stream["transformation"]},
-                    }, source_id, "built-in-lsb")
+                    }, analysis_parent_id, "built-in-lsb")
                 elif reason:
                     log("warning", f"Skipped bitstream artifact {stream['label']}: {reason}", "built-in-lsb")
             methods.append(_public_method(visual_result))

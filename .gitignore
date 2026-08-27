@@ -27,6 +27,8 @@ backend/data/
 backend/.data/
 backend/reports/
 backend/artifacts/
+outputs/
+.tools/
 *.sqlite
 *.sqlite3
 *.sqlite3-shm

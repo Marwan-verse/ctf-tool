@@ -63,3 +63,14 @@ def test_byte_inspection_is_bounded() -> None:
     assert len(report["strings"]) == 2
     assert report["strings_truncated"] is True
     assert len(report["byte_frequency"]) == 256
+
+
+def test_svg_text_nodes_are_concatenated_for_flag_scanning() -> None:
+    svg = b"<svg xmlns='http://www.w3.org/2000/svg'>" + b"".join(
+        f"<text>{char}</text>".encode("ascii") for char in "flag{svg_nodes}"
+    ) + b"</svg>"
+
+    report = inspect_bytes(svg, max_strings=100)
+
+    joined = [record for record in report["strings"] if record["encoding"] == "svg-text-joined"]
+    assert joined and joined[0]["text"] == "flag{svg_nodes}"

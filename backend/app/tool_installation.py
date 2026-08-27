@@ -7,6 +7,7 @@ request body.
 
 from __future__ import annotations
 
+import base64
 import os
 import subprocess
 import tempfile
@@ -25,6 +26,8 @@ WSL_APT_PACKAGES: dict[str, tuple[str, ...]] = {
     "identify": ("imagemagick",),
     "pngcheck": ("pngcheck",),
     "pngcrush": ("pngcrush",),
+    "pngfix": ("libpng-tools",),
+    "optipng": ("optipng",),
     "jpeginfo": ("jpeginfo",),
     "jpegtran": ("libjpeg-turbo-progs",),
     "djpeg": ("libjpeg-turbo-progs",),
@@ -39,6 +42,9 @@ WSL_APT_PACKAGES: dict[str, tuple[str, ...]] = {
     "webpinfo": ("webp",),
     "webpmux": ("webp",),
     "gifsicle": ("gifsicle",),
+    "gifsicle_repair": ("gifsicle",),
+    "zipfix": ("zip",),
+    "zipfix_deep": ("zip",),
     "tesseract": ("tesseract-ocr",),
     "zbarimg": ("zbar-tools",),
     "ffprobe": ("ffmpeg",),
@@ -206,6 +212,24 @@ def _run_wsl(wsl: Path, arguments: list[str], *, timeout: int) -> dict[str, Any]
     return _run_process([str(wsl), "-u", "root", "--", *arguments], timeout=timeout)
 
 
+def _run_wsl_script(wsl: Path, script: str, *, timeout: int) -> dict[str, Any]:
+    """Run a fixed script without exposing shell metacharacters to wsl.exe.
+
+    WSL's Windows argument bridge can expand dollar-prefixed Make variables in
+    an inline ``sh -lc`` argument.  Base64 transports only a fixed, inert
+    alphabet; decoding happens inside the target shell.  ``script`` is module
+    controlled (never supplied by a request), and the encoded data has no
+    interpolation characters.
+    """
+
+    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    return _run_wsl(
+        wsl,
+        ["sh", "-lc", f"printf %s '{encoded}' | base64 -d | sh"],
+        timeout=timeout,
+    )
+
+
 def _run_winget_install(winget: Path, package_id: str) -> dict[str, Any]:
     return _run_process(
         [
@@ -332,7 +356,7 @@ def install_tools(tool_ids: list[str]) -> dict[str, Any]:
             command_results["jsteg"].append(result)
             channels["jsteg"] = "Kali WSL / Go module"
         if "jpseek" in missing:
-            result = _run_wsl(wsl, ["sh", "-lc", JPSEEK_BUILD_SCRIPT], timeout=900)
+            result = _run_wsl_script(wsl, JPSEEK_BUILD_SCRIPT, timeout=900)
             command_results["jpseek"].append(result)
             channels["jpseek"] = "Kali WSL / pinned source build"
 

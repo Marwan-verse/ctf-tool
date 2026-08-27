@@ -7,7 +7,7 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-from app.hexedit import apply_edits, diagnose_bytes, normalize_edits, write_edited_copy
+from app.hexedit import apply_edits, diagnose_bytes, normalize_edits, read_repair_candidate, write_edited_copy
 from app.main import create_app
 from app.reporting import input_artifact_record
 from app.config import Settings
@@ -57,7 +57,22 @@ def test_integrity_separates_png_crc_errors_from_heuristic_bytes() -> None:
     assert diagnose_bytes(noisy, filename="evidence.png")["verdict"] in {"valid", "warning"}
 
 
-def _make_api_fixture(tmp_path: Path) -> tuple[TestClient, str, str, Path, bytes]:
+def test_integrity_detects_tiff_and_ico_structure() -> None:
+    # Minimal, bounded directory headers are enough to exercise format
+    # detection and the parser-backed Hex integrity contract.
+    tiff = b"II*\x00\x08\x00\x00\x00\x00\x00\x00\x00"
+    ico = b"\x00\x00\x01\x00\x00\x00"
+    tiff_result = diagnose_bytes(tiff, filename="evidence.tiff")
+    ico_result = diagnose_bytes(ico, filename="evidence.ico")
+    assert tiff_result["detected_format"] == "tiff"
+    assert tiff_result["validation_format"] == "tiff"
+    assert tiff_result["verdict"] == "valid"
+    assert ico_result["detected_format"] == "ico"
+    assert ico_result["validation_format"] == "ico"
+    assert ico_result["verdict"] == "valid"
+
+
+def _make_api_fixture(tmp_path: Path, source_bytes: bytes | None = None) -> tuple[TestClient, str, str, Path, bytes]:
     settings = Settings(
         data_dir=tmp_path / "data",
         database_path=tmp_path / "data" / "forenscope.sqlite3",
@@ -75,10 +90,9 @@ def _make_api_fixture(tmp_path: Path) -> tuple[TestClient, str, str, Path, bytes
     source_path = job_dir / "input" / "source.upload"
     (job_dir / "output").mkdir(parents=True, exist_ok=True)
     source_path.parent.mkdir(parents=True, exist_ok=True)
-    # Keep a harmless trailing payload so a byte edit can be rendered by
-    # Pillow while the integrity panel still reports that trailing bytes are
-    # a review warning.
-    original = tiny_png() + b"CTF"
+    # The default fixture keeps a harmless trailing payload so a byte edit can
+    # be rendered by Pillow while the integrity panel reports a review warning.
+    original = source_bytes if source_bytes is not None else tiny_png() + b"CTF"
     source_path.write_bytes(original)
     source_sha = hashlib.sha256(original).hexdigest()
     storage.create_job(
@@ -138,5 +152,47 @@ def test_hex_api_rejects_stale_hash_and_duplicate_offsets(tmp_path: Path) -> Non
         duplicate = {"artifact_id": artifact_id, "base_sha256": hashlib.sha256(original).hexdigest(), "edits": [{"offset": 1, "value": 2}, {"offset": 1, "value": 3}]}
         response = client.post(f"/api/jobs/{job_id}/hex/analyze", json=duplicate)
         assert response.status_code == 422
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_missing_png_end_chunk_exposes_and_saves_copy_only_repair(tmp_path: Path) -> None:
+    damaged = tiny_png()[:-12]
+    client, job_id, artifact_id, source_path, original = _make_api_fixture(tmp_path, damaged)
+    try:
+        view = client.get(f"/api/jobs/{job_id}/hex", params={"artifact_id": artifact_id})
+        assert view.status_code == 200, view.text
+        candidates = view.json()["integrity"]["repair_candidates"]
+        assert candidates
+        candidate = next(item for item in candidates if item["format"] == "png")
+        repaired_data, _ = read_repair_candidate(source_path, candidate["id"], filename="evidence.png", declared_media_type="image/png")
+        assert diagnose_bytes(repaired_data, filename="evidence.png", include_repairs=False)["verdict"] == "valid"
+        saved = client.post(
+            f"/api/jobs/{job_id}/hex/repair",
+            json={"artifact_id": artifact_id, "base_sha256": hashlib.sha256(original).hexdigest(), "candidate_id": candidate["id"]},
+        )
+        assert saved.status_code == 200, saved.text
+        derived = saved.json()["artifact"]
+        assert derived["kind"] == "repair"
+        assert derived["parent_id"] == artifact_id
+        assert source_path.read_bytes() == damaged
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_corrupted_png_header_exposes_recovery_candidate_in_hex_lab(tmp_path: Path) -> None:
+    damaged = bytearray(tiny_png())
+    damaged[:8] = b"\x89PB\x11\r\n\x1a\n"
+    damaged[8:12] = b"\x00\x12\x13\x14"
+    client, job_id, artifact_id, source_path, original = _make_api_fixture(tmp_path, bytes(damaged))
+    try:
+        view = client.get(f"/api/jobs/{job_id}/hex", params={"artifact_id": artifact_id})
+        assert view.status_code == 200, view.text
+        candidates = view.json()["integrity"]["repair_candidates"]
+        candidate = next(item for item in candidates if item["label"] == "png_header_recovered")
+        repaired, details = read_repair_candidate(source_path, candidate["id"], filename="evidence.png", declared_media_type="image/png")
+        assert repaired.startswith(b"\x89PNG\r\n\x1a\n")
+        assert details["format"] == "png"
+        assert source_path.read_bytes() == original
     finally:
         client.__exit__(None, None, None)

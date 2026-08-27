@@ -55,7 +55,7 @@ class AnalysisOptions(BaseModel):
     audio_analysis_seconds: int = Field(default=180, ge=15, le=300)
     audio_spectrogram_fft: Literal[256, 512, 1024, 2048, 4096] = 2048
     audio_channel_mode: Literal["mix", "left", "right", "difference"] = "mix"
-    audio_lsb_bits: int = Field(default=2, ge=1, le=4)
+    audio_lsb_bits: int = Field(default=2, ge=1, le=8)
     max_recursion_depth: int = Field(default=3, ge=1, le=4)
     max_artifacts: int = Field(default=100, ge=25, le=500)
     tool_timeout_seconds: int = Field(default=60, ge=5, le=180)
@@ -237,6 +237,22 @@ class HexEditRequest(BaseModel):
 class HexSaveRequest(HexEditRequest):
     """Save edits as a new derived artifact; the source is never overwritten."""
 
+    name: str | None = Field(default=None, max_length=180)
+
+
+class HexRepairRequest(BaseModel):
+    """Select one deterministic format repair for copy-only artifact creation."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    artifact_id: str | None = Field(
+        default=None,
+        min_length=36,
+        max_length=36,
+        pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
+    )
+    base_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    candidate_id: str = Field(min_length=3, max_length=120, pattern=r"^[a-z0-9][a-z0-9._:-]{2,119}$")
     name: str | None = Field(default=None, max_length=180)
 
 

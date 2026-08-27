@@ -22,8 +22,9 @@ MAX_LIVE_EDIT_BYTES = 32 * 1024 * 1024
 MAX_PREVIEW_PIXELS = 40_000_000
 MAX_PREVIEW_EDGE = 2400
 MAX_STRUCTURE_ITEMS = 100_000
+MAX_REPAIR_CANDIDATES = 8
 
-_IMAGE_KINDS = {"png", "jpeg", "gif", "bmp", "webp"}
+_IMAGE_KINDS = {"png", "jpeg", "gif", "bmp", "webp", "tiff", "ico"}
 _AUDIO_MIME = {
     "wav": "audio/wav",
     "flac": "audio/flac",
@@ -39,6 +40,9 @@ _EXTENSION_KIND = {
     ".gif": "gif",
     ".bmp": "bmp",
     ".webp": "webp",
+    ".tif": "tiff",
+    ".tiff": "tiff",
+    ".ico": "ico",
     ".wav": "wav",
     ".wave": "wav",
     ".zip": "zip",
@@ -53,6 +57,8 @@ _MEDIA_KIND = {
     "audio/x-wav": "wav",
     "application/zip": "zip",
     "application/x-zip-compressed": "zip",
+    "image/tiff": "tiff",
+    "image/x-icon": "ico",
 }
 _SIGNATURES = {
     "png": "89 50 4e 47 0d 0a 1a 0a",
@@ -62,6 +68,8 @@ _SIGNATURES = {
     "webp": "52 49 46 46 … 57 45 42 50",
     "wav": "52 49 46 46 … 57 41 56 45",
     "zip": "50 4b 03 04",
+    "tiff": "49 49 2a 00 or 4d 4d 00 2a",
+    "ico": "00 00 01 00",
 }
 
 
@@ -123,6 +131,10 @@ def detect_magic_kind(data: bytes) -> str | None:
         return "gif"
     if data.startswith(b"BM"):
         return "bmp"
+    if len(data) >= 4 and ((data[:2] == b"II" and data[2:4] in {b"*\x00", b"+\x00"}) or (data[:2] == b"MM" and data[2:4] in {b"\x00*", b"\x00+"})):
+        return "tiff"
+    if data.startswith(b"\x00\x00\x01\x00"):
+        return "ico"
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "webp"
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
@@ -650,6 +662,59 @@ def _validate_zip(data: bytes) -> tuple[list[dict[str, Any]], list[dict[str, str
     return issues, checks, True
 
 
+def _validate_analyzer_format(kind: str, data: bytes) -> tuple[list[dict[str, Any]], list[dict[str, str]], bool]:
+    """Adapt the bounded TIFF/ICO analyzers to the Hex integrity contract."""
+
+    try:
+        from .analyzers.formats import analyze_format
+
+        parsed = analyze_format(kind, data, profile="deep")
+    except Exception as exc:
+        return [
+            _issue(
+                f"{kind}-parser",
+                f"{kind.upper()} parser stopped",
+                "The bounded format parser rejected these bytes before it could complete structural checks.",
+                "warning",
+                details={"error": type(exc).__name__},
+            )
+        ], [_check("format-parser", "failed", f"The {kind.upper()} parser stopped safely.")], False
+
+    issues: list[dict[str, Any]] = []
+    findings = parsed.get("findings") or []
+    for finding in findings[:MAX_STRUCTURE_ITEMS]:
+        if not isinstance(finding, Mapping):
+            continue
+        severity = str(finding.get("severity") or "warning").lower()
+        if severity not in {"error", "warning", "info"}:
+            severity = "warning"
+        details = finding.get("details") if isinstance(finding.get("details"), Mapping) else {}
+        offset = details.get("offset") if isinstance(details.get("offset"), int) else None
+        length_value = details.get("length", details.get("size"))
+        length = length_value if isinstance(length_value, int) and length_value >= 0 else None
+        issues.append(
+            _issue(
+                f"{kind}-{str(finding.get('category') or 'structure')}",
+                str(finding.get("title") or f"{kind.upper()} structure finding"),
+                str(finding.get("description") or "The bounded format parser reported a structural finding."),
+                severity,
+                offset=offset,
+                length=length,
+                details=details,
+            )
+        )
+    parser_error = isinstance(parsed.get("properties"), Mapping) and bool(parsed["properties"].get("parser_error"))
+    has_error = any(item.get("severity") == "error" for item in issues)
+    checks = [
+        _check(
+            "format-parser",
+            "failed" if has_error or parser_error else "passed",
+            f"Checked the bounded {kind.upper()} header and structural pointers.",
+        )
+    ]
+    return issues, checks, not has_error and not parser_error
+
+
 _VALIDATORS = {
     "png": _validate_png,
     "jpeg": _validate_jpeg,
@@ -658,10 +723,127 @@ _VALIDATORS = {
     "webp": _validate_webp,
     "wav": _validate_wav,
     "zip": _validate_zip,
+    "tiff": lambda data: _validate_analyzer_format("tiff", data),
+    "ico": lambda data: _validate_analyzer_format("ico", data),
 }
 
+_REPAIRABLE_KINDS = {"png", "jpeg", "gif", "bmp", "webp", "tiff", "ico"}
 
-def diagnose_bytes(data: bytes, *, filename: str = "", declared_media_type: str = "") -> dict[str, Any]:
+
+def _repair_candidate_id(kind: str, label: str, index: int) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")[:56] or f"candidate-{index + 1}"
+    return f"{kind}-{index + 1}-{slug}"
+
+
+def _collect_repair_candidates(
+    data: bytes,
+    *,
+    filename: str = "",
+    declared_media_type: str = "",
+    validation_kind: str | None = None,
+) -> list[dict[str, Any]]:
+    """Build deterministic, copy-only repair candidates without exposing bytes."""
+
+    detected = detect_magic_kind(data)
+    expected = expected_kind(filename, declared_media_type)
+    parser_kind = validation_kind if validation_kind in _REPAIRABLE_KINDS else detected if detected in _REPAIRABLE_KINDS else expected if expected in _REPAIRABLE_KINDS else None
+    try:
+        # The format analyzers already contain conservative repair logic. Run
+        # them in deep mode so CRC and end-marker candidates are available in
+        # this explicit Hex workflow, while still bounding the input above.
+        from .analyzers.formats import analyze_format, propose_header_repairs
+
+        parsed = analyze_format(parser_kind, data, profile="deep") if parser_kind else {"repairs": []}
+    except Exception:
+        parsed = {"repairs": []}
+    try:
+        header_repairs = propose_header_repairs(data, profile="deep")
+    except Exception:
+        header_repairs = []
+    candidates: list[dict[str, Any]] = []
+    repairs = [*header_repairs, *(parsed.get("repairs") or [])]
+    for index, repair in enumerate(repairs):
+        repaired = repair.get("data") if isinstance(repair, Mapping) else None
+        if not isinstance(repaired, (bytes, bytearray)):
+            continue
+        repaired_bytes = bytes(repaired)
+        if not repaired_bytes or repaired_bytes == data or len(repaired_bytes) > MAX_LIVE_EDIT_BYTES:
+            continue
+        changed_offsets = [position for position, (before, after) in enumerate(zip(data, repaired_bytes)) if before != after][:64]
+        if len(repaired_bytes) > len(data):
+            changed_offsets.append(len(data))
+        candidate_kind = str(repair.get("kind") or parser_kind)
+        candidate_id = _repair_candidate_id(candidate_kind, str(repair.get("label") or "repair"), index)
+        after_integrity = diagnose_bytes(
+            repaired_bytes,
+            filename=filename,
+            declared_media_type=declared_media_type,
+            include_repairs=False,
+        )
+        candidates.append({
+            "id": candidate_id,
+            "label": str(repair.get("label") or candidate_id),
+            "reason": str(repair.get("reason") or "The format parser found a deterministic structural repair."),
+            "transformation": str(repair.get("transformation") or "Create a bounded repair candidate."),
+            "producer": str(repair.get("producer") or f"{candidate_kind}-parser"),
+            "format": candidate_kind,
+            "source_size": len(data),
+            "repaired_size": len(repaired_bytes),
+            "size_delta": len(repaired_bytes) - len(data),
+            "changed_bytes": sum(before != after for before, after in zip(data, repaired_bytes)) + abs(len(repaired_bytes) - len(data)),
+            "changed_offsets": changed_offsets,
+            "after_integrity": after_integrity,
+            "_data": repaired_bytes,
+        })
+        if len(candidates) >= MAX_REPAIR_CANDIDATES:
+            break
+    return candidates
+
+
+def _public_repair_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in candidate.items() if key != "_data"}
+
+
+def read_repair_candidate(
+    path: Path,
+    candidate_id: str,
+    *,
+    filename: str = "",
+    declared_media_type: str = "",
+) -> tuple[bytes, dict[str, Any]]:
+    """Resolve a server-validated candidate again from immutable source bytes."""
+
+    total_size = path.stat().st_size
+    if total_size > MAX_LIVE_EDIT_BYTES:
+        raise LiveEditTooLargeError(
+            f"Repair candidates are limited to {MAX_LIVE_EDIT_BYTES // (1024 * 1024)} MiB for bounded validation."
+        )
+    data = path.read_bytes()
+    candidates = _collect_repair_candidates(data, filename=filename or path.name, declared_media_type=declared_media_type)
+    for candidate in candidates:
+        if candidate["id"] == candidate_id:
+            return bytes(candidate["_data"]), _public_repair_candidate(candidate)
+    raise HexEditError("That repair candidate is no longer available for this artifact. Re-scan its structure first.")
+
+
+def write_repair_copy(destination: Path, data: bytes) -> dict[str, Any]:
+    """Write a bounded repair payload atomically without touching its source."""
+
+    digest = hashlib.sha256(data).hexdigest()
+    with destination.open("xb") as writer:
+        writer.write(data)
+        writer.flush()
+        os.fsync(writer.fileno())
+    return {"sha256": digest, "size_bytes": len(data)}
+
+
+def diagnose_bytes(
+    data: bytes,
+    *,
+    filename: str = "",
+    declared_media_type: str = "",
+    include_repairs: bool = True,
+) -> dict[str, Any]:
     """Return a conservative structural verdict independent of heuristic anomalies."""
 
     detected = detect_magic_kind(data)
@@ -699,6 +881,12 @@ def diagnose_bytes(data: bytes, *, filename: str = "", declared_media_type: str 
     else:
         verdict = "unknown"
         summary = "This format is not fully supported by the structural validator; no corruption verdict is claimed."
+    repairs = _collect_repair_candidates(
+        data,
+        filename=filename,
+        declared_media_type=declared_media_type,
+        validation_kind=validation_kind,
+    ) if include_repairs else []
     return {
         "verdict": verdict,
         "expected_format": expected,
@@ -708,6 +896,7 @@ def diagnose_bytes(data: bytes, *, filename: str = "", declared_media_type: str 
         "summary": summary,
         "issues": issues[:200],
         "checks": checks[:100],
+        "repair_candidates": [_public_repair_candidate(candidate) for candidate in repairs],
     }
 
 
@@ -726,6 +915,7 @@ def diagnose_file(path: Path, *, filename: str = "", declared_media_type: str = 
             "summary": f"Full structural validation is limited to {MAX_LIVE_EDIT_BYTES // (1024 * 1024)} MiB for responsive live editing.",
             "issues": [_issue("validation-size-limit", "Full integrity check was bounded", "The artifact exceeds the live editor's in-memory validation budget.", "info", offset=0, length=total_size)],
             "checks": [_check("format-parser", "skipped", "Artifact exceeds the live structural-validation budget.")],
+            "repair_candidates": [],
         }
     return diagnose_bytes(path.read_bytes(), filename=filename or path.name, declared_media_type=declared_media_type)
 

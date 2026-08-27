@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,38 @@ def test_unknown_id_never_becomes_a_command(monkeypatch: pytest.MonkeyPatch) -> 
     assert report["status"] == "failed"
     assert report["items"][0]["status"] == "unavailable"
     assert report["items"][0]["channel"] is None
+
+
+def test_pinned_wsl_build_script_is_base64_transport_encoded(monkeypatch: pytest.MonkeyPatch) -> None:
+    wsl = Path("C:/Windows/System32/wsl.exe")
+    captured: list[str] = []
+
+    def fake_wsl(_wsl: Path, arguments: list[str], *, timeout: int) -> dict[str, object]:
+        captured.extend(arguments)
+        return {"status": "completed", "return_code": 0, "output": "ok", "duration_ms": 1}
+
+    monkeypatch.setattr(tool_installation, "_run_wsl", fake_wsl)
+    script = "build_dir=$(mktemp -d)\necho $build_dir"
+
+    tool_installation._run_wsl_script(wsl, script, timeout=30)  # noqa: SLF001 - validates shell-boundary encoding
+
+    assert captured[:2] == ["sh", "-lc"]
+    assert "$" not in captured[2]
+    encoded = captured[2].split("'")[1]
+    assert base64.b64decode(encoded).decode("utf-8") == script
+
+
+def test_web_repair_tools_are_backed_by_fixed_wsl_packages() -> None:
+    for tool_id, package in {
+        "pngfix": "libpng-tools",
+        "optipng": "optipng",
+        "gifsicle_repair": "gifsicle",
+        "zipfix": "zip",
+        "zipfix_deep": "zip",
+    }.items():
+        assert tool_id in tool_installation.INSTALLABLE_TOOL_IDS
+        assert tool_installation.WSL_APT_PACKAGES[tool_id] == (package,)
+        assert tool_installation.install_strategy(tool_id) == "Kali WSL package"
 
 
 def test_shared_winget_audio_package_is_installed_once(monkeypatch: pytest.MonkeyPatch) -> None:

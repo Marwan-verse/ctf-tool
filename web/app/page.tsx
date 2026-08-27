@@ -1,10 +1,12 @@
 'use client';
 
-import { type CSSProperties, type ClipboardEvent, type DragEvent, type FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { type CSSProperties, type ClipboardEvent, type DragEvent, type FormEvent, type KeyboardEvent, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 
 type Profile = 'quick' | 'balanced' | 'deep';
 type EvidenceSection = 'image' | 'audio' | 'corrupted';
 type Screen = 'setup' | 'running' | 'results';
+type ColorTheme = 'light' | 'dark';
+type UiPreferences = { theme: ColorTheme; zoom: number };
 type ResultTab = 'overview' | 'repairs' | 'audio' | 'candidates' | 'artifacts' | 'visual' | 'metadata' | 'hex' | 'tools' | 'methods';
 type MethodFilter = 'all' | 'completed' | 'missing' | 'skipped' | 'failed';
 type BooleanOptionKey = 'structure_analysis' | 'visual_analysis' | 'lsb_analysis' | 'ocr' | 'barcodes' | 'recursive_extraction' | 'decoders' | 'crypto_analysis' | 'repairs' | 'external_tools' | 'external_extraction' | 'audio_spectrogram' | 'audio_signal_decoders' | 'audio_sstv' | 'audio_channel_exports' | 'audio_audacity_bundle';
@@ -119,7 +121,8 @@ type HexRow = { offset: number; hex: string; ascii: string; bytes?: number[]; le
 type HexMatch = { offset: number; length: number };
 type HexAnomaly = { kind: string; title: string; description: string; offset: number; length: number; severity?: string; details?: Record<string, unknown> };
 type HexIntegrityIssue = { kind: string; title: string; description: string; severity: 'error' | 'warning' | 'info'; offset?: number; length?: number; expected?: string; actual?: string; details?: Record<string, unknown> };
-type HexIntegrity = { verdict: 'valid' | 'warning' | 'corrupt' | 'unknown'; expected_format?: string | null; detected_format?: string | null; validation_format?: string | null; validation_complete?: boolean; summary: string; issues: HexIntegrityIssue[]; checks?: Array<{ id: string; status: string; summary: string }> };
+type HexRepairCandidate = { id: string; label: string; reason: string; transformation: string; producer?: string; format?: string; source_size: number; repaired_size: number; size_delta: number; changed_bytes: number; changed_offsets: number[]; after_integrity?: HexIntegrity };
+type HexIntegrity = { verdict: 'valid' | 'warning' | 'corrupt' | 'unknown'; expected_format?: string | null; detected_format?: string | null; validation_format?: string | null; validation_complete?: boolean; summary: string; issues: HexIntegrityIssue[]; checks?: Array<{ id: string; status: string; summary: string }>; repair_candidates?: HexRepairCandidate[] };
 type HexView = {
   artifact?: Artifact;
   offset: number;
@@ -135,6 +138,7 @@ type HexView = {
 type HexEdit = { offset: number; original: number; value: number };
 type HexEditActionItem = { offset: number; original: number; before: number; after: number };
 type HexEditAction = HexEditActionItem[];
+type HexContextMenu = { x: number; y: number; offset: number; original: number; value: number; blockStart: number; blockLength: number };
 type HexEditPreview = {
   revision: number;
   edited_size: number;
@@ -145,6 +149,17 @@ type HexEditPreview = {
   integrity: HexIntegrity;
   preview: { kind: 'image' | 'audio' | 'none'; available?: boolean; media_type?: string; url?: string; message?: string };
 };
+type HexFormatReference = { format: string; extensions: string; header: string; trailer: string; structure: string; notes: string };
+const HEX_FORMAT_REFERENCE: HexFormatReference[] = [
+  { format: 'PNG', extensions: '.png', header: '89 50 4E 47 0D 0A 1A 0A', trailer: '49 45 4E 44 AE 42 60 82', structure: '4-byte length + 4-byte type + data + CRC-32', notes: 'IEND is the terminal chunk; data after it may be an embedded payload.' },
+  { format: 'JPEG', extensions: '.jpg · .jpeg', header: 'FF D8 FF', trailer: 'FF D9', structure: 'FF marker + big-endian 2-byte segment length', notes: 'Scan data uses byte stuffing; EOI can be missing after a truncated transfer.' },
+  { format: 'GIF', extensions: '.gif', header: 'GIF87a / GIF89a', trailer: '3B', structure: 'Blocks: 2C image, 21 extension, 3B trailer', notes: 'Image and extension payloads use length-prefixed sub-blocks.' },
+  { format: 'BMP', extensions: '.bmp', header: '42 4D (BM)', trailer: 'No fixed marker', structure: '14-byte file header + DIB header + pixel offset', notes: 'bfSize and pixel offset are little-endian integrity anchors; 32-bit word lanes are checked for interleaved payloads.' },
+  { format: 'WebP', extensions: '.webp', header: '52 49 46 46 ?? ?? ?? ?? 57 45 42 50', trailer: 'RIFF declared size', structure: '4CC chunk + little-endian 4-byte size + payload', notes: 'VP8, VP8L, or VP8X must appear inside the RIFF form.' },
+  { format: 'TIFF', extensions: '.tif · .tiff', header: '49 49 2A 00 / 4D 4D 00 2A', trailer: 'No fixed marker', structure: 'IFD offset chain; byte order is declared in the header', notes: 'Missing IFD offsets are structural damage; there is no universal end signature.' },
+  { format: 'ICO', extensions: '.ico', header: '00 00 01 00', trailer: 'No fixed marker', structure: 'Directory entries + embedded PNG/DIB image blobs', notes: 'Use embedded image signatures and directory offsets to locate payloads.' },
+  { format: 'WAV', extensions: '.wav', header: '52 49 46 46 ?? ?? ?? ?? 57 41 56 45', trailer: 'RIFF declared size', structure: 'fmt/data RIFF chunks with little-endian sizes', notes: 'fmt and data chunks plus block alignment must agree for playback.' },
+];
 
 type Finding = {
   id?: string;
@@ -242,7 +257,7 @@ type Job = {
   [key: string]: unknown;
 };
 
-type Capability = { id?: string; name?: string; executable?: string; available?: boolean; resolved?: string | null; source?: string | null; version?: string; category?: string; profiles?: string[]; formats?: string[]; install_hint?: string; installable?: boolean; install_strategy?: string | null };
+type Capability = { id?: string; name?: string; executable?: string; available?: boolean; resolved?: string | null; source?: string | null; source_url?: string | null; version?: string; category?: string; profiles?: string[]; formats?: string[]; install_hint?: string; installable?: boolean; install_strategy?: string | null };
 type ToolInstallReport = { status?: string; installed_count?: number; already_available_count?: number; available_count?: number; requested_count?: number; unresolved_count?: number; managers?: string[]; message?: string; items?: Array<{ id?: string; status?: string; message?: string; channel?: string | null; source?: string | null; resolved?: string | null; diagnostic?: string | null }> };
 type ActivityItem = { at: string; message: string; stage?: string };
 type MetadataRow = { path: string; value: string };
@@ -251,7 +266,30 @@ const API_BASE = (
   process.env.NEXT_PUBLIC_API_URL
   || (typeof window !== 'undefined' ? `${window.location.protocol}//${window.location.hostname}:8000` : 'http://localhost:8000')
 ).replace(/\/$/, '');
+const UI_PREFERENCES_KEY = 'forenscope.ui-preferences.v1';
+const DEFAULT_UI_PREFERENCES: UiPreferences = { theme: 'light', zoom: 100 };
+const UI_ZOOM_MIN = 100;
+const UI_ZOOM_MAX = 160;
 const TERMINAL = new Set(['completed', 'succeeded', 'partial', 'failed', 'cancelled', 'expired']);
+
+function normalizeInterfaceZoom(value: unknown) {
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric)) return DEFAULT_UI_PREFERENCES.zoom;
+  return Math.max(UI_ZOOM_MIN, Math.min(UI_ZOOM_MAX, Math.round(numeric / 5) * 5));
+}
+
+function readUiPreferences(): UiPreferences {
+  if (typeof window === 'undefined') return DEFAULT_UI_PREFERENCES;
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(UI_PREFERENCES_KEY) || '{}') as Partial<UiPreferences>;
+    return {
+      theme: parsed.theme === 'dark' ? 'dark' : 'light',
+      zoom: normalizeInterfaceZoom(parsed.zoom),
+    };
+  } catch {
+    return DEFAULT_UI_PREFERENCES;
+  }
+}
 const profileOptionDefaults: Record<Profile, ScanOptions> = {
   quick: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, evidence_type: 'auto', audio_spectrogram: true, audio_signal_decoders: true, audio_sstv: true, audio_sstv_mode: 'auto', audio_sstv_max_images: 1, audio_sstv_slant_correction: true, audio_channel_exports: true, audio_audacity_bundle: true, audio_analysis_seconds: 60, audio_spectrogram_fft: 1024, audio_channel_mode: 'mix', audio_lsb_bits: 1, max_recursion_depth: 2, max_artifacts: 45, tool_timeout_seconds: 20, external_output_kib: 512, max_external_files: 16, foremost_depth: 1, color_remap_variants: 4, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
   balanced: { structure_analysis: true, visual_analysis: true, lsb_analysis: true, ocr: true, barcodes: true, recursive_extraction: true, decoders: true, crypto_analysis: true, repairs: true, external_tools: true, external_extraction: true, evidence_type: 'auto', audio_spectrogram: true, audio_signal_decoders: true, audio_sstv: true, audio_sstv_mode: 'auto', audio_sstv_max_images: 2, audio_sstv_slant_correction: true, audio_channel_exports: true, audio_audacity_bundle: true, audio_analysis_seconds: 180, audio_spectrogram_fft: 2048, audio_channel_mode: 'mix', audio_lsb_bits: 2, max_recursion_depth: 3, max_artifacts: 100, tool_timeout_seconds: 60, external_output_kib: 1024, max_external_files: 32, foremost_depth: 2, color_remap_variants: 8, zsteg_mode: 'all', ocr_language: 'eng', selected_external_tools: null },
@@ -334,7 +372,7 @@ const SECTION_COPY: Record<EvidenceSection, {
     dropTitle: 'Drop an image here', formatCopy: 'PNG, JPEG, GIF, BMP, WebP, TIFF or ICO',
     accept: '.png,.apng,.jpg,.jpeg,.gif,.bmp,.webp,.tif,.tiff,.ico,application/octet-stream',
     analyzeLabel: 'Analyze image', selectedNote: 'Preview waits for the sandboxed safe renderer',
-    passwordHint: 'Steghide, Stegseek and OutGuess use it for bounded extraction; encrypted payload checks support OpenSSL salted AES and passphrase-based XOR.',
+    passwordHint: 'Steghide automatically tries an empty passphrase when this is omitted; Stegseek and OutGuess use a supplied value for bounded extraction. Encrypted payload checks support OpenSSL salted AES and passphrase-based XOR.',
     resultEyebrow: 'Investigation complete', fallbackName: 'Image scan', settingsLabel: 'Image', toolLabel: 'Image',
     installNote: 'Availability is refreshed automatically when installation finishes.',
   },
@@ -343,7 +381,7 @@ const SECTION_COPY: Record<EvidenceSection, {
     dropTitle: 'Drop an audio file here', formatCopy: 'WAV, MP3, FLAC, Ogg/Opus, M4A, AIFF, AU, WMA, AMR, CAF or MIDI',
     accept: '.wav,.wave,.mp3,.flac,.ogg,.oga,.opus,.m4a,.aac,.aif,.aiff,.aifc,.au,.snd,.wma,.amr,.caf,.mid,.midi,audio/*,application/octet-stream',
     analyzeLabel: 'Analyze audio', selectedNote: 'Playback uses only content-verified local audio',
-    passwordHint: 'Steghide can inspect WAV/AU payloads; extracted PCM bits and carved data also enter bounded encrypted-payload recovery.',
+    passwordHint: 'Steghide automatically tries an empty passphrase for WAV/AU payloads; extracted PCM bits and carved data also enter bounded encrypted-payload recovery.',
     resultEyebrow: 'Audio investigation complete', fallbackName: 'Audio scan', settingsLabel: 'Audio', toolLabel: 'Audio',
     installNote: 'Audio coverage includes FFmpeg/FFprobe, SoX, MediaInfo, minimodem and multimon-ng.',
   },
@@ -504,20 +542,28 @@ function HexByteCell({
   offset,
   value,
   original,
+  highlighted,
   onChange,
   onBlur,
   onPaste,
+  onContextMenu,
+  onMouseEnter,
+  onMouseLeave,
 }: {
   offset: number;
   value: string;
   original: number;
+  highlighted?: boolean;
   onChange: (value: string) => void;
   onBlur: (value: string) => void;
   onPaste: (event: ClipboardEvent<HTMLInputElement>) => void;
+  onContextMenu: (event: ReactMouseEvent<HTMLInputElement>) => void;
+  onMouseEnter: () => void;
+  onMouseLeave: () => void;
 }) {
   const changed = value.length === 2 && Number.parseInt(value, 16) !== original;
   return <input
-    className={`hex-byte-cell${changed ? ' changed' : ''}`}
+    className={`hex-byte-cell${changed ? ' changed' : ''}${highlighted ? ' hovered' : ''}`}
     value={value}
     inputMode="text"
     maxLength={2}
@@ -527,6 +573,9 @@ function HexByteCell({
     onChange={(event) => onChange(event.target.value)}
     onBlur={(event) => onBlur(event.target.value)}
     onPaste={onPaste}
+    onContextMenu={onContextMenu}
+    onMouseEnter={onMouseEnter}
+    onMouseLeave={onMouseLeave}
   />;
 }
 function confidenceBand(candidate: Candidate) {
@@ -632,6 +681,7 @@ async function readJson<T = unknown>(response: Response): Promise<T> {
 
 function HomeWorkbench() {
   const fileInput = useRef<HTMLInputElement>(null);
+  const [uiPreferences, setUiPreferences] = useState<UiPreferences>(readUiPreferences);
   const [evidenceSection, setEvidenceSection] = useState<EvidenceSection>('image');
   const [screen, setScreen] = useState<Screen>('setup');
   const [profile, setProfile] = useState<Profile>('balanced');
@@ -682,10 +732,23 @@ function HomeWorkbench() {
   const [hexPreviewUrl, setHexPreviewUrl] = useState('');
   const [hexPreviewBusy, setHexPreviewBusy] = useState(false);
   const [hexSaveBusy, setHexSaveBusy] = useState(false);
+  const [hexRepairBusy, setHexRepairBusy] = useState(false);
   const [hexDerivedName, setHexDerivedName] = useState('');
+  const [hexHoverOffset, setHexHoverOffset] = useState<number | null>(null);
+  const [hexContextMenu, setHexContextMenu] = useState<HexContextMenu | null>(null);
   const hexRequestRef = useRef(0);
   const hexPreviewRequestRef = useRef(0);
   const hexPreviewUrlRef = useRef('');
+
+  useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.theme = uiPreferences.theme;
+    root.style.setProperty('color-scheme', uiPreferences.theme);
+    root.style.setProperty('zoom', String(uiPreferences.zoom / 100));
+    try {
+      window.localStorage.setItem(UI_PREFERENCES_KEY, JSON.stringify(uiPreferences));
+    } catch { /* private browsing or storage policy can disable persistence */ }
+  }, [uiPreferences]);
 
   const refreshRecent = useCallback(async () => {
     try {
@@ -731,6 +794,28 @@ function HomeWorkbench() {
       window.removeEventListener('keydown', onKeyDown);
     };
   }, [fullscreenVisual]);
+
+  useEffect(() => {
+    if (!hexContextMenu) return;
+    const closeMenu = (event: Event) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest('[data-hex-context-menu]')) return;
+      setHexContextMenu(null);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setHexContextMenu(null);
+    };
+    window.addEventListener('pointerdown', closeMenu);
+    window.addEventListener('resize', closeMenu);
+    window.addEventListener('scroll', closeMenu, true);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('pointerdown', closeMenu);
+      window.removeEventListener('resize', closeMenu);
+      window.removeEventListener('scroll', closeMenu, true);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [hexContextMenu]);
 
   useEffect(() => () => {
     if (hexPreviewUrlRef.current.startsWith('blob:')) URL.revokeObjectURL(hexPreviewUrlRef.current);
@@ -803,6 +888,7 @@ function HomeWorkbench() {
   const activeHexArtifact = useMemo(() => hexArtifactChoices.find((artifact) => artifactId(artifact) === effectiveHexArtifactId) || null, [effectiveHexArtifactId, hexArtifactChoices]);
   const baselineHexPreviewUrl = activeHexArtifact ? (artifactPreviewUrl(activeHexArtifact) || artifactAudioUrl(activeHexArtifact)) : '';
   const activeHexIntegrity = hexEditPreview?.integrity || hexView?.integrity;
+  const hexRepairCandidates = activeHexIntegrity?.repair_candidates || [];
   const displayHexPreviewUrl = hexEdits.size ? hexPreviewUrl : baselineHexPreviewUrl;
   const replaceHexPreviewUrl = useCallback((next: string) => {
     const previous = hexPreviewUrlRef.current;
@@ -937,6 +1023,7 @@ function HomeWorkbench() {
     if (formats.includes('all')) return true;
     return formats.some((format) => (evidenceSection === 'audio' ? audioKinds : imageKinds).has(format.toLowerCase()));
   });
+  const webRepairCapabilities = relevantCapabilities.filter((capability) => capability.category === 'repair' && capability.source_url);
   const availableTools = relevantCapabilities.filter((capability) => capability.available === true).length;
   const armedMethodCount = 1 + currentConfigurableMethods.filter((method) => scanOptions[method.key]).length + availableTools;
   const activeResultTabs = resultTabs.filter((tab) => {
@@ -1013,6 +1100,82 @@ function HomeWorkbench() {
       else next.set(item.offset, { offset: item.offset, original: item.original, value });
     }
     return next;
+  }
+
+  function applyHexAction(action: HexEditAction) {
+    if (!action.length) return false;
+    setHexEdits((current) => applyHexActionToMap(current, action, 'redo'));
+    setHexUndo((current) => [...current, action]);
+    setHexRedo([]);
+    setHexDraftBytes({});
+    setHexError('');
+    return true;
+  }
+
+  function openHexContextMenu(event: ReactMouseEvent<HTMLInputElement>, offset: number) {
+    event.preventDefault();
+    event.stopPropagation();
+    const row = hexView?.rows.find((candidate) => offset >= candidate.offset && offset < candidate.offset + candidate.length);
+    const original = originalHexByteAt(offset);
+    if (!row || original === undefined) return;
+    const current = hexEdits.get(offset)?.value ?? original;
+    const menuWidth = 248;
+    const menuHeight = 238;
+    setHexHoverOffset(offset);
+    setHexContextMenu({
+      x: Math.max(8, Math.min(event.clientX, Math.max(8, window.innerWidth - menuWidth - 8))),
+      y: Math.max(8, Math.min(event.clientY, Math.max(8, window.innerHeight - menuHeight - 8))),
+      offset,
+      original,
+      value: current,
+      blockStart: row.offset,
+      blockLength: row.length,
+    });
+  }
+
+  function restoreHexByte(offset: number) {
+    const existing = hexEdits.get(offset);
+    if (!existing) {
+      setHexContextMenu(null);
+      return;
+    }
+    applyHexAction([{ offset, original: existing.original, before: existing.value, after: existing.original }]);
+    setHexContextMenu(null);
+  }
+
+  function deleteHexUnit(offset: number) {
+    const original = originalHexByteAt(offset);
+    if (original === undefined) {
+      setHexError('The byte is no longer visible. Scroll it into view and try again.');
+      setHexContextMenu(null);
+      return;
+    }
+    const before = hexEdits.get(offset)?.value ?? original;
+    if (before === 0) {
+      setHexError('This byte is already 00.');
+      setHexContextMenu(null);
+      return;
+    }
+    applyHexAction([{ offset, original, before, after: 0 }]);
+    setHexContextMenu(null);
+  }
+
+  function deleteHexBlock(blockStart: number, blockLength: number) {
+    const row = hexView?.rows.find((candidate) => candidate.offset === blockStart);
+    if (!row) {
+      setHexError('The byte block is no longer visible. Scroll it into view and try again.');
+      setHexContextMenu(null);
+      return;
+    }
+    const action: HexEditAction = [];
+    for (const [index, original] of hexRowBytes(row).entries()) {
+      if (index >= blockLength) break;
+      const offset = blockStart + index;
+      const before = hexEdits.get(offset)?.value ?? original;
+      if (before !== 0) action.push({ offset, original, before, after: 0 });
+    }
+    if (!applyHexAction(action)) setHexError('This block is already filled with 00 bytes.');
+    setHexContextMenu(null);
   }
 
   function commitHexByte(offset: number, nextValue: number) {
@@ -1105,6 +1268,8 @@ function HomeWorkbench() {
     setHexUndo([]);
     setHexRedo([]);
     setHexDraftBytes({});
+    setHexHoverOffset(null);
+    setHexContextMenu(null);
     clearHexPreview();
     setHexError('');
   }
@@ -1150,6 +1315,37 @@ function HomeWorkbench() {
       setHexError(caught instanceof Error ? caught.message : 'The edited artifact could not be saved.');
     } finally {
       setHexSaveBusy(false);
+    }
+  }
+
+  async function saveHexRepair(candidate: HexRepairCandidate) {
+    if (!activeJobId || !activeHexArtifact || hexRepairBusy) return;
+    if (hexEdits.size) {
+      setHexError('Save or discard the unsaved byte edits before creating a source repair candidate.');
+      return;
+    }
+    setHexRepairBusy(true);
+    setHexError('');
+    try {
+      const response = await fetch(`${API_BASE}/api/jobs/${activeJobId}/hex/repair`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          artifact_id: artifactId(activeHexArtifact),
+          base_sha256: String(activeHexArtifact.sha256 || '').toLowerCase(),
+          candidate_id: candidate.id,
+        }),
+      });
+      const saved = await readJson<{ artifact?: Artifact }>(response);
+      const derived = saved.artifact;
+      if (!derived) throw new Error('The server did not return the repair artifact.');
+      setHexArtifactId(artifactId(derived));
+      setHexView(null);
+      await refreshJob(activeJobId);
+    } catch (caught) {
+      setHexError(caught instanceof Error ? caught.message : 'The repair candidate could not be saved.');
+    } finally {
+      setHexRepairBusy(false);
     }
   }
 
@@ -1344,7 +1540,7 @@ function HomeWorkbench() {
   const hexPreviewKind: 'image' | 'audio' | 'none' = hexEditPreview?.preview.kind || (activeHexArtifact && artifactPreviewUrl(activeHexArtifact) ? 'image' : activeHexArtifact && artifactAudioUrl(activeHexArtifact) ? 'audio' : 'none');
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell theme-${uiPreferences.theme}`} data-interface-zoom={uiPreferences.zoom}>
       <aside className="sidebar">
         <button className="brand brand-button" onClick={resetScan} aria-label="Return to new scan">
           <span className="brand-mark" aria-hidden="true">F</span>
@@ -1803,7 +1999,7 @@ function HomeWorkbench() {
                   <div className="hex-toolbar">
                     <label><span>Artifact</span><select value={effectiveHexArtifactId} onChange={(event) => selectHexArtifact(event.target.value)} disabled={!hexArtifactChoices.length}><option value="">Choose an artifact…</option>{hexArtifactChoices.map((artifact) => <option key={artifactId(artifact)} value={artifactId(artifact)}>{artifactName(artifact)} · {formatBytes(artifactSize(artifact))}</option>)}</select></label>
                     <form onSubmit={submitHexSearch} className="hex-search-form"><label><span>Search</span><input value={hexSearchInput} onChange={(event) => setHexSearchInput(event.target.value.slice(0, 256))} placeholder={hexSearchMode === 'hex' ? '89 50 4e 47 or PK:03:04' : 'flag{…} or readable text'} disabled={!effectiveHexArtifactId} /></label><select aria-label="Hex search mode" value={hexSearchMode} onChange={(event) => setHexSearchMode(event.target.value as 'text' | 'hex')} disabled={!effectiveHexArtifactId}><option value="text">Text</option><option value="hex">Hex bytes</option></select><button type="submit" disabled={!effectiveHexArtifactId || hexLoading}>Search</button></form>
-                    <div className="hex-offset-control"><label><span>Offset</span><input value={hexOffsetInput} onChange={(event) => setHexOffsetInput(event.target.value.slice(0, 24))} onKeyDown={(event) => { if (event.key === 'Enter') goToHexOffset(); }} disabled={!effectiveHexArtifactId} /></label><button onClick={goToHexOffset} disabled={!effectiveHexArtifactId}>Go</button><button onClick={() => jumpToHexOffset(Math.max(0, hexOffset - 8192))} disabled={!hexView || hexOffset <= 0} aria-label="Previous hex page">←</button><button onClick={() => jumpToHexOffset(hexOffset + 8192)} disabled={!hexView || hexOffset + hexView.length >= hexView.total_size} aria-label="Next hex page">→</button></div>
+                    <div className="hex-offset-control"><label><span>Offset</span><input value={hexOffsetInput} onChange={(event) => setHexOffsetInput(event.target.value.slice(0, 24))} onKeyDown={(event) => { if (event.key === 'Enter') goToHexOffset(); }} disabled={!effectiveHexArtifactId} /></label><button onClick={goToHexOffset} disabled={!effectiveHexArtifactId}>Go</button><button onClick={() => jumpToHexOffset(Math.max(0, hexOffset - 8192))} disabled={!hexView || hexOffset <= 0} aria-label="Previous hex page">←</button><button onClick={() => jumpToHexOffset(hexOffset + 8192)} disabled={!hexView || hexOffset + hexView.length >= hexView.total_size} aria-label="Next hex page">→</button></div><button className="hex-structure-scan-button" onClick={() => void loadHexView(effectiveHexArtifactId, hexOffset, hexSearch, hexSearchMode)} disabled={!effectiveHexArtifactId || hexLoading || Boolean(hexEdits.size)} title={hexEdits.size ? 'Discard the draft before scanning the source artifact.' : 'Re-run format and corruption checks'}>Scan corruption</button>
                   </div>
                   <div className="hex-edit-toolbar">
                     <div className="hex-edit-status" aria-live="polite"><span className={hexEdits.size ? 'draft-dot active' : 'draft-dot'} aria-hidden="true" />{hexEdits.size ? `${hexEdits.size} unsaved byte edit${hexEdits.size === 1 ? '' : 's'}` : 'No unsaved edits'}{hexPreviewBusy ? <small> · updating live checks…</small> : null}</div>
@@ -1820,9 +2016,63 @@ function HomeWorkbench() {
                     <div className="hex-live-preview" aria-live="polite"><div className="hex-live-heading"><div><p className="eyebrow">Live result</p><h3>{hexEdits.size ? 'Edited bytes preview' : 'Original artifact preview'}</h3></div><span className={hexPreviewBusy ? 'preview-state busy' : displayHexPreviewUrl ? 'preview-state ready' : 'preview-state'}>{hexPreviewBusy ? 'Checking…' : displayHexPreviewUrl ? 'Live' : 'No browser preview'}</span></div>{displayHexPreviewUrl && hexPreviewKind === 'image' ? <SafePreviewImage src={displayHexPreviewUrl} alt={hexEdits.size ? 'Live preview of edited bytes' : 'Preview of selected artifact'} className="hex-live-image" /> : null}{displayHexPreviewUrl && hexPreviewKind === 'audio' ? <audio className="hex-live-audio" controls preload="metadata" src={displayHexPreviewUrl} /> : null}{!displayHexPreviewUrl ? <p className="hex-muted">{hexEditPreview?.preview.message || 'Select a supported image or audio artifact to see a browser preview. Structural checks still update for every edited file.'}</p> : null}{hexEdits.size && hexEditPreview?.sha256 ? <small className="hex-live-hash">Edited SHA-256 · <code>{hexEditPreview.sha256}</code></small> : null}</div>
                     <div className="hex-stat-row"><div><strong>{formatHexOffset(hexView.offset)}</strong><small>window start</small></div><div><strong>{formatBytes(hexView.length)}</strong><small>bytes shown</small></div><div><strong>{hexView.search?.match_count || 0}</strong><small>base search matches</small></div><div><strong>{hexEdits.size}</strong><small>unsaved byte edits</small></div></div>
                     <div className="hex-layout">
-                      <div className="hex-table" role="grid" aria-label="Editable hex byte window" onKeyDown={handleHexEditorKeyDown}><div className="hex-table-head" role="row"><span>Offset</span><span>Hex bytes · click a cell to edit</span><span>ASCII</span></div>{hexView.rows.map((row) => { const baseBytes = hexRowBytes(row); const displayedBytes = baseBytes.map((byte, index) => hexEdits.get(row.offset + index)?.value ?? byte); const ascii = displayedBytes.map((byte) => byte >= 32 && byte <= 126 ? String.fromCharCode(byte) : '.').join(''); const matched = hexView.matches.some((match) => match.offset < row.offset + row.length && match.offset + match.length > row.offset); return <div className={`hex-row ${matched ? 'matched' : ''}`} role="row" key={row.offset}><span className="hex-row-offset">{formatHexOffset(row.offset)}</span><div className="hex-byte-grid" role="gridcell">{baseBytes.map((original, index) => { const offset = row.offset + index; const edited = hexEdits.get(offset); const draft = hexDraftBytes[offset]; return <HexByteCell key={offset} offset={offset} original={original} value={draft ?? formatHexByte(edited?.value ?? original)} onChange={(value) => handleHexByteDraft(offset, value)} onBlur={(value) => finishHexByteDraft(offset, value)} onPaste={(event) => { event.preventDefault(); pasteHexBytes(offset, event.clipboardData.getData('text')); }} />; })}</div><code className="hex-row-ascii">{ascii}</code></div>; })}{!hexView.rows.length && <div className="hex-empty">The selected offset is at end-of-file.</div>}</div>
-                      <aside className="hex-findings">{activeHexIntegrity && <section className="hex-integrity-card"><div className="hex-subheading"><div><p className="eyebrow">Format-aware review{hexEdits.size ? ' · edited draft' : ' · source'}</p><h3>Structure health</h3></div><em className={`integrity-badge ${activeHexIntegrity.verdict}`}>{integrityLabel(activeHexIntegrity.verdict)}</em></div><p className="hex-integrity-summary">{activeHexIntegrity.summary}</p><small className="hex-integrity-format">Expected {activeHexIntegrity.expected_format || 'unknown'} · detected {activeHexIntegrity.detected_format || 'unknown'}{activeHexIntegrity.validation_complete === false ? ' · bounded check' : ''}</small>{activeHexIntegrity.issues?.length ? <div className="hex-integrity-list">{activeHexIntegrity.issues.map((issue, index) => <button key={`${issue.kind}-${issue.offset ?? index}`} onClick={() => issue.offset !== undefined && jumpToHexOffset(Math.max(0, issue.offset - 64))}><div><strong>{issue.title}</strong><em className={issue.severity}>{issue.severity}</em></div>{issue.offset !== undefined ? <small>{formatHexOffset(issue.offset)}{issue.length ? ` · ${formatBytes(issue.length)}` : ''}</small> : null}<p>{issue.description}</p></button>)}</div> : <p className="hex-muted">No confirmed structural errors or warnings were found. Heuristic signals are listed separately.</p>}</section>}<section><div className="hex-subheading"><div><p className="eyebrow">Pattern search</p><h3>Matches</h3></div><span>{hexView.matches.length}</span></div>{hexView.matches.length ? <div className="hex-match-list">{hexView.matches.map((match) => <button key={match.offset} onClick={() => jumpToHexOffset(Math.max(0, match.offset - 64))}><strong>{formatHexOffset(match.offset)}</strong><small>{match.length} byte{match.length === 1 ? '' : 's'} · jump here</small></button>)}</div> : <p className="hex-muted">{hexSearch ? 'No matches found in the base artifact. Save edits as a derived artifact to search its complete bytes.' : 'Enter text or hex bytes above to search.'}</p>}</section><section><div className="hex-subheading"><div><p className="eyebrow">Heuristic leads</p><h3>Anomalies</h3></div><span>{hexView.anomalies.length}</span></div>{hexView.anomalies.length ? <div className="hex-anomaly-list">{hexView.anomalies.map((anomaly, index) => <button key={`${anomaly.kind}-${anomaly.offset}-${index}`} onClick={() => jumpToHexOffset(Math.max(0, anomaly.offset - 64))}><div><strong>{anomaly.title}</strong><em className={anomaly.severity || 'info'}>{anomaly.severity || 'info'}</em></div><small>{formatHexOffset(anomaly.offset)} · {formatBytes(anomaly.length)}</small><p>{anomaly.description}</p></button>)}</div> : <p className="hex-muted">No heuristic anomalies were detected. These are leads, not corruption verdicts.</p>}</section></aside>
+                      <div className="hex-table" role="grid" aria-label="Editable hex byte window" onKeyDown={handleHexEditorKeyDown}>
+                        <div className="hex-table-head" role="row"><span>Offset</span><span>Hex bytes · click a cell to edit</span><span>ASCII</span></div>
+                        {hexView.rows.map((row) => {
+                          const baseBytes = hexRowBytes(row);
+                          const displayedBytes = baseBytes.map((byte, index) => hexEdits.get(row.offset + index)?.value ?? byte);
+                          const matched = hexView.matches.some((match) => match.offset < row.offset + row.length && match.offset + match.length > row.offset);
+                          return <div className={`hex-row ${matched ? 'matched' : ''}`} role="row" key={row.offset}>
+                            <span className="hex-row-offset">{formatHexOffset(row.offset)}</span>
+                            <div className="hex-byte-grid" role="gridcell">
+                              {baseBytes.map((original, index) => {
+                                const offset = row.offset + index;
+                                const edited = hexEdits.get(offset);
+                                const draft = hexDraftBytes[offset];
+                                return <HexByteCell
+                                  key={offset}
+                                  offset={offset}
+                                  original={original}
+                                  value={draft ?? formatHexByte(edited?.value ?? original)}
+                                  highlighted={hexHoverOffset === offset}
+                                  onChange={(value) => handleHexByteDraft(offset, value)}
+                                  onBlur={(value) => finishHexByteDraft(offset, value)}
+                                  onPaste={(event) => { event.preventDefault(); pasteHexBytes(offset, event.clipboardData.getData('text')); }}
+                                  onContextMenu={(event) => openHexContextMenu(event, offset)}
+                                  onMouseEnter={() => setHexHoverOffset(offset)}
+                                  onMouseLeave={() => setHexHoverOffset((current) => current === offset ? null : current)}
+                                />;
+                              })}
+                            </div>
+                            <code className="hex-row-ascii">
+                              {displayedBytes.map((byte, index) => {
+                                const offset = row.offset + index;
+                                const character = byte >= 32 && byte <= 126 ? String.fromCharCode(byte) : '.';
+                                return <span
+                                  className={`hex-ascii-char${hexHoverOffset === offset ? ' hovered' : ''}`}
+                                  key={offset}
+                                  title={`Byte ${formatHexOffset(offset)} · 0x${formatHexByte(byte)}`}
+                                  aria-label={`ASCII byte at ${formatHexOffset(offset)}: ${character}`}
+                                  onMouseEnter={() => setHexHoverOffset(offset)}
+                                  onMouseLeave={() => setHexHoverOffset((current) => current === offset ? null : current)}
+                                >{character}</span>;
+                              })}
+                            </code>
+                          </div>;
+                        })}
+                        {!hexView.rows.length && <div className="hex-empty">The selected offset is at end-of-file.</div>}
+                      </div>
+                      <aside className="hex-findings"><section className="hex-reference-card"><div className="hex-subheading"><div><p className="eyebrow">Byte signatures</p><h3>Format reference</h3></div><span>{HEX_FORMAT_REFERENCE.length} formats</span></div><div className="hex-reference-table" role="table" aria-label="Image and audio header and trailer reference"><div className="hex-reference-head" role="row"><span>Format</span><span>Header</span><span>Trailer / end</span></div>{HEX_FORMAT_REFERENCE.map((entry) => <article key={entry.format} role="row"><div><strong>{entry.format}</strong><small>{entry.extensions}</small></div><code title={`${entry.format} header`}>{entry.header}</code><code title={`${entry.format} trailer`}>{entry.trailer}</code><p>{entry.structure}. {entry.notes}</p></article>)}</div><p className="hex-reference-note"><code>??</code> means a variable size field; use the format-aware scan below to validate values and boundaries.</p></section>{activeHexIntegrity && <section className="hex-integrity-card"><div className="hex-subheading"><div><p className="eyebrow">Format-aware review{hexEdits.size ? ' · edited draft' : ' · source'}</p><h3>Structure health</h3></div><em className={`integrity-badge ${activeHexIntegrity.verdict}`}>{integrityLabel(activeHexIntegrity.verdict)}</em></div><p className="hex-integrity-summary">{activeHexIntegrity.summary}</p><small className="hex-integrity-format">Expected {activeHexIntegrity.expected_format || 'unknown'} · detected {activeHexIntegrity.detected_format || 'unknown'}{activeHexIntegrity.validation_complete === false ? ' · bounded check' : ''}</small>{activeHexIntegrity.issues?.length ? <div className="hex-integrity-list">{activeHexIntegrity.issues.map((issue, index) => <button key={`${issue.kind}-${issue.offset ?? index}`} onClick={() => issue.offset !== undefined && jumpToHexOffset(Math.max(0, issue.offset - 64))}><div><strong>{issue.title}</strong><em className={issue.severity}>{issue.severity}</em></div>{issue.offset !== undefined ? <small>{formatHexOffset(issue.offset)}{issue.length ? ` · ${formatBytes(issue.length)}` : ''}</small> : null}<p>{issue.description}</p></button>)}</div> : <p className="hex-muted">No confirmed structural errors or warnings were found. Heuristic signals are listed separately.</p>}</section>}<section><div className="hex-subheading"><div><p className="eyebrow">Pattern search</p><h3>Matches</h3></div><span>{hexView.matches.length}</span></div>{hexView.matches.length ? <div className="hex-match-list">{hexView.matches.map((match) => <button key={match.offset} onClick={() => jumpToHexOffset(Math.max(0, match.offset - 64))}><strong>{formatHexOffset(match.offset)}</strong><small>{match.length} byte{match.length === 1 ? '' : 's'} · jump here</small></button>)}</div> : <p className="hex-muted">{hexSearch ? 'No matches found in the base artifact. Save edits as a derived artifact to search its complete bytes.' : 'Enter text or hex bytes above to search.'}</p>}</section><section><div className="hex-subheading"><div><p className="eyebrow">Heuristic leads</p><h3>Anomalies</h3></div><span>{hexView.anomalies.length}</span></div>{hexView.anomalies.length ? <div className="hex-anomaly-list">{hexView.anomalies.map((anomaly, index) => <button key={`${anomaly.kind}-${anomaly.offset}-${index}`} onClick={() => jumpToHexOffset(Math.max(0, anomaly.offset - 64))}><div><strong>{anomaly.title}</strong><em className={anomaly.severity || 'info'}>{anomaly.severity || 'info'}</em></div><small>{formatHexOffset(anomaly.offset)} · {formatBytes(anomaly.length)}</small><p>{anomaly.description}</p></button>)}</div> : <p className="hex-muted">No heuristic anomalies were detected. These are leads, not corruption verdicts.</p>}</section></aside>
+                      {hexContextMenu && <div className="hex-context-menu" data-hex-context-menu role="menu" aria-label={`Hex actions for ${formatHexOffset(hexContextMenu.offset)}`} style={{ left: hexContextMenu.x, top: hexContextMenu.y }} onContextMenu={(event) => event.preventDefault()}>
+                        <div className="hex-context-heading"><strong>Byte {formatHexOffset(hexContextMenu.offset)}</strong><small>original {formatHexByte(hexContextMenu.original)} · current {formatHexByte(hexContextMenu.value)}</small></div>
+                        <button type="button" role="menuitem" onClick={() => { undoHexEdit(); setHexContextMenu(null); }} disabled={!hexUndo.length}><span>Undo last edit</span><kbd>Ctrl/Cmd+Z</kbd></button>
+                        <button type="button" role="menuitem" onClick={() => restoreHexByte(hexContextMenu.offset)} disabled={hexContextMenu.value === hexContextMenu.original}><span>Restore this byte</span><kbd>{formatHexByte(hexContextMenu.original)}</kbd></button>
+                        <button type="button" role="menuitem" className="danger" onClick={() => deleteHexUnit(hexContextMenu.offset)}><span>Delete unit</span><small>zero 1 byte</small></button>
+                        <button type="button" role="menuitem" className="danger" onClick={() => deleteHexBlock(hexContextMenu.blockStart, hexContextMenu.blockLength)}><span>Delete block</span><small>zero {hexContextMenu.blockLength} bytes</small></button>
+                        <p>Draft-only action · file length and source bytes stay unchanged.</p>
+                      </div>}
                     </div>
+                    {activeHexIntegrity && <section className="hex-repair-card"><div className="hex-subheading"><div><p className="eyebrow">Copy-only fixes</p><h3>Repair candidates</h3></div><span>{hexRepairCandidates.length}</span></div><p className="hex-repair-intro">The parser compares the bytes, identifies the format, and proposes only deterministic repairs such as CRC fields or missing end markers. Every repair is saved as a new artifact.</p>{hexRepairCandidates.length ? <div className="hex-repair-list">{hexRepairCandidates.map((candidate) => <article key={candidate.id}><div className="hex-repair-heading"><strong>{candidate.label.replace(/[_-]+/g, ' ')}</strong><em>{(candidate.format || 'format').toUpperCase()}</em></div><p>{candidate.reason}</p><small>{candidate.transformation}</small><div className="hex-repair-meta"><span>{candidate.changed_bytes} byte{candidate.changed_bytes === 1 ? '' : 's'} changed</span><span>{candidate.size_delta >= 0 ? '+' : ''}{candidate.size_delta} bytes</span><span>After: {integrityLabel(candidate.after_integrity?.verdict)}</span></div><button type="button" onClick={() => void saveHexRepair(candidate)} disabled={Boolean(hexEdits.size) || hexRepairBusy || !activeHexArtifact}>{hexRepairBusy ? 'Saving…' : hexEdits.size ? 'Discard draft first' : 'Create repair artifact'}</button></article>)}</div> : <p className="hex-muted">No deterministic repair was found for this format. Review the detected header/trailer and use the editor for a deliberate byte-level patch.</p>}</section>}
                   </>}
                 </section>
               )}
@@ -1870,6 +2120,28 @@ function HomeWorkbench() {
             <header><div><p className="eyebrow">Scan configuration</p><h2 id="method-title">Choose exactly what will run</h2></div><button onClick={() => setShowAdvanced(false)} aria-label="Close scan settings">×</button></header>
             <p className="modal-intro">Settings are validated by the local engine and saved with the case. Fingerprinting and raw string recovery always run so every result keeps a trustworthy evidence baseline.</p>
             <div className="method-catalog settings-catalog">
+              <section className="settings-section appearance-settings" aria-labelledby="appearance-settings">
+                <div className="settings-section-title"><div><p className="eyebrow">Display preferences</p><h3 id="appearance-settings">Appearance and text size</h3></div><button type="button" onClick={() => setUiPreferences(DEFAULT_UI_PREFERENCES)}>Reset appearance</button></div>
+                <div className="appearance-settings-grid">
+                  <div className="appearance-control">
+                    <span><strong>Color theme</strong><small>Switch the complete workbench, results, and hex editor.</small></span>
+                    <div className="theme-choice" role="group" aria-label="Color theme">
+                      <button type="button" className={uiPreferences.theme === 'light' ? 'active' : ''} aria-pressed={uiPreferences.theme === 'light'} onClick={() => setUiPreferences((current) => ({ ...current, theme: 'light' }))}><i aria-hidden="true">☀</i>Light</button>
+                      <button type="button" className={uiPreferences.theme === 'dark' ? 'active' : ''} aria-pressed={uiPreferences.theme === 'dark'} onClick={() => setUiPreferences((current) => ({ ...current, theme: 'dark' }))}><i aria-hidden="true">◐</i>Dark</button>
+                    </div>
+                  </div>
+                  <div className="appearance-control zoom-preference">
+                    <span><strong>Interface zoom</strong><small>Enlarge all text, controls, tool output, and hex bytes.</small></span>
+                    <div className="zoom-preference-controls">
+                      <button type="button" aria-label="Zoom out interface" disabled={uiPreferences.zoom <= UI_ZOOM_MIN} onClick={() => setUiPreferences((current) => ({ ...current, zoom: normalizeInterfaceZoom(current.zoom - 10) }))}>−</button>
+                      <label htmlFor="interface-zoom"><input id="interface-zoom" type="range" min={UI_ZOOM_MIN} max={UI_ZOOM_MAX} step="5" value={uiPreferences.zoom} onChange={(event) => setUiPreferences((current) => ({ ...current, zoom: normalizeInterfaceZoom(event.target.value) }))} /><output htmlFor="interface-zoom" aria-live="polite">{uiPreferences.zoom}%</output></label>
+                      <button type="button" aria-label="Zoom in interface" disabled={uiPreferences.zoom >= UI_ZOOM_MAX} onClick={() => setUiPreferences((current) => ({ ...current, zoom: normalizeInterfaceZoom(current.zoom + 10) }))}>＋</button>
+                    </div>
+                  </div>
+                </div>
+                <p className="appearance-note">Saved only in this browser. Zoom changes apply immediately and do not alter exported evidence.</p>
+              </section>
+
               <section className="settings-section" aria-labelledby="analysis-switches">
                 <div className="settings-section-title"><div><p className="eyebrow">Analysis stages</p><h3 id="analysis-switches">{sectionCopy.settingsLabel} method groups</h3></div><span>{currentConfigurableMethods.filter((item) => scanOptions[item.key]).length}/{currentConfigurableMethods.length} enabled</span></div>
                 <div className="method-settings-grid">
@@ -1894,7 +2166,7 @@ function HomeWorkbench() {
                     <label><span>Analyze duration<small>Decoded seconds, bounded 15–300</small></span><input type="number" min="15" max="300" step="15" value={scanOptions.audio_analysis_seconds} onChange={(event) => setScanOptions((current) => ({ ...current, audio_analysis_seconds: Math.max(15, Math.min(300, Number(event.target.value) || 15)) }))} /></label>
                     <label><span>Spectrogram FFT<small>Frequency/time resolution</small></span><select value={scanOptions.audio_spectrogram_fft} onChange={(event) => setScanOptions((current) => ({ ...current, audio_spectrogram_fft: Number(event.target.value) as ScanOptions['audio_spectrogram_fft'] }))}>{[256, 512, 1024, 2048, 4096].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
                     <label><span>Analysis channel<small>Signal used by decoders</small></span><select value={scanOptions.audio_channel_mode} onChange={(event) => setScanOptions((current) => ({ ...current, audio_channel_mode: event.target.value as ScanOptions['audio_channel_mode'] }))}><option value="mix">Mono mix</option><option value="left">Left</option><option value="right">Right</option><option value="difference">Stereo difference</option></select></label>
-                    <label><span>PCM LSB planes<small>Least-significant sample bits</small></span><select value={scanOptions.audio_lsb_bits} onChange={(event) => setScanOptions((current) => ({ ...current, audio_lsb_bits: Number(event.target.value) }))}>{[1, 2, 3, 4].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+                    <label><span>PCM bit planes<small>Payload-byte planes plus stereo channel splits</small></span><select value={scanOptions.audio_lsb_bits} onChange={(event) => setScanOptions((current) => ({ ...current, audio_lsb_bits: Number(event.target.value) }))}>{[1, 2, 3, 4, 5, 6, 7, 8].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
                     <label><span>SSTV mode<small>Auto VIS or force a damaged transmission</small></span><select value={scanOptions.audio_sstv_mode} disabled={!scanOptions.audio_sstv} onChange={(event) => setScanOptions((current) => ({ ...current, audio_sstv_mode: event.target.value as ScanOptions['audio_sstv_mode'] }))}><option value="auto">Auto-detect VIS</option><option value="robot36">Robot 36</option><option value="robot72">Robot 72</option><option value="martin1">Martin M1</option><option value="martin2">Martin M2</option><option value="scottie1">Scottie S1</option><option value="scottie2">Scottie S2</option><option value="scottiedx">Scottie DX</option><option value="pd120">PD-120</option><option value="pd180">PD-180</option><option value="pd240">PD-240</option></select></label>
                     <label><span>SSTV image ceiling<small>Maximum transmissions decoded, 1–4</small></span><select value={scanOptions.audio_sstv_max_images} disabled={!scanOptions.audio_sstv} onChange={(event) => setScanOptions((current) => ({ ...current, audio_sstv_max_images: Number(event.target.value) }))}>{[1, 2, 3, 4].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
                     <label className="budget-check"><span>Correct SSTV slant<small>Re-align each line from its 1200 Hz sync</small></span><input type="checkbox" checked={scanOptions.audio_sstv_slant_correction} disabled={!scanOptions.audio_sstv} onChange={(event) => setScanOptions((current) => ({ ...current, audio_sstv_slant_correction: event.target.checked }))} /></label>
@@ -1907,6 +2179,7 @@ function HomeWorkbench() {
                 <p className="install-note">One click installs fixed, allowlisted packages non-interactively through Kali WSL or Windows Package Manager—no ZIP extraction or installer walkthrough. {sectionCopy.installNote}</p>
                 {toolInstallReport && <div className={`tool-download-report ${toolInstallReport.status || ''}`}><div><strong>{toolInstallReport.message || 'Tool installation finished.'}</strong><small>{toolInstallReport.available_count !== undefined ? `${toolInstallReport.available_count}/${toolInstallReport.requested_count || 0} requested tools detected` : 'Installation report recorded.'}{toolInstallReport.managers?.length ? ` · ${toolInstallReport.managers.join(', ')}` : ''}</small></div></div>}
                 {toolInstallReport?.items?.length ? <div className="tool-download-items" aria-label="Tool installation status"><span className="tool-download-items-title">Installation results</span>{toolInstallReport.items.map((item, index) => <div className="tool-download-item" key={`${item.id || 'tool'}-${index}`}><span><strong>{item.id || 'tool'}</strong><small>{item.message || item.status || 'recorded'}{item.channel ? ` · ${item.channel}` : ''}{item.resolved ? ` · ${item.resolved}` : ''}</small>{item.diagnostic ? <details open><summary>Installer diagnostic</summary><pre>{boundedDisplay(item.diagnostic, 2_000)}</pre></details> : null}</span><em className={item.status || ''}>{(item.status || 'unknown').replaceAll('_', ' ')}</em></div>)}</div> : null}
+                {evidenceSection === 'corrupted' && webRepairCapabilities.length ? <div className="repair-web-sources" aria-label="Web-sourced repair tools"><div><p className="eyebrow">Web-sourced repair engines</p><strong>Curated upstream tools for damaged files</strong><small>These links document the projects behind the adapters. Installation still uses the fixed local package mappings above; original files remain unchanged.</small></div><div className="repair-web-source-links">{webRepairCapabilities.map((capability) => capability.source_url ? <a key={`${capability.id || capability.executable}-source`} href={capability.source_url} target="_blank" rel="noreferrer noopener">{capability.name || capability.id || capability.executable} ↗</a> : null)}</div></div> : null}
                 <div className="tool-selection-actions"><button onClick={() => setScanOptions((current) => ({ ...current, selected_external_tools: Array.from(new Set([...(current.selected_external_tools || []), ...relevantCapabilities.map((item) => item.id).filter((item): item is string => Boolean(item))])) }))}>Select visible</button><button onClick={() => setScanOptions((current) => ({ ...current, selected_external_tools: (current.selected_external_tools || capabilities.map((item) => item.id).filter((item): item is string => Boolean(item))).filter((id) => !relevantCapabilities.some((item) => item.id === id)) }))}>Clear visible</button></div>
                 <div className="external-tool-grid">
                   {relevantCapabilities.map((capability) => {

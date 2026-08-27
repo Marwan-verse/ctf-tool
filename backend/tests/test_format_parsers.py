@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import io
+import struct
+import zipfile
 from pathlib import Path
 
-from app.analyzers.formats import analyze_format, parse_png
+from app.analyzers.formats import analyze_format, parse_bmp, parse_png, propose_header_repairs
 
 
 def test_png_text_metadata_is_extracted_with_provenance(metadata_png: Path) -> None:
@@ -44,3 +47,68 @@ def test_malformed_input_returns_a_report_instead_of_raising() -> None:
     assert result["kind"] == "png"
     assert isinstance(result["findings"], list)
     assert isinstance(result["properties"], dict)
+
+
+def test_corrupted_png_signature_and_ihdr_length_get_a_provenance_candidate(metadata_png: Path) -> None:
+    source = bytearray(metadata_png.read_bytes())
+    source[:8] = b"\x89PB\x11\r\n\x1a\n"
+    source[8:12] = b"\x00\x12\x13\x14"
+
+    [candidate] = propose_header_repairs(bytes(source), profile="deep")
+
+    assert candidate["kind"] == "png"
+    assert candidate["data"][:8] == b"\x89PNG\r\n\x1a\n"
+    assert candidate["data"][8:12] == b"\x00\x00\x00\r"
+    assert parse_png(candidate["data"], profile="quick")["properties"]["width"] == 8
+    assert candidate["details"] == {"signature_repaired": True, "ihdr_length_repaired": True}
+
+
+def test_corrupted_jpeg_soi_with_jfif_evidence_gets_a_candidate() -> None:
+    # Two literal prefix bytes stand in for a damaged FF D8 SOI.  The valid
+    # APP0 length/JFIF marker and following JPEG marker make the repair safe.
+    source = b"\\x\xff\xe0\x00\x10JFIF\x00" + (b"\x00" * 9) + b"\xff\xdb" + (b"\x00" * 20)
+
+    [candidate] = propose_header_repairs(source, profile="deep")
+
+    assert candidate["kind"] == "jpeg"
+    assert candidate["data"][:3] == b"\xff\xd8\xff"
+    assert "start-of-image" in candidate["transformation"]
+
+
+def test_bmp_interleaved_word_lane_recovers_and_trims_zip() -> None:
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("clue.txt", "picoCTF{synthetic_bmp_word_lane}")
+    archive_data = archive_buffer.getvalue()
+
+    # Keep enough carrier data after EOCD to exceed zipfile's normal backward
+    # search window. This is the layout used by picoCTF's Invisible WORDs.
+    width, height = 400, 200
+    pixel_count = width * height
+    hidden_lane = archive_data.ljust(pixel_count * 2, b"\xa5")
+    pixels = bytearray(pixel_count * 4)
+    pixels[0::4] = b"\x00" * pixel_count
+    pixels[1::4] = b"\x00" * pixel_count
+    pixels[2::4] = hidden_lane[0::2]
+    pixels[3::4] = hidden_lane[1::2]
+
+    pixel_offset = 14 + 124
+    bmp = bytearray(pixel_offset + len(pixels))
+    bmp[:2] = b"BM"
+    struct.pack_into("<I", bmp, 2, len(bmp))
+    struct.pack_into("<I", bmp, 10, pixel_offset)
+    struct.pack_into("<IiiHHII", bmp, 14, 124, width, height, 1, 32, 3, len(pixels))
+    struct.pack_into("<IIII", bmp, 54, 0x00007C00, 0x000003E0, 0x0000001F, 0)
+    bmp[pixel_offset:] = pixels
+
+    result = parse_bmp(bytes(bmp), profile="quick")
+
+    assert result["properties"]["bitfield_masks"] == [
+        "0x00007c00", "0x000003e0", "0x0000001f", "0x00000000",
+    ]
+    [recovered] = [item for item in result["extracted"] if item["label"] == "bmp_word_lane_1_zip"]
+    assert recovered["data"] == archive_data
+    assert len(hidden_lane) - len(recovered["data"]) > 65_557
+    with zipfile.ZipFile(io.BytesIO(recovered["data"])) as archive:
+        assert archive.read("clue.txt") == b"picoCTF{synthetic_bmp_word_lane}"
+    assert any(finding["title"] == "File hidden in a BMP word lane" for finding in result["findings"])

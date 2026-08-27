@@ -338,17 +338,41 @@ def analyze_audio(
         ))
 
     if lsb_enabled:
-        for bit in range(max(1, min(4, int(lsb_bits)))):
-            packed = _pcm_lsb_stream(integer_samples, bit)
+        # CTF WAV stego commonly stores one bit in every *payload byte*, not
+        # only in the decoded integer sample. Enumerate those byte planes
+        # while keeping the output bounded and preserving frame order.
+        requested_bits = max(1, min(8, int(lsb_bits)))
+        raw_payload = np.frombuffer(frames, dtype=np.uint8)
+        for bit in range(requested_bits):
+            packed = _pcm_byte_lsb_stream(raw_payload, bit)
             if packed:
                 result["stego_streams"].append({
                     "label": f"audio_pcm_lsb_bit{bit}",
                     "data": packed,
                     "producer": "built-in-audio-lsb",
-                    "transformation": f"extract PCM sample bit {bit} in interleaved frame order",
+                    "transformation": f"extract PCM payload-byte bit {bit} in interleaved frame order",
                     "kind": "binary",
-                    "parameters": {"bit": bit, "channels": channels, "sample_count": int(integer_samples.size)},
+                    "parameters": {"bit": bit, "channels": channels, "sample_width_bytes": sample_width, "payload_bytes": int(raw_payload.size), "packing": "msb-first"},
                 })
+        # Stereo challenges frequently hide the message in one channel.  The
+        # channel-separated byte streams are deterministic and capped at four
+        # channels, with no external process or unbounded allocation.
+        if channels >= 2 and sample_width >= 1 and raw_payload.size % (channels * sample_width) == 0:
+            frame_bytes = channels * sample_width
+            channel_bytes = raw_payload.reshape(-1, frame_bytes).reshape(-1, channels, sample_width)
+            for channel_index in range(min(channels, 4)):
+                separated = channel_bytes[:, channel_index, :].reshape(-1)
+                for bit in range(requested_bits):
+                    packed = _pcm_byte_lsb_stream(separated, bit)
+                    if packed:
+                        result["stego_streams"].append({
+                            "label": f"audio_pcm_lsb_channel{channel_index + 1}_bit{bit}",
+                            "data": packed,
+                            "producer": "built-in-audio-lsb",
+                            "transformation": f"extract PCM payload-byte bit {bit} from channel {channel_index + 1} in frame order",
+                            "kind": "binary",
+                            "parameters": {"bit": bit, "channel": channel_index + 1, "channels": channels, "sample_width_bytes": sample_width, "payload_bytes": int(separated.size), "packing": "msb-first"},
+                        })
 
     if channel_exports:
         export_channels: list[tuple[str, np.ndarray]] = [("mono_mix", np.mean(samples, axis=1, keepdims=True))]
@@ -741,6 +765,21 @@ def _pcm_lsb_stream(samples: np.ndarray, bit: int) -> bytes:
     return np.packbits(values, bitorder="big").tobytes()
 
 
+def _pcm_byte_lsb_stream(payload: np.ndarray, bit: int) -> bytes:
+    """Pack a bounded bit plane from raw PCM payload bytes.
+
+    ``wave.readframes`` excludes the RIFF header, so this mirrors the bytewise
+    extraction used by common WAV steganography challenges without accidentally
+    leaking container metadata into the candidate stream.
+    """
+
+    if payload.size < 8:
+        return b""
+    maximum_bits = min(int(payload.size), MAX_LSB_BYTES * 8)
+    values = ((payload[:maximum_bits] >> int(bit)) & 1).astype(np.uint8)
+    return np.packbits(values, bitorder="big").tobytes()
+
+
 def _normalize(samples: np.ndarray) -> np.ndarray:
     peak = float(np.max(np.abs(samples))) if samples.size else 0.0
     return samples if peak <= 1e-12 else samples * (0.98 / peak)
@@ -791,7 +830,7 @@ def _submethods_without_pcm(spectrogram: bool, decoders: bool, sstv: bool, chann
         _method("audio-spectrogram", "Spectrogram renderer", "audio-spectrum", "skipped", "A decoded PCM stream is required." if spectrogram else "Spectrogram generation was disabled."),
         _method("audio-signal-decoders", "DTMF and Morse signal decoders", "audio-decoding", "skipped", "A decoded PCM stream is required." if decoders else "Signal decoders were disabled."),
         _method("audio-sstv", "RX-SSTV-compatible image decoder", "audio-sstv", "skipped", "A decoded PCM stream is required." if sstv else "SSTV decoding was disabled."),
-        _method("audio-pcm-lsb", "PCM least-significant-bit extraction", "steganography", "skipped", "A decoded integer PCM stream is required." if lsb else "PCM LSB extraction was disabled."),
+        _method("audio-pcm-lsb", "PCM byte/sample bit extraction", "steganography", "skipped", "A decoded PCM payload is required." if lsb else "PCM LSB extraction was disabled."),
         _method("audio-channel-exports", "Channel isolation exports", "audio", "skipped", "A decoded PCM stream is required." if channels else "Channel exports were disabled."),
         _method("audio-audacity", "Audacity review bundle", "audio", "skipped", "A decoded PCM stream is required." if audacity else "Audacity-compatible exports were disabled."),
     ]
@@ -812,7 +851,7 @@ def _submethods_with_pcm(result: dict[str, Any], spectrogram: bool, decoders: bo
             ),
             signals["sstv"],
         ),
-        _method("audio-pcm-lsb", "PCM least-significant-bit extraction", "steganography", "completed" if lsb else "skipped", f"Extracted {len(result['stego_streams'])} bounded PCM bit-plane stream(s)." if lsb else "PCM LSB extraction was disabled."),
+        _method("audio-pcm-lsb", "PCM byte/sample bit extraction", "steganography", "completed" if lsb else "skipped", f"Extracted {len(result['stego_streams'])} bounded PCM byte/channel bit-plane stream(s)." if lsb else "PCM LSB extraction was disabled."),
         _method("audio-channel-exports", "Channel isolation exports", "audio", "completed" if channels else "skipped", "Exported mono, channel, and stereo-difference review WAVs." if channels else "Channel exports were disabled."),
         _method("audio-audacity", "Audacity review bundle", "audio", "completed" if audacity else "skipped", "Created normalized/reversed PCM WAVs and an Audacity-compatible label track." if audacity else "Audacity-compatible exports were disabled."),
     ]

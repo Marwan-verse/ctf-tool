@@ -38,8 +38,10 @@ from .hexedit import (
     analyze_edited_file,
     normalize_edits,
     patch_digest,
+    read_repair_candidate,
     render_edited_preview,
     write_edited_copy,
+    write_repair_copy,
 )
 from .hexview import inspect_file
 from .jobs import JobManager
@@ -59,6 +61,7 @@ from .schemas import (
     CapabilitiesResponse,
     HealthResponse,
     HexEditRequest,
+    HexRepairRequest,
     HexSaveRequest,
     JobListResponse,
     JobResponse,
@@ -157,6 +160,7 @@ def _tool_capability(spec: Any, wsl_tools: dict[str, str]) -> dict[str, Any]:
             if resolved
             else "Install automatically from Scan settings, then refresh availability."
         ),
+        "source_url": spec.source_url,
     }
 
 
@@ -361,10 +365,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 {"id": "decomposer", "name": "Bit-layer decomposer", "category": "visual", "available": True, "formats": ["all images"]},
                 {"id": "color_remapping", "name": "Color remapping", "category": "visual", "available": True, "formats": ["all images"]},
                 {"id": "pcrt", "name": "PCRT-compatible PNG repair", "category": "repair", "available": True, "formats": ["png"]},
+                {"id": "header-recovery", "name": "Signature and first-header recovery", "category": "repair", "available": True, "formats": ["png", "jpeg", "unknown binary"]},
+                {"id": "bmp-word-lanes", "name": "BMP bitfield word-lane payload recovery", "category": "steganography", "available": True, "formats": ["bmp"]},
                 {"id": "crypto-analysis", "name": "Encrypted payload detection and recovery", "category": "crypto", "available": True, "formats": ["extracted payloads"]},
                 {"id": "audio-waveform", "name": "PCM waveform and statistics", "category": "audio", "available": True, "formats": ["wav"]},
                 {"id": "audio-spectrogram", "name": "Built-in STFT spectrogram", "category": "audio-spectrum", "available": True, "formats": ["wav"]},
-                {"id": "audio-pcm-lsb", "name": "PCM sample bit extraction", "category": "steganography", "available": True, "formats": ["wav"]},
+                {"id": "audio-pcm-lsb", "name": "PCM byte/channel bit-plane extraction", "category": "steganography", "available": True, "formats": ["wav"]},
                 {"id": "audio-signal-decoders", "name": "DTMF and Morse decoders", "category": "audio-decoding", "available": True, "formats": ["wav"]},
                 {"id": "audio-sstv", "name": "RX-SSTV-compatible VIS image decoder", "category": "audio-sstv", "available": True, "formats": ["wav"]},
                 {"id": "audio-audacity", "name": "Audacity review bundle", "category": "audio", "available": True, "formats": ["wav"]},
@@ -832,6 +838,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail={"code": "invalid_hex_edits", "message": str(exc)}) from exc
         return artifact, path, normalized
 
+    def validate_hex_repair_request(
+        request_model: HexRepairRequest,
+        *,
+        request: Request,
+        identifier: str,
+        storage: Storage,
+    ) -> tuple[dict[str, Any], Path]:
+        artifact = resolve_hex_artifact(identifier, request_model.artifact_id, storage)
+        source_sha = str(artifact.get("sha256") or "").lower()
+        if request_model.base_sha256 != source_sha:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "stale_artifact",
+                    "message": "This artifact changed since the editor loaded it. Refresh the artifact before creating a repair.",
+                },
+            )
+        path = _artifact_path(_settings(request), identifier, artifact)
+        return artifact, path
+
     @application.post("/api/jobs/{job_id}/hex/analyze")
     async def analyze_hex_edits(request: Request, job_id: UUID, payload: HexEditRequest) -> dict[str, Any]:
         """Analyze a sparse edited copy in memory; no temporary artifact is persisted."""
@@ -983,6 +1009,114 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 logger.exception("Unable to persist hex-derived artifact for job %s", identifier)
                 raise HTTPException(status_code=500, detail={"code": "hex_save_failed", "message": "The derived artifact could not be indexed."}) from exc
             return {"artifact": artifact_public_record(stored), "source_sha256": str(artifact.get("sha256") or "")}
+
+    @application.post("/api/jobs/{job_id}/hex/repair")
+    async def create_hex_repair(request: Request, job_id: UUID, payload: HexRepairRequest) -> dict[str, Any]:
+        """Create a deterministic format repair as a new immutable artifact."""
+
+        identifier = str(job_id)
+        storage = _storage(request)
+        job = _get_job_or_404(storage, identifier)
+        if str(job.get("status")) not in TERMINAL_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "job_active", "message": "Wait for the analysis to finish before creating a repair artifact."},
+            )
+        lock_map: dict[str, asyncio.Lock] = getattr(request.app.state, "hex_edit_locks", {})
+        lock = lock_map.setdefault(identifier, asyncio.Lock())
+        async with lock:
+            artifact, source_path = validate_hex_repair_request(payload, request=request, identifier=identifier, storage=storage)
+            artifacts = await anyio.to_thread.run_sync(storage.list_artifacts, identifier)
+            if len(artifacts) >= _settings(request).max_artifacts:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "artifact_limit", "message": "This job has reached its derived-artifact limit."},
+                )
+            source_name = normalize_display_filename(str(artifact.get("name") or "source.bin"), fallback="source.bin")
+            try:
+                repaired_data, candidate = await anyio.to_thread.run_sync(
+                    partial(
+                        read_repair_candidate,
+                        source_path,
+                        payload.candidate_id,
+                        filename=source_name,
+                        declared_media_type=str(artifact.get("media_type") or ""),
+                    )
+                )
+            except LiveEditTooLargeError as exc:
+                raise HTTPException(status_code=413, detail={"code": "repair_limit", "message": str(exc)}) from exc
+            except (HexEditError, OSError) as exc:
+                raise HTTPException(status_code=422, detail={"code": "repair_unavailable", "message": str(exc)}) from exc
+            configured_settings = _settings(request)
+            job_dir = resolve_under(configured_settings.jobs_dir, identifier, must_exist=True)
+            edit_dir = resolve_under(job_dir, "output", "hex-edits", must_exist=False)
+            edit_dir.mkdir(parents=True, exist_ok=True)
+            requested_name = normalize_display_filename(payload.name, fallback="") if payload.name else ""
+            if not requested_name:
+                label = normalize_display_filename(str(candidate.get("label") or "repair"), fallback="repair")
+                stem = Path(source_name).stem or "source"
+                suffix = Path(source_name).suffix or ".bin"
+                requested_name = normalize_display_filename(f"{stem}-{label}{suffix}", fallback=f"source-repair{suffix}")
+            destination_name = f"{uuid4().hex}-{requested_name}"
+            destination = resolve_under(job_dir, "output", "hex-edits", destination_name, must_exist=False)
+            temporary = resolve_under(job_dir, "output", "hex-edits", f".{uuid4().hex}.tmp", must_exist=False)
+            try:
+                written = await anyio.to_thread.run_sync(partial(write_repair_copy, temporary, repaired_data))
+                await anyio.to_thread.run_sync(partial(os.replace, temporary, destination))
+                media_type, sniff_previewable = await anyio.to_thread.run_sync(sniff_media_type, destination)
+                relative_path = destination.relative_to(job_dir).as_posix()
+                record = {
+                    "id": str(uuid4()),
+                    "job_id": identifier,
+                    "parent_id": str(artifact["id"]),
+                    "name": requested_name,
+                    "kind": "repair",
+                    "relative_path": relative_path,
+                    "media_type": media_type,
+                    "size_bytes": int(written["size_bytes"]),
+                    "sha256": written["sha256"],
+                    "previewable": bool(sniff_previewable),
+                    "metadata": {
+                        "immutable_derived": True,
+                        "repair_candidate": True,
+                        "producer": candidate.get("producer") or "format-parser",
+                        "transformation": candidate.get("transformation") or "deterministic format repair",
+                        "reason": candidate.get("reason") or "The format parser found a structural repair.",
+                        "repair_candidate_id": candidate.get("id"),
+                        "format": candidate.get("format"),
+                        "source_artifact_id": str(artifact["id"]),
+                        "source_sha256": str(artifact.get("sha256") or ""),
+                        "source_size": candidate.get("source_size"),
+                        "repaired_size": candidate.get("repaired_size"),
+                        "changed_bytes": candidate.get("changed_bytes"),
+                        "changed_offsets": candidate.get("changed_offsets", [])[:64],
+                        "after_integrity": candidate.get("after_integrity"),
+                    },
+                }
+                stored = await anyio.to_thread.run_sync(storage.upsert_artifact, record)
+                try:
+                    await anyio.to_thread.run_sync(
+                        storage.append_event,
+                        identifier,
+                        "artifact",
+                        {"artifact_id": stored["id"], "name": stored["name"], "message": "Saved a deterministic format repair candidate."},
+                    )
+                except Exception:
+                    logger.warning("Unable to append hex repair event for job %s", identifier, exc_info=True)
+            except (HexEditError, OSError, ValueError) as exc:
+                temporary.unlink(missing_ok=True)
+                destination.unlink(missing_ok=True)
+                raise HTTPException(status_code=422, detail={"code": "repair_save_failed", "message": str(exc)}) from exc
+            except Exception as exc:
+                temporary.unlink(missing_ok=True)
+                destination.unlink(missing_ok=True)
+                logger.exception("Unable to persist hex repair for job %s", identifier)
+                raise HTTPException(status_code=500, detail={"code": "repair_save_failed", "message": "The repair artifact could not be indexed."}) from exc
+            return {
+                "artifact": artifact_public_record(stored),
+                "candidate": candidate,
+                "source_sha256": str(artifact.get("sha256") or ""),
+            }
 
     async def export_context(request: Request, job_id: UUID) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
         identifier = str(job_id)

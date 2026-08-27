@@ -23,6 +23,7 @@ class ToolSpec:
     category: str
     kinds: frozenset[str] | None
     profiles: frozenset[str]
+    source_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,9 +54,11 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("strings", "strings", "GNU/Unix strings cross-check", "strings", None, frozenset({"quick", "balanced", "deep"})),
     ToolSpec("identify", "identify", "ImageMagick decoded-image inspection", "identity", IMAGE_KINDS, frozenset({"balanced", "deep"})),
     ToolSpec("pngcheck", "pngcheck", "pngcheck structure validation", "structure", frozenset({"png"}), frozenset({"quick", "balanced", "deep"})),
-    ToolSpec("pngcrush", "pngcrush", "pngcrush lossless validation", "structure", frozenset({"png"}), frozenset({"deep"})),
+    ToolSpec("pngcrush", "pngcrush", "pngcrush lossless validation", "structure", frozenset({"png"}), frozenset({"deep"}), "https://pmt.sourceforge.io/pngcrush/"),
+    ToolSpec("pngfix", "pngfix", "libpng PNG zlib recovery", "repair", frozenset({"png"}), frozenset({"balanced", "deep"}), "https://github.com/pnggroup/libpng"),
+    ToolSpec("optipng", "optipng", "OptiPNG error-recovery rewrite", "repair", frozenset({"png"}), frozenset({"balanced", "deep"}), "https://optipng.sourceforge.net/"),
     ToolSpec("jpeginfo", "jpeginfo", "jpeginfo structure validation", "structure", frozenset({"jpeg"}), frozenset({"quick", "balanced", "deep"})),
-    ToolSpec("jpegtran", "jpegtran", "jpegtran lossless normalization", "repair", frozenset({"jpeg"}), frozenset({"balanced", "deep"})),
+    ToolSpec("jpegtran", "jpegtran", "jpegtran lossless normalization", "repair", frozenset({"jpeg"}), frozenset({"balanced", "deep"}), "https://www.ijg.org/"),
     ToolSpec("djpeg", "djpeg", "libjpeg pixel decode validation", "structure", frozenset({"jpeg"}), frozenset({"deep"})),
     ToolSpec("zsteg", "zsteg", "zsteg lossless steganography", "steganography", frozenset({"png", "bmp"}), frozenset({"balanced", "deep"})),
     ToolSpec("stegseek", "stegseek", "Stegseek JPEG extraction", "steganography", frozenset({"jpeg"}), frozenset({"balanced", "deep"})),
@@ -71,7 +74,10 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("tiffdump", "tiffdump", "libtiff directory dump", "structure", frozenset({"tiff"}), frozenset({"deep"})),
     ToolSpec("webpinfo", "webpinfo", "WebP RIFF inspection", "structure", frozenset({"webp"}), frozenset({"quick", "balanced", "deep"})),
     ToolSpec("webpmux", "webpmux", "WebP container and animation inspection", "structure", frozenset({"webp"}), frozenset({"balanced", "deep"})),
-    ToolSpec("gifsicle", "gifsicle", "Gifsicle animation inspection", "animation", frozenset({"gif"}), frozenset({"balanced", "deep"})),
+    ToolSpec("gifsicle", "gifsicle", "Gifsicle animation inspection", "animation", frozenset({"gif"}), frozenset({"balanced", "deep"}), "https://www.lcdf.org/gifsicle/"),
+    ToolSpec("gifsicle_repair", "gifsicle", "Gifsicle tolerant GIF rewrite", "repair", frozenset({"gif"}), frozenset({"balanced", "deep"}), "https://www.lcdf.org/gifsicle/"),
+    ToolSpec("zipfix", "zip", "Info-ZIP archive repair", "repair", frozenset({"zip"}), frozenset({"deep"}), "https://infozip.sourceforge.net/"),
+    ToolSpec("zipfix_deep", "zip", "Info-ZIP deep archive repair", "repair", frozenset({"zip"}), frozenset({"deep"}), "https://infozip.sourceforge.net/"),
     ToolSpec("tesseract", "tesseract", "Tesseract OCR command-line cross-check", "ocr", IMAGE_KINDS, frozenset({"balanced", "deep"})),
     ToolSpec("zbarimg", "zbarimg", "ZBar barcode command-line cross-check", "barcodes", IMAGE_KINDS, frozenset({"balanced", "deep"})),
     ToolSpec("ffprobe", "ffprobe", "FFprobe stream and codec inspection", "audio-metadata", AUDIO_KINDS, frozenset({"quick", "balanced", "deep"})),
@@ -169,6 +175,12 @@ def _well_known_tool_directories(executable: str) -> tuple[str, ...]:
     user_program_roots = ([local / "Programs"] if local else [])
 
     directories: list[Path] = []
+    configured_tools_root = os.environ.get("FORENSCOPE_TOOLS_DIR")
+    managed_tools_root = (
+        Path(configured_tools_root).expanduser()
+        if configured_tools_root
+        else Path(__file__).resolve().parents[3] / ".tools"
+    )
     if executable == "exiftool":
         directories.extend(root / "ExifTool" for root in [*user_program_roots, *program_roots])
     elif executable == "identify":
@@ -181,6 +193,13 @@ def _well_known_tool_directories(executable: str) -> tuple[str, ...]:
         directories.extend(root / "Tesseract-OCR" for root in program_roots)
     elif executable == "openstego":
         directories.extend(root / "OpenStego" for root in [*user_program_roots, *program_roots])
+    elif executable == "steghide":
+        # The verified upstream Windows archive has this fixed layout. Keeping
+        # it inside the project avoids changing the user's system PATH.
+        directories.extend((
+            managed_tools_root / "steghide" / "bin",
+            managed_tools_root / "steghide-0.5.1-win32" / "steghide",
+        ))
     elif executable == "exiv2":
         directories.extend(root / "Exiv2" for root in [*user_program_roots, *program_roots])
     elif executable == "file":
@@ -423,6 +442,13 @@ class ExternalToolRunner:
         foremost_recursive_failures = 0
         with tempfile.TemporaryDirectory(prefix=f"{spec.tool_id}-", dir=str(work_dir)) as temp_name:
             temp_dir = Path(temp_name)
+            # WSL can retain its Windows current-working-directory handle briefly
+            # after a child exits. Running it from a disposable per-tool folder
+            # then makes Windows refuse the folder cleanup. All paths below are
+            # absolute and the job directory is server-controlled, so use the
+            # stable job directory as the WSL CWD while retaining the isolated
+            # per-tool directory for outputs.
+            execution_cwd = work_dir if resolution.source == "wsl" else temp_dir
             executable = resolution.executable
             if spec.tool_id == "file":
                 argv = [executable, "--brief", "--mime-type", str(input_path)]
@@ -438,6 +464,12 @@ class ExternalToolRunner:
                 argv = [executable, "-v", str(input_path)]
             elif spec.tool_id == "pngcrush":
                 argv = [executable, "-n", "-v", str(input_path)]
+            elif spec.tool_id == "pngfix":
+                extracted_path = temp_dir / "pngfix_repaired.png"
+                argv = [executable, f"--out={extracted_path}", str(input_path)]
+            elif spec.tool_id == "optipng":
+                extracted_path = temp_dir / "optipng_repaired.png"
+                argv = [executable, "-fix", "-force", "-out", str(extracted_path), "--", str(input_path)]
             elif spec.tool_id == "jpeginfo":
                 argv = [executable, "-c", str(input_path)]
             elif spec.tool_id == "jpegtran":
@@ -457,10 +489,14 @@ class ExternalToolRunner:
                 else:
                     return self._not_run(spec, "skipped", "A password was not supplied; seed scanning is reserved for Deep mode.", executable=resolution.display)
             elif spec.tool_id == "steghide":
-                if password is None:
-                    return self._not_run(spec, "skipped", "A passphrase is required for bounded Steghide extraction.", executable=resolution.display)
+                # Empty-passphrase Steghide payloads are common in beginner CTFs.
+                # Passing -p explicitly also prevents an interactive prompt.
+                steghide_password = password if password is not None else ""
                 extracted_path = temp_dir / "steghide_payload.bin"
-                argv = [executable, "extract", "-sf", str(input_path), "-p", password, "-xf", str(extracted_path), "-f"]
+                argv = [
+                    executable, "extract", "-sf", str(input_path), "-p", steghide_password,
+                    "-xf", str(extracted_path), "-f",
+                ]
             elif spec.tool_id == "outguess":
                 if password is None:
                     return self._not_run(spec, "skipped", "A passphrase is required for bounded OutGuess extraction.", executable=resolution.display)
@@ -498,6 +534,15 @@ class ExternalToolRunner:
                 argv = [executable, "-info", str(input_path)]
             elif spec.tool_id == "gifsicle":
                 argv = [executable, "--info", str(input_path)]
+            elif spec.tool_id == "gifsicle_repair":
+                extracted_path = temp_dir / "gifsicle_repaired.gif"
+                argv = [executable, "--careful", "--output", str(extracted_path), "--", str(input_path)]
+            elif spec.tool_id == "zipfix":
+                extracted_path = temp_dir / "zipfix_repaired.zip"
+                argv = [executable, "-F", str(input_path), "--out", str(extracted_path)]
+            elif spec.tool_id == "zipfix_deep":
+                extracted_path = temp_dir / "zipfix_deep_repaired.zip"
+                argv = [executable, "-FF", str(input_path), "--out", str(extracted_path)]
             elif spec.tool_id == "tesseract":
                 argv = [executable, str(input_path), "stdout", "-l", ocr_language, "--psm", "6"]
             elif spec.tool_id == "zbarimg":
@@ -537,7 +582,7 @@ class ExternalToolRunner:
             started_at = utc_now()
             start = time.monotonic()
             launch_argv = self._launch_argv(resolution, argv[1:])
-            execution = self._execute(launch_argv, cwd=temp_dir, stdin_data=stdin_data)
+            execution = self._execute(launch_argv, cwd=execution_cwd, stdin_data=stdin_data)
             if spec.tool_id == "foremost":
                 foremost_inputs_scanned = 1
                 foremost_depth_reached = 1 if execution["status"] == "completed" else 0
@@ -560,7 +605,7 @@ class ExternalToolRunner:
                         ]
                         recursive_execution = self._execute(
                             self._launch_argv(resolution, recursive_argv[1:]),
-                            cwd=temp_dir,
+                            cwd=execution_cwd,
                             timeout=remaining_seconds,
                         )
                         foremost_inputs_scanned += 1
@@ -615,7 +660,7 @@ class ExternalToolRunner:
                     "executable": spec.executable,
                     "resolved": resolution.display,
                     "source": resolution.source,
-                    "version": self._version(spec, resolution, temp_dir),
+                    "version": self._version(spec, resolution, execution_cwd),
                 },
                 "command": public_argv,
                 "return_code": execution["return_code"],
@@ -633,7 +678,9 @@ class ExternalToolRunner:
                         "scan_budget": max(1, min(64, int(max_extracted_files))),
                     }
                     if spec.tool_id == "foremost"
-                    else {}
+                    else ({
+                        "passphrase_strategy": "supplied" if password is not None else "automatic_empty",
+                    } if spec.tool_id == "steghide" else {})
                 ),
                 "extracted": [],
             }
@@ -659,6 +706,11 @@ class ExternalToolRunner:
                             "outguess": ("outguess_payload", "extract embedded payload with supplied OutGuess password"),
                             "jpegtran": ("jpegtran_normalized", "losslessly normalize JPEG markers and entropy stream"),
                             "djpeg": ("djpeg_decoded", "decode JPEG pixels to a PPM validation artifact"),
+                            "pngfix": ("pngfix_repaired", "repair recoverable PNG zlib/header issues with libpng pngfix"),
+                            "optipng": ("optipng_repaired", "recover and rewrite a damaged PNG with OptiPNG -fix"),
+                            "gifsicle_repair": ("gifsicle_repaired", "rewrite a GIF with Gifsicle's tolerant parser"),
+                            "zipfix": ("zipfix_repaired", "repair a ZIP with Info-ZIP -F"),
+                            "zipfix_deep": ("zipfix_deep_repaired", "scan and repair a ZIP with Info-ZIP -FF"),
                             "jpseek": ("jpseek_payload", "extract a JPHide payload with JPSeek"),
                             "ffmpeg_spectrogram": ("ffmpeg_spectrogram", "render a full-band FFmpeg spectrogram"),
                             "ffmpeg_pcm": ("ffmpeg_audacity_review", "convert decoded audio to Audacity-compatible 16-bit PCM WAV"),
@@ -670,6 +722,9 @@ class ExternalToolRunner:
                             "transformation": transformation,
                             "offset": None, "kind": sniff_kind(payload),
                         })
+                        if spec.tool_id == "steghide":
+                            strategy = "the supplied passphrase" if password is not None else "the automatic empty-passphrase attempt"
+                            method["summary"] = f"Steghide extracted a {size}-byte payload using {strategy}."
                     elif size:
                         method["extraction_warning"] = f"Extracted payload size {size} exceeded the adapter limit."
                 except OSError as exc:
@@ -889,7 +944,7 @@ class ExternalToolRunner:
             return None
         version_args = {
             "exiftool": ["-ver"], "gifsicle": ["--version"], "file": ["--version"],
-            "strings": ["--version"], "pngcheck": ["-V"], "jpeginfo": ["--version"],
+            "strings": ["--version"], "pngcheck": ["-h"], "jpeginfo": ["--version"],
             "zsteg": ["--version"], "stegseek": ["--version"], "binwalk": ["--version"],
             "tiffinfo": ["--version"], "webpinfo": ["-version"],
             "exiv2": ["--version"], "identify": ["-version"], "pngcrush": ["-version"],

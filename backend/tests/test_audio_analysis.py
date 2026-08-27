@@ -108,6 +108,49 @@ def test_builtin_audio_generates_signal_visuals_and_review_artifacts(tmp_path: P
     assert any(item["title"] == "Bytes follow the declared RIFF container" for item in result["findings"])
 
 
+def test_audio_lsb_extracts_raw_payload_bytes_from_each_stereo_channel(tmp_path: Path) -> None:
+    source = tmp_path / "stereo-lsb.wav"
+    message = b"flag{stereo_pcm_bytes}"
+    channels = 2
+    sample_width = 2
+    frame_count = 2_000
+    raw = bytearray(frame_count * channels * sample_width)
+    bits = [(byte >> shift) & 1 for byte in message for shift in range(7, -1, -1)]
+    # The first channel's raw bytes are separated from the interleaved stream
+    # in the analyzer; write one message bit into each of those bytes.
+    for index, bit in enumerate(bits):
+        frame = index // sample_width
+        offset = index % sample_width
+        raw[frame * channels * sample_width + offset] |= bit
+    with wave.open(str(source), "wb") as target:
+        target.setnchannels(channels)
+        target.setsampwidth(sample_width)
+        target.setframerate(8_000)
+        target.writeframes(bytes(raw))
+
+    result = analyze_audio(
+        source,
+        kind="wav",
+        profile="balanced",
+        enabled=True,
+        spectrogram_enabled=False,
+        signal_decoders=False,
+        sstv_enabled=False,
+        channel_exports=False,
+        audacity_bundle=False,
+        lsb_enabled=True,
+        analysis_seconds=15,
+        fft_size=512,
+        channel_mode="mix",
+        lsb_bits=1,
+    )
+
+    assert any(
+        item["label"] == "audio_pcm_lsb_channel1_bit0" and message in item["data"]
+        for item in result["stego_streams"]
+    )
+
+
 def test_engine_routes_audio_to_audio_pipeline_and_finds_raw_flag(tmp_path: Path) -> None:
     source = tmp_path / "challenge.wav"
     _write_dtmf_wav(source)
