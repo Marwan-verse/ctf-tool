@@ -21,6 +21,10 @@ def test_audio_options_enforce_bounded_duration_and_known_fft_sizes() -> None:
         AnalysisOptions.model_validate({"audio_analysis_seconds": 301})
     with pytest.raises(ValidationError):
         AnalysisOptions.model_validate({"audio_spectrogram_fft": 123})
+    with pytest.raises(ValidationError):
+        AnalysisOptions.model_validate({"audio_sstv_mode": "definitely-not-a-mode"})
+    with pytest.raises(ValidationError):
+        AnalysisOptions.model_validate({"audio_sstv_max_images": 5})
 
     options = AnalysisOptions.model_validate(
         {
@@ -29,10 +33,87 @@ def test_audio_options_enforce_bounded_duration_and_known_fft_sizes() -> None:
             "audio_spectrogram_fft": 4096,
             "audio_channel_mode": "difference",
             "audio_lsb_bits": 4,
+            "audio_sstv_mode": "robot36",
+            "audio_sstv_max_images": 3,
         }
     )
     assert options.audio_analysis_seconds == 90
     assert options.audio_channel_mode == "difference"
+    assert options.audio_sstv_mode == "robot36"
+    assert options.audio_sstv_max_images == 3
+
+
+def test_corrupted_evidence_type_is_valid_and_overrides_audio_magic(tmp_path: Path) -> None:
+    options = AnalysisOptions.model_validate({"evidence_type": "corrupted"})
+    assert options.evidence_type == "corrupted"
+
+    source = tmp_path / "damaged.wav"
+    source.write_bytes(b"RIFF" + (4).to_bytes(4, "little") + b"WAVE")
+    report = AnalysisEngine().run(
+        input_path=source,
+        output_dir=tmp_path / "output",
+        profile="quick",
+        flag_prefix=None,
+        password=None,
+        progress_callback=None,
+        is_cancelled=lambda: False,
+        options={
+            "evidence_type": "corrupted",
+            "structure_analysis": False,
+            "visual_analysis": False,
+            "lsb_analysis": False,
+            "ocr": False,
+            "barcodes": False,
+            "recursive_extraction": False,
+            "decoders": False,
+            "crypto_analysis": False,
+            "repairs": False,
+            "external_tools": False,
+        },
+    )
+
+    method_ids = {method["id"] for method in report["methods"]}
+    assert report["status"] == "completed"
+    assert report["section"] == "corrupted"
+    assert report["coverage"]["section"] == "corrupted"
+    assert report["source"]["detected_type"] == "wav"
+    assert "built-in-core" in method_ids
+    assert "audio-waveform" not in method_ids
+
+
+def test_corrupted_deep_scan_creates_copy_only_png_repair(malformed_png: Path, tmp_path: Path) -> None:
+    source_bytes = malformed_png.read_bytes()
+    output_dir = tmp_path / "output"
+
+    report = AnalysisEngine().run(
+        input_path=malformed_png,
+        output_dir=output_dir,
+        profile="deep",
+        flag_prefix=None,
+        password=None,
+        progress_callback=None,
+        is_cancelled=lambda: False,
+        options={
+            "evidence_type": "corrupted",
+            "visual_analysis": False,
+            "lsb_analysis": False,
+            "ocr": False,
+            "barcodes": False,
+            "recursive_extraction": False,
+            "decoders": False,
+            "crypto_analysis": False,
+            "external_tools": False,
+        },
+    )
+
+    repair_artifacts = [artifact for artifact in report["artifacts"] if artifact["repair_candidate"]]
+    assert report["status"] == "completed"
+    assert report["section"] == "corrupted"
+    assert report["coverage"]["section"] == "corrupted"
+    assert report["coverage"]["original_mutated"] is False
+    assert len(repair_artifacts) == 1
+    assert (output_dir / repair_artifacts[0]["relative_path"]).read_bytes() != source_bytes
+    assert malformed_png.read_bytes() == source_bytes
 
 
 def test_engine_honors_disabled_stages_and_custom_budgets(clean_png: Path, tmp_path: Path) -> None:

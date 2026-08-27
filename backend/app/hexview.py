@@ -1,4 +1,4 @@
-"""Bounded, read-only byte inspection for the Hex results view."""
+"""Bounded byte inspection for the Hex results view."""
 
 from __future__ import annotations
 
@@ -197,6 +197,7 @@ def _rows(data: bytes, base_offset: int) -> list[dict[str, Any]]:
             {
                 "offset": base_offset + local_offset,
                 "hex": " ".join(f"{byte:02x}" for byte in chunk),
+                "bytes": list(chunk),
                 "ascii": "".join(chr(byte) if 32 <= byte <= 126 else "." for byte in chunk),
                 "length": len(chunk),
             }
@@ -212,8 +213,10 @@ def inspect_file(
     search: str | None = None,
     search_mode: str = "text",
     include_anomalies: bool = True,
+    filename: str = "",
+    declared_media_type: str = "",
 ) -> dict[str, Any]:
-    """Return a bounded hex window, whole-file matches, and anomaly hints."""
+    """Return a bounded hex window, whole-file matches, anomaly hints, and integrity."""
 
     total_size = path.stat().st_size
     bounded_offset = max(0, min(int(offset), total_size))
@@ -224,6 +227,12 @@ def inspect_file(
     needle = parse_search(search, search_mode)
     matches = find_matches(path, needle) if needle else []
     anomalies = scan_anomalies(path) if include_anomalies else []
+    # Integrity is intentionally independent from heuristic anomaly signals:
+    # zero runs, entropy changes, and embedded signatures are useful leads but
+    # are not evidence that a file is structurally corrupt.
+    from .hexedit import diagnose_file
+
+    integrity = diagnose_file(path, filename=filename or path.name, declared_media_type=declared_media_type)
     return {
         "offset": bounded_offset,
         "length": len(data),
@@ -233,4 +242,5 @@ def inspect_file(
         "anomalies": anomalies,
         "search": {"query": search or "", "mode": search_mode, "byte_length": len(needle), "match_count": len(matches)},
         "anomaly_scan": {"enabled": bool(include_anomalies), "count": len(anomalies), "bounded": True},
+        "integrity": integrity,
     }

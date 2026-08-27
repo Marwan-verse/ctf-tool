@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import tempfile
@@ -30,6 +31,16 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from . import __version__
 from .analyzers.external import TOOL_SPECS, discover_wsl_tools, resolve_tool
 from .config import MEBIBYTE, Settings, settings as default_settings
+from .hexedit import (
+    HexEditError,
+    LiveEditTooLargeError,
+    PreviewUnavailableError,
+    analyze_edited_file,
+    normalize_edits,
+    patch_digest,
+    render_edited_preview,
+    write_edited_copy,
+)
 from .hexview import inspect_file
 from .jobs import JobManager
 from .reporting import (
@@ -47,6 +58,8 @@ from .schemas import (
     AnalysisOptions,
     CapabilitiesResponse,
     HealthResponse,
+    HexEditRequest,
+    HexSaveRequest,
     JobListResponse,
     JobResponse,
     JobStatus,
@@ -230,6 +243,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         application.state.jobs = manager
         application.state.started_at = time.monotonic()
         application.state.tool_install_lock = asyncio.Lock()
+        application.state.hex_edit_locks = {}
         try:
             yield
         finally:
@@ -237,7 +251,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     application = FastAPI(
         title="Forenscope API",
-        summary="Local-first image and audio forensics control plane",
+        summary="Local-first image, audio, and corrupted-file forensics control plane",
         version=__version__,
         docs_url="/api/docs",
         redoc_url=None,
@@ -319,6 +333,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "formats": [
                 "PNG", "APNG", "JPEG", "MPO", "BMP", "GIF", "WebP", "TIFF", "BigTIFF", "ICO", "CUR",
                 "WAV", "AIFF", "FLAC", "Ogg", "Opus", "MP3", "AAC", "M4A", "AU", "WMA", "AMR", "CAF", "MIDI",
+                "PDF", "ZIP", "Gzip", "Bzip2", "XZ", "Text", "Unknown binary",
             ],
             "analysis_categories": [
                 "identity",
@@ -338,6 +353,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "audio-signal",
                 "audio-decoding",
                 "audio-sstv",
+                "file-recovery",
             ],
             "exports": ["json", "html", "zip"],
             "tools": tools,
@@ -350,10 +366,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 {"id": "audio-spectrogram", "name": "Built-in STFT spectrogram", "category": "audio-spectrum", "available": True, "formats": ["wav"]},
                 {"id": "audio-pcm-lsb", "name": "PCM sample bit extraction", "category": "steganography", "available": True, "formats": ["wav"]},
                 {"id": "audio-signal-decoders", "name": "DTMF and Morse decoders", "category": "audio-decoding", "available": True, "formats": ["wav"]},
-                {"id": "audio-sstv", "name": "RX-SSTV-compatible tone scan", "category": "audio-sstv", "available": True, "formats": ["wav"]},
+                {"id": "audio-sstv", "name": "RX-SSTV-compatible VIS image decoder", "category": "audio-sstv", "available": True, "formats": ["wav"]},
                 {"id": "audio-audacity", "name": "Audacity review bundle", "category": "audio", "available": True, "formats": ["wav"]},
-                {"id": "pdfinfo", "name": "pdfinfo", "category": "document", "available": False, "formats": ["document section"]},
-                {"id": "pdfid", "name": "PDFiD", "category": "document", "available": False, "formats": ["document section"]},
             ],
             "option_defaults": {
                 profile.value: AnalysisOptions.for_profile(profile).model_dump()
@@ -755,6 +769,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     search=search,
                     search_mode=search_mode,
                     include_anomalies=include_anomalies,
+                    filename=str(artifact.get("name") or ""),
+                    declared_media_type=str(artifact.get("media_type") or ""),
                 )
             )
         except ValueError as exc:
@@ -769,6 +785,204 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ) from exc
         payload["artifact"] = artifact_public_record(artifact)
         return payload
+
+    def resolve_hex_artifact(identifier: str, artifact_id: str | None, storage: Storage) -> dict[str, Any]:
+        """Resolve a requested artifact while keeping path selection server-side."""
+
+        if artifact_id is None:
+            artifacts = storage.list_artifacts(identifier)
+            artifact = next((item for item in artifacts if item.get("kind") == "original"), None)
+            if artifact is None:
+                raise _not_found("Source artifact")
+            return artifact
+        artifact = storage.get_artifact(identifier, str(artifact_id))
+        if artifact is None:
+            raise _not_found("Artifact")
+        return artifact
+
+    def validate_hex_request(
+        request_model: HexEditRequest,
+        *,
+        request: Request,
+        identifier: str,
+        storage: Storage,
+    ) -> tuple[dict[str, Any], Path, list[dict[str, int]]]:
+        artifact = resolve_hex_artifact(identifier, request_model.artifact_id, storage)
+        source_sha = str(artifact.get("sha256") or "").lower()
+        if request_model.base_sha256 != source_sha:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "stale_artifact",
+                    "message": "This artifact changed since the editor loaded it. Refresh the artifact before applying edits.",
+                },
+            )
+        path = _artifact_path(_settings(request), identifier, artifact)
+        try:
+            normalized = normalize_edits(
+                [item.model_dump() for item in request_model.edits],
+                path.stat().st_size,
+            )
+        except (HexEditError, OSError) as exc:
+            if isinstance(exc, OSError):
+                raise HTTPException(
+                    status_code=410,
+                    detail={"code": "artifact_unavailable", "message": "This artifact is no longer available on disk."},
+                ) from exc
+            raise HTTPException(status_code=422, detail={"code": "invalid_hex_edits", "message": str(exc)}) from exc
+        return artifact, path, normalized
+
+    @application.post("/api/jobs/{job_id}/hex/analyze")
+    async def analyze_hex_edits(request: Request, job_id: UUID, payload: HexEditRequest) -> dict[str, Any]:
+        """Analyze a sparse edited copy in memory; no temporary artifact is persisted."""
+
+        identifier = str(job_id)
+        storage = _storage(request)
+        _get_job_or_404(storage, identifier)
+        artifact, path, normalized = validate_hex_request(payload, request=request, identifier=identifier, storage=storage)
+        try:
+            result = await anyio.to_thread.run_sync(
+                partial(
+                    analyze_edited_file,
+                    path,
+                    normalized,
+                    filename=str(artifact.get("name") or ""),
+                    declared_media_type=str(artifact.get("media_type") or ""),
+                    revision=payload.revision,
+                )
+            )
+        except LiveEditTooLargeError as exc:
+            raise HTTPException(status_code=413, detail={"code": "live_edit_limit", "message": str(exc)}) from exc
+        except (HexEditError, OSError) as exc:
+            raise HTTPException(status_code=422, detail={"code": "invalid_hex_edits", "message": str(exc)}) from exc
+        result["artifact"] = artifact_public_record(artifact)
+        result["original_sha256"] = str(artifact.get("sha256") or "")
+        return result
+
+    @application.post("/api/jobs/{job_id}/hex/preview")
+    async def preview_hex_edits(request: Request, job_id: UUID, payload: HexEditRequest) -> Response:
+        """Render edited bytes directly to a browser-safe response without saving them."""
+
+        identifier = str(job_id)
+        storage = _storage(request)
+        _get_job_or_404(storage, identifier)
+        artifact, path, normalized = validate_hex_request(payload, request=request, identifier=identifier, storage=storage)
+        try:
+            rendered, media_type, _kind = await anyio.to_thread.run_sync(partial(render_edited_preview, path, normalized))
+        except LiveEditTooLargeError as exc:
+            raise HTTPException(status_code=413, detail={"code": "live_edit_limit", "message": str(exc)}) from exc
+        except PreviewUnavailableError as exc:
+            raise HTTPException(status_code=415, detail={"code": "preview_unavailable", "message": str(exc)}) from exc
+        except (HexEditError, OSError) as exc:
+            raise HTTPException(status_code=422, detail={"code": "invalid_hex_edits", "message": str(exc)}) from exc
+        return Response(
+            rendered,
+            media_type=media_type,
+            headers={
+                "Cache-Control": "no-store, max-age=0",
+                "X-Hex-Revision": str(payload.revision),
+                "X-Hex-Source-SHA256": str(artifact.get("sha256") or ""),
+                "Content-Security-Policy": "default-src 'none'; sandbox; frame-ancestors 'none'",
+            },
+        )
+
+    @application.post("/api/jobs/{job_id}/hex/save")
+    async def save_hex_edits(request: Request, job_id: UUID, payload: HexSaveRequest) -> dict[str, Any]:
+        """Persist a sparse edit as a new child artifact using an atomic write."""
+
+        identifier = str(job_id)
+        storage = _storage(request)
+        job = _get_job_or_404(storage, identifier)
+        if str(job.get("status")) not in TERMINAL_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "job_active", "message": "Wait for the analysis to finish before saving a derived hex artifact."},
+            )
+        lock_map: dict[str, asyncio.Lock] = getattr(request.app.state, "hex_edit_locks", {})
+        lock = lock_map.setdefault(identifier, asyncio.Lock())
+        async with lock:
+            artifact, source_path, normalized = validate_hex_request(payload, request=request, identifier=identifier, storage=storage)
+            artifacts = await anyio.to_thread.run_sync(storage.list_artifacts, identifier)
+            if len(artifacts) >= _settings(request).max_artifacts:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "artifact_limit", "message": "This job has reached its derived-artifact limit."},
+                )
+            configured_settings = _settings(request)
+            job_dir = resolve_under(configured_settings.jobs_dir, identifier, must_exist=True)
+            edit_dir = resolve_under(job_dir, "output", "hex-edits", must_exist=False)
+            edit_dir.mkdir(parents=True, exist_ok=True)
+            source_name = normalize_display_filename(str(artifact.get("name") or "source.bin"), fallback="source.bin")
+            requested_name = normalize_display_filename(payload.name, fallback="") if payload.name else ""
+            if not requested_name:
+                stem = Path(source_name).stem or "source"
+                suffix = Path(source_name).suffix or ".bin"
+                requested_name = f"{stem}-edited{suffix}"
+            # The random server prefix prevents path collisions while the
+            # display name remains useful in the artifact list.
+            destination_name = f"{uuid4().hex}-{requested_name}"
+            destination = resolve_under(job_dir, "output", "hex-edits", destination_name, must_exist=False)
+            temporary = resolve_under(job_dir, "output", "hex-edits", f".{uuid4().hex}.tmp", must_exist=False)
+            try:
+                written = await anyio.to_thread.run_sync(partial(write_edited_copy, source_path, temporary, normalized))
+                if not written["changed_count"]:
+                    temporary.unlink(missing_ok=True)
+                    raise HTTPException(status_code=422, detail={"code": "no_effective_edits", "message": "Every submitted byte already had that value."})
+                await anyio.to_thread.run_sync(partial(os.replace, temporary, destination))
+                media_type, sniff_previewable = await anyio.to_thread.run_sync(sniff_media_type, destination)
+                relative_path = destination.relative_to(job_dir).as_posix()
+                record = {
+                    "id": str(uuid4()),
+                    "job_id": identifier,
+                    "parent_id": str(artifact["id"]),
+                    "name": requested_name,
+                    "kind": "hex-edit",
+                    "relative_path": relative_path,
+                    "media_type": media_type,
+                    "size_bytes": int(written["size_bytes"]),
+                    "sha256": written["sha256"],
+                    "previewable": bool(sniff_previewable),
+                    "metadata": {
+                        "immutable_derived": True,
+                        "producer": "hex-editor",
+                        "transformation": "sparse byte overwrite",
+                        "source_artifact_id": str(artifact["id"]),
+                        "source_sha256": str(artifact.get("sha256") or ""),
+                        "edit_count": len(normalized),
+                        "changed_count": int(written["changed_count"]),
+                        "patch_sha256": patch_digest(normalized),
+                        "edited_offsets": [item["offset"] for item in normalized[:512]],
+                    },
+                }
+                stored = await anyio.to_thread.run_sync(storage.upsert_artifact, record)
+                try:
+                    await anyio.to_thread.run_sync(
+                        storage.append_event,
+                        identifier,
+                        "artifact",
+                        {"artifact_id": stored["id"], "name": stored["name"], "message": "Saved a new derived artifact from Hex editor edits."},
+                    )
+                except Exception:
+                    # The artifact and its bytes are already a consistent
+                    # pair; an event-log failure must not delete the indexed
+                    # file and leave a dangling database row.
+                    logger.warning("Unable to append hex artifact event for job %s", identifier, exc_info=True)
+            except HTTPException:
+                temporary.unlink(missing_ok=True)
+                destination.unlink(missing_ok=True)
+                raise
+            except (HexEditError, OSError, ValueError) as exc:
+                temporary.unlink(missing_ok=True)
+                destination.unlink(missing_ok=True)
+                raise HTTPException(status_code=422, detail={"code": "hex_save_failed", "message": str(exc)}) from exc
+            except Exception as exc:
+                # If indexing fails after the atomic move, remove the derived
+                # bytes as well so the filesystem and SQLite cannot diverge.
+                temporary.unlink(missing_ok=True)
+                destination.unlink(missing_ok=True)
+                logger.exception("Unable to persist hex-derived artifact for job %s", identifier)
+                raise HTTPException(status_code=500, detail={"code": "hex_save_failed", "message": "The derived artifact could not be indexed."}) from exc
+            return {"artifact": artifact_public_record(stored), "source_sha256": str(artifact.get("sha256") or "")}
 
     async def export_context(request: Request, job_id: UUID) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
         identifier = str(job_id)

@@ -16,6 +16,8 @@ def test_hex_view_returns_window_matches_and_anomalies(tmp_path: Path) -> None:
     assert payload["total_size"] == path.stat().st_size
     assert payload["length"] == 64
     assert payload["rows"][0]["offset"] == 0
+    assert payload["rows"][0]["bytes"] == list(path.read_bytes()[:16])
+    assert "integrity" in payload
     assert payload["matches"][0]["offset"] == 7
     assert any(item["kind"] == "long-zero-run" for item in payload["anomalies"])
     assert any(item["kind"] == "embedded-signature" and item["offset"] > 0 for item in payload["anomalies"])

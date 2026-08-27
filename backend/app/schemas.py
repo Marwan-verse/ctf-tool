@@ -43,10 +43,13 @@ class AnalysisOptions(BaseModel):
     repairs: bool = True
     external_tools: bool = True
     external_extraction: bool = True
-    evidence_type: Literal["auto", "image", "audio"] = "auto"
+    evidence_type: Literal["auto", "image", "audio", "corrupted"] = "auto"
     audio_spectrogram: bool = True
     audio_signal_decoders: bool = True
     audio_sstv: bool = True
+    audio_sstv_mode: Literal["auto", "robot36", "robot72", "martin1", "martin2", "scottie1", "scottie2", "scottiedx", "pd120", "pd180", "pd240"] = "auto"
+    audio_sstv_max_images: int = Field(default=2, ge=1, le=4)
+    audio_sstv_slant_correction: bool = True
     audio_channel_exports: bool = True
     audio_audacity_bundle: bool = True
     audio_analysis_seconds: int = Field(default=180, ge=15, le=300)
@@ -85,6 +88,7 @@ class AnalysisOptions(BaseModel):
             audio_analysis_seconds={"quick": 60, "balanced": 180, "deep": 300}.get(profile_name, 180),
             audio_spectrogram_fft={"quick": 1024, "balanced": 2048, "deep": 4096}.get(profile_name, 2048),
             audio_lsb_bits={"quick": 1, "balanced": 2, "deep": 4}.get(profile_name, 2),
+            audio_sstv_max_images={"quick": 1, "balanced": 2, "deep": 4}.get(profile_name, 2),
         )
 
     @field_validator("selected_external_tools")
@@ -200,6 +204,40 @@ class ToolInstallRequest(BaseModel):
         if not normalized:
             raise ValueError("At least one tool identifier is required.")
         return normalized
+
+
+class HexByteEdit(BaseModel):
+    """One fixed-size byte replacement in the immutable source."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    offset: int = Field(ge=0, le=1_000_000_000_000)
+    value: int = Field(ge=0, le=255)
+
+
+class HexEditRequest(BaseModel):
+    """Bounded sparse edits used by live validation and preview."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    # Keep this as a string because strict Pydantic UUID fields reject the
+    # JSON string representation browsers send. The route still resolves it
+    # against the job's artifact table before touching any path.
+    artifact_id: str | None = Field(
+        default=None,
+        min_length=36,
+        max_length=36,
+        pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
+    )
+    base_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    revision: int = Field(default=0, ge=0, le=1_000_000_000)
+    edits: list[HexByteEdit] = Field(min_length=1, max_length=4096)
+
+
+class HexSaveRequest(HexEditRequest):
+    """Save edits as a new derived artifact; the source is never overwritten."""
+
+    name: str | None = Field(default=None, max_length=180)
 
 
 class MessageResponse(BaseModel):

@@ -14,10 +14,12 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from .common import display_text, normalize_json, utc_now
+from .sstv import decode_sstv
 
 
 AUDIO_KINDS = frozenset({"audio", "wav", "aiff", "flac", "ogg", "mp3", "aac", "m4a", "au", "asf", "amr", "caf", "midi"})
 MAX_DECODE_FRAMES = 5_000_000
+MAX_SSTV_SOURCE_FRAMES = 15_000_000
 MAX_LSB_BYTES = 8 * 1024 * 1024
 _DTMF_ROWS = (697.0, 770.0, 852.0, 941.0)
 _DTMF_COLUMNS = (1209.0, 1336.0, 1477.0, 1633.0)
@@ -118,6 +120,9 @@ def analyze_audio(
     fft_size: int,
     channel_mode: str,
     lsb_bits: int,
+    sstv_mode: str = "auto",
+    sstv_max_images: int = 2,
+    sstv_slant_correction: bool = True,
 ) -> dict[str, Any]:
     """Analyze PCM WAV directly and describe other containers for external decoding."""
 
@@ -243,7 +248,37 @@ def analyze_audio(
         signals["dtmf"] = _decode_dtmf(selected, sample_rate)
         signals["morse"] = _decode_morse(selected, sample_rate)
     if sstv_enabled:
-        signals["sstv"] = _detect_sstv(selected, sample_rate)
+        sstv_samples = selected
+        sstv_sample_rate = sample_rate
+        if len(samples) < total_frames and analysis_seconds > analyzed_duration:
+            try:
+                extended = _read_sstv_pcm(path, analysis_seconds=analysis_seconds, channel_mode=channel_mode)
+            except (EOFError, OSError, ValueError, wave.Error):
+                extended = None
+            if extended is not None:
+                sstv_samples, sstv_sample_rate = extended
+        sstv_result = decode_sstv(
+            sstv_samples,
+            sstv_sample_rate,
+            mode_name=sstv_mode,
+            max_images=sstv_max_images,
+            slant_correction=sstv_slant_correction,
+        )
+        sstv_result["analyzed_seconds"] = round(len(sstv_samples) / sstv_sample_rate, 5)
+        sstv_result["streaming_downsample"] = sstv_sample_rate != sample_rate
+        decoded_images = list(sstv_result.pop("images", []))
+        signals["sstv"] = sstv_result
+        for decoded_image in decoded_images:
+            result["visuals"].append({
+                "label": decoded_image["label"],
+                "title": decoded_image["title"],
+                "data": decoded_image["data"],
+                "producer": "built-in-sstv",
+                "transformation": "decode SSTV frequency-modulated scan lines into RGB pixels",
+                "parameters": decoded_image.get("parameters", {}),
+                "width": decoded_image.get("width"),
+                "height": decoded_image.get("height"),
+            })
     result["signals"] = normalize_json(signals)
 
     labels: list[tuple[float, float, str]] = []
@@ -274,10 +309,19 @@ def analyze_audio(
         decoded = str(signals["morse"]["text"])
         result["findings"].append(_finding("info", "audio-decoding", "Morse-like keying detected", f"Decoded tentative Morse text: {decoded}", text=decoded, pattern=signals["morse"].get("pattern")))
         result["text_records"].append({"source": "audio:morse", "offset": None, "text": decoded, "confidence_hint": 6})
-    if signals["sstv"].get("candidate"):
+    if signals["sstv"].get("images_decoded"):
+        modes = ", ".join(str(mode) for mode in signals["sstv"].get("decoded_modes", []))
+        result["findings"].append(_finding(
+            "high", "audio-sstv", "SSTV image recovered",
+            f"Decoded {signals['sstv']['images_decoded']} SSTV image(s) from the audio signal ({modes or 'mode unavailable'}).",
+            images_decoded=signals["sstv"]["images_decoded"],
+            decoded_modes=signals["sstv"].get("decoded_modes", []),
+            headers=signals["sstv"].get("headers", []),
+        ))
+    elif signals["sstv"].get("candidate"):
         result["findings"].append(_finding(
             "warning", "audio-sstv", "Possible SSTV transmission",
-            "1900 Hz leader energy and 1200 Hz sync pulses resemble an SSTV preamble. Review the spectrogram or decoder-ready WAV.",
+            "SSTV leader, sync, or VIS evidence was detected, but a complete image was not recovered. Try a manual mode or a longer analysis duration.",
             **signals["sstv"],
         ))
     if float(signals["ultrasonic_energy_ratio"]) >= 0.03:
@@ -375,6 +419,48 @@ def _decode_pcm(frames: bytes, sample_width: int, channels: int) -> tuple[np.nda
     if raw.size == 0:
         raise ValueError("No complete PCM frames were available.")
     return normalized.reshape(-1, channels), integer.reshape(-1, channels), bit_depth
+
+
+def _read_sstv_pcm(path: Path, *, analysis_seconds: int, channel_mode: str) -> tuple[np.ndarray, int] | None:
+    """Read a long WAV as bounded mono chunks and decimate for SSTV timing.
+
+    General audio statistics retain the stricter in-memory frame ceiling. SSTV
+    modes can last almost five minutes, so this path keeps only one selected
+    channel at no more than 16 kHz while reading at most 15 million frames.
+    """
+
+    parts: list[np.ndarray] = []
+    with wave.open(str(path), "rb") as source:
+        channels = source.getnchannels()
+        sample_width = source.getsampwidth()
+        sample_rate = source.getframerate()
+        total_frames = source.getnframes()
+        if channels < 1 or channels > 32 or sample_rate < 6_000 or sample_rate > 768_000:
+            return None
+        frame_limit = min(total_frames, sample_rate * max(15, min(300, int(analysis_seconds))), MAX_SSTV_SOURCE_FRAMES)
+        stride = max(1, math.ceil(sample_rate / 16_000))
+        retained_rate = round(sample_rate / stride)
+        frame_offset = 0
+        remaining = frame_limit
+        while remaining > 0:
+            requested = min(262_144, remaining)
+            frames = source.readframes(requested)
+            if not frames:
+                break
+            decoded, _integer, _bit_depth = _decode_pcm(frames, sample_width, channels)
+            start = (-frame_offset) % stride
+            parts.append(_select_channel(decoded, channel_mode)[start::stride].astype(np.float32, copy=True))
+            consumed = len(decoded)
+            frame_offset += consumed
+            remaining -= consumed
+            if consumed < requested:
+                break
+    if not parts:
+        return None
+    retained = np.concatenate(parts)
+    if retained.size > MAX_SSTV_SOURCE_FRAMES:
+        retained = retained[:MAX_SSTV_SOURCE_FRAMES]
+    return retained, retained_rate
 
 
 def _select_channel(samples: np.ndarray, mode: str) -> np.ndarray:
@@ -635,36 +721,6 @@ def _decode_morse(samples: np.ndarray, sample_rate: int) -> dict[str, Any]:
     return {"text": display_text(decoded, 500), "pattern": display_text(pattern, 1000), "events": events[:200]}
 
 
-def _detect_sstv(samples: np.ndarray, sample_rate: int) -> dict[str, Any]:
-    window = max(128, int(sample_rate * 0.02))
-    hop = window
-    indices = np.arange(window, dtype=np.float64)
-    kernels = np.exp(-2j * np.pi * np.asarray([1900.0, 1200.0])[:, None] * indices[None, :] / sample_rate)
-    leader_frames = sync_frames = 0
-    candidate_offsets: list[float] = []
-    for start in range(0, max(0, len(samples) - window + 1), hop):
-        segment = samples[start:start + window]
-        rms = float(np.sqrt(np.mean(np.square(segment, dtype=np.float64))))
-        if rms < 0.008:
-            continue
-        amplitudes = 2.0 * np.abs(kernels @ segment) / window
-        leader, sync = float(amplitudes[0]), float(amplitudes[1])
-        if leader > 0.035 and leader > sync * 1.35:
-            leader_frames += 1
-        if sync > 0.035 and sync > leader * 1.25:
-            sync_frames += 1
-            if len(candidate_offsets) < 40:
-                candidate_offsets.append(round(start / sample_rate, 4))
-    candidate = leader_frames >= 10 and sync_frames >= 2
-    return {
-        "candidate": candidate,
-        "leader_frames": leader_frames,
-        "sync_frames": sync_frames,
-        "sync_offsets_seconds": candidate_offsets,
-        "method": "20 ms 1900 Hz leader / 1200 Hz sync energy scan",
-    }
-
-
 def _ultrasonic_ratio(samples: np.ndarray, sample_rate: int) -> float:
     if sample_rate < 38_000 or samples.size < 1024:
         return 0.0
@@ -734,7 +790,7 @@ def _submethods_without_pcm(spectrogram: bool, decoders: bool, sstv: bool, chann
         _method("audio-waveform", "PCM waveform and statistics", "audio", "skipped", "Direct PCM decoding is currently available for WAV input; FFmpeg/SoX can decode other formats."),
         _method("audio-spectrogram", "Spectrogram renderer", "audio-spectrum", "skipped", "A decoded PCM stream is required." if spectrogram else "Spectrogram generation was disabled."),
         _method("audio-signal-decoders", "DTMF and Morse signal decoders", "audio-decoding", "skipped", "A decoded PCM stream is required." if decoders else "Signal decoders were disabled."),
-        _method("audio-sstv", "RX-SSTV-compatible tone scan", "audio-sstv", "skipped", "A decoded PCM stream is required." if sstv else "SSTV detection was disabled."),
+        _method("audio-sstv", "RX-SSTV-compatible image decoder", "audio-sstv", "skipped", "A decoded PCM stream is required." if sstv else "SSTV decoding was disabled."),
         _method("audio-pcm-lsb", "PCM least-significant-bit extraction", "steganography", "skipped", "A decoded integer PCM stream is required." if lsb else "PCM LSB extraction was disabled."),
         _method("audio-channel-exports", "Channel isolation exports", "audio", "skipped", "A decoded PCM stream is required." if channels else "Channel exports were disabled."),
         _method("audio-audacity", "Audacity review bundle", "audio", "skipped", "A decoded PCM stream is required." if audacity else "Audacity-compatible exports were disabled."),
@@ -747,7 +803,15 @@ def _submethods_with_pcm(result: dict[str, Any], spectrogram: bool, decoders: bo
         _method("audio-waveform", "PCM waveform and statistics", "audio", "completed", "Decoded PCM statistics and a bounded waveform overview."),
         _method("audio-spectrogram", "Spectrogram renderer", "audio-spectrum", "completed" if spectrogram else "skipped", "Rendered a bounded STFT spectrogram." if spectrogram else "Spectrogram generation was disabled."),
         _method("audio-signal-decoders", "DTMF and Morse signal decoders", "audio-decoding", "completed" if decoders else "skipped", f"Decoded {len(signals['dtmf'].get('events', []))} DTMF event(s); Morse output: {signals['morse'].get('text') or 'none'}." if decoders else "Signal decoders were disabled.", {"dtmf": signals["dtmf"], "morse": signals["morse"]}),
-        _method("audio-sstv", "RX-SSTV-compatible tone scan", "audio-sstv", "completed" if sstv else "skipped", "Possible SSTV preamble detected." if signals["sstv"].get("candidate") else ("No SSTV-like leader/sync pattern was detected." if sstv else "SSTV detection was disabled."), signals["sstv"]),
+        _method(
+            "audio-sstv", "RX-SSTV-compatible image decoder", "audio-sstv", "completed" if sstv else "skipped",
+            (
+                f"Recovered {signals['sstv'].get('images_decoded', 0)} SSTV image(s): {', '.join(signals['sstv'].get('decoded_modes', []))}."
+                if signals["sstv"].get("images_decoded")
+                else ("SSTV signal evidence was detected, but no complete image was recovered." if signals["sstv"].get("candidate") else ("No SSTV-like VIS/leader/sync pattern was detected." if sstv else "SSTV decoding was disabled."))
+            ),
+            signals["sstv"],
+        ),
         _method("audio-pcm-lsb", "PCM least-significant-bit extraction", "steganography", "completed" if lsb else "skipped", f"Extracted {len(result['stego_streams'])} bounded PCM bit-plane stream(s)." if lsb else "PCM LSB extraction was disabled."),
         _method("audio-channel-exports", "Channel isolation exports", "audio", "completed" if channels else "skipped", "Exported mono, channel, and stereo-difference review WAVs." if channels else "Channel exports were disabled."),
         _method("audio-audacity", "Audacity review bundle", "audio", "completed" if audacity else "skipped", "Created normalized/reversed PCM WAVs and an Audacity-compatible label track." if audacity else "Audacity-compatible exports were disabled."),
