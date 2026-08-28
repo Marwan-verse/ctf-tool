@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import binascii
 import io
 import struct
 import zipfile
@@ -61,6 +62,34 @@ def test_corrupted_png_signature_and_ihdr_length_get_a_provenance_candidate(meta
     assert candidate["data"][8:12] == b"\x00\x00\x00\r"
     assert parse_png(candidate["data"], profile="quick")["properties"]["width"] == 8
     assert candidate["details"] == {"signature_repaired": True, "ihdr_length_repaired": True}
+
+
+def test_multi_stage_corrupted_png_is_recovered_from_crc_and_boundaries(clean_png: Path) -> None:
+    original = clean_png.read_bytes()
+    phys_payload = b"\x00\x00\x0b\x13\x00\x00\x0b\x13\x01"
+    phys = struct.pack(">I", len(phys_payload)) + b"pHYs" + phys_payload
+    phys += struct.pack(">I", binascii.crc32(b"pHYs" + phys_payload) & 0xFFFFFFFF)
+    clean = original[:33] + phys + original[33:]
+    first_idat = 33 + len(phys)
+    corrupted = bytearray(clean)
+    corrupted[:8] = b"\x89eN4\r\n\xb0\xaa"
+    corrupted[12:16] = b'C"DR'
+    corrupted[41] = 0xAA  # pHYs byte; its original CRC remains as evidence.
+    corrupted[first_idat:first_idat + 4] = b"\xAA\xAA\xFF\xA5"
+    corrupted[first_idat + 4:first_idat + 8] = b"\xABDET"
+
+    [candidate] = propose_header_repairs(bytes(corrupted), profile="deep")
+
+    assert candidate["label"] == "png_structure_recovered"
+    assert candidate["data"] == clean
+    details = candidate["details"]
+    assert details["signature_repaired"] is True
+    assert details["ihdr_type_repaired"] is True
+    assert details["ancillary_byte_repairs"] == [{"chunk": "pHYs", "offset": 41, "from": "aa", "to": "00"}]
+    assert details["inferred_chunks"][0]["type"] == "IDAT"
+    repaired = parse_png(candidate["data"], profile="quick")
+    assert repaired["properties"]["bad_crc_count"] == 0
+    assert repaired["properties"]["iend_present"] is True
 
 
 def test_corrupted_jpeg_soi_with_jfif_evidence_gets_a_candidate() -> None:

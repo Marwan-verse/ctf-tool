@@ -38,7 +38,7 @@ from .analyzers.formats import analyze_format, propose_header_repairs
 from .analyzers.visual import analyze_visual
 
 
-SUPPORTED_IMAGE_FORMATS = ["PNG/APNG", "JPEG/MPO", "GIF", "BMP", "WebP", "TIFF/BigTIFF", "ICO/CUR"]
+SUPPORTED_IMAGE_FORMATS = ["PNG/APNG", "JPEG/MPO", "GIF", "BMP", "WebP", "SVG text", "TIFF/BigTIFF", "ICO/CUR"]
 SUPPORTED_AUDIO_FORMATS = ["WAV/PCM", "AIFF/AIFC", "FLAC", "Ogg/Opus", "MP3", "AAC/M4A", "AU", "WMA/ASF", "AMR", "CAF", "MIDI"]
 
 
@@ -317,9 +317,11 @@ class AnalysisEngine:
             core_details = inspect_bytes(source_data, max_strings=limits["max_strings"])
             collector.scan_bytes(source_data, source_artifact_id=source_id, method="raw-bytes")
             for record in core_details["strings"]:
+                record_method = _text_method(record.get("source", "")) if str(record.get("encoding", "")).startswith("svg-") else f"strings:{record['encoding']}"
                 collector.scan_text(
-                    record["text"], source_artifact_id=source_id, method=f"strings:{record['encoding']}",
-                    offset=record["offset"], confidence_hint=3,
+                    record["text"], source_artifact_id=source_id, method=record_method,
+                    offset=record["offset"], transform_chain=record.get("transform_chain"),
+                    confidence_hint=int(record.get("confidence_hint", 3)),
                 )
             all_string_seeds.extend(core_details["strings"])
             methods.append({
@@ -1573,13 +1575,15 @@ def _public_method(method: dict[str, Any]) -> dict[str, Any]:
 def _kind_from_extension(extension: str) -> str | None:
     return {
         ".png": "png", ".apng": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".jpe": "jpeg", ".mpo": "jpeg",
-        ".gif": "gif", ".bmp": "bmp", ".dib": "bmp", ".webp": "webp",
+        ".gif": "gif", ".bmp": "bmp", ".dib": "bmp", ".webp": "webp", ".svg": "svg",
         ".tif": "tiff", ".tiff": "tiff", ".ico": "ico", ".cur": "ico",
     }.get(extension)
 
 
 def _text_method(source: str) -> str:
     lowered = source.lower()
+    if "svg" in lowered:
+        return "svg-text"
     if "barcode" in lowered or "qr" in lowered:
         return "barcode"
     if "ocr" in lowered:

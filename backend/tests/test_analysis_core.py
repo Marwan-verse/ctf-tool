@@ -4,6 +4,7 @@ import base64
 import zlib
 
 from app.analyzers.core import BoundedDecoder, CandidateCollector, inspect_bytes
+from app.analyzers.common import sniff_kind
 
 
 def test_candidate_collector_prefers_configured_prefix_and_deduplicates() -> None:
@@ -74,3 +75,23 @@ def test_svg_text_nodes_are_concatenated_for_flag_scanning() -> None:
 
     joined = [record for record in report["strings"] if record["encoding"] == "svg-text-joined"]
     assert joined and joined[0]["text"] == "flag{svg_nodes}"
+
+
+def test_svg_tspans_with_character_spacing_are_compacted_safely() -> None:
+    fragments = ["p ", "i ", "c ", "o ", "C ", "T ", "F { 3 n h 4 n ", "c 3 d _ t e s t }"]
+    svg = (
+        b"<?xml version='1.0'?><svg xmlns='http://www.w3.org/2000/svg'><text>"
+        + b"".join(f"<tspan>{fragment}</tspan>".encode("ascii") for fragment in fragments)
+        + b"</text><text>ordinary SVG prose stays spaced</text></svg>"
+    )
+
+    report = inspect_bytes(svg, max_strings=100)
+    compact = [record for record in report["strings"] if record["encoding"] == "svg-text-compact"]
+
+    assert sniff_kind(svg, "drawing.svg") == "svg"
+    assert len(compact) == 1
+    assert compact[0]["text"] == "picoCTF{3nh4nc3d_test}"
+    assert compact[0]["transform_chain"] == [
+        "extract ordered SVG text from 8 fragment(s)",
+        "remove whitespace separators",
+    ]

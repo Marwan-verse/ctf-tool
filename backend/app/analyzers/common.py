@@ -185,12 +185,15 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "zstd"
     if data.startswith(b"%PDF-"):
         return "pdf"
+    markup_head = data[:8192].lstrip(b"\xef\xbb\xbf\x00\t\r\n ").lower()
+    if b"<svg" in markup_head and (markup_head.startswith((b"<svg", b"<?xml", b"<!--"))):
+        return "svg"
     if data and _looks_textual(data[:8192]):
         return "text"
     extension = Path(filename).suffix.lower()
     return {
         ".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".jpe": "jpeg",
-        ".gif": "gif", ".bmp": "bmp", ".webp": "webp",
+        ".gif": "gif", ".bmp": "bmp", ".webp": "webp", ".svg": "svg",
         ".tif": "tiff", ".tiff": "tiff", ".ico": "ico", ".cur": "ico",
         ".wav": "wav", ".wave": "wav", ".aif": "aiff", ".aiff": "aiff", ".aifc": "aiff",
         ".flac": "flac", ".ogg": "ogg", ".oga": "ogg", ".opus": "ogg",
@@ -207,7 +210,7 @@ def mime_for(kind: str, filename: str = "") -> str:
 def extension_for(kind: str) -> str:
     return {
         "png": ".png", "jpeg": ".jpg", "gif": ".gif", "bmp": ".bmp",
-        "webp": ".webp", "tiff": ".tiff", "ico": ".ico", "zip": ".zip",
+        "webp": ".webp", "svg": ".svg", "tiff": ".tiff", "ico": ".ico", "zip": ".zip",
         "wav": ".wav", "aiff": ".aiff", "flac": ".flac", "ogg": ".ogg",
         "mp3": ".mp3", "aac": ".aac", "m4a": ".m4a", "au": ".au",
         "asf": ".wma", "amr": ".amr", "caf": ".caf", "midi": ".mid",

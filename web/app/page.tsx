@@ -369,8 +369,8 @@ const SECTION_COPY: Record<EvidenceSection, {
 }> = {
   image: {
     label: 'Image', symbol: '◫', setupEyebrow: 'Image forensics', headline: 'Find what the pixels are hiding.',
-    dropTitle: 'Drop an image here', formatCopy: 'PNG, JPEG, GIF, BMP, WebP, TIFF or ICO',
-    accept: '.png,.apng,.jpg,.jpeg,.gif,.bmp,.webp,.tif,.tiff,.ico,application/octet-stream',
+    dropTitle: 'Drop an image here', formatCopy: 'PNG, JPEG, GIF, BMP, WebP, SVG, TIFF or ICO',
+    accept: '.png,.apng,.jpg,.jpeg,.gif,.bmp,.webp,.svg,.tif,.tiff,.ico,image/svg+xml,application/octet-stream',
     analyzeLabel: 'Analyze image', selectedNote: 'Preview waits for the sandboxed safe renderer',
     passwordHint: 'Steghide automatically tries an empty passphrase when this is omitted; Stegseek and OutGuess use a supplied value for bounded extraction. Encrypted payload checks support OpenSSL salted AES and passphrase-based XOR.',
     resultEyebrow: 'Investigation complete', fallbackName: 'Image scan', settingsLabel: 'Image', toolLabel: 'Image',

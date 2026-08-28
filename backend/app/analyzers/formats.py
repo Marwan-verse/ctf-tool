@@ -55,6 +55,28 @@ def _finding(severity: str, category: str, title: str, description: str, **detai
     }
 
 
+_PNG_RECOVERY_CHUNK_LIMIT = 64 * 1024 * 1024
+_PNG_RECOVERY_ANCILLARY_LIMIT = 256
+
+
+def _plausible_png_ihdr_payload(payload: bytes) -> bool:
+    """Return whether a 13-byte PNG IHDR payload is structurally plausible."""
+
+    if len(payload) != 13:
+        return False
+    try:
+        width, height, bit_depth, color_type, compression, filtering, interlace = struct.unpack(">IIBBBBB", payload)
+    except struct.error:
+        return False
+    if not (1 <= width <= 100_000 and 1 <= height <= 100_000):
+        return False
+    if width * height > 256_000_000:
+        return False
+    if bit_depth not in {1, 2, 4, 8, 16} or color_type not in {0, 2, 3, 4, 6}:
+        return False
+    return compression == 0 and filtering == 0 and interlace in {0, 1}
+
+
 def _valid_png_ihdr(data: bytes) -> bool:
     """Return whether bytes at the canonical PNG IHDR location are plausible.
 
@@ -65,17 +87,7 @@ def _valid_png_ihdr(data: bytes) -> bool:
 
     if len(data) < 49 or data[12:16] != b"IHDR":
         return False
-    try:
-        width, height, bit_depth, color_type, compression, filtering, interlace = struct.unpack(">IIBBBBB", data[16:29])
-    except struct.error:
-        return False
-    if not (1 <= width <= 100_000 and 1 <= height <= 100_000):
-        return False
-    if width * height > 256_000_000:
-        return False
-    if bit_depth not in {1, 2, 4, 8, 16} or color_type not in {0, 2, 3, 4, 6}:
-        return False
-    if compression != 0 or filtering != 0 or interlace not in {0, 1}:
+    if not _plausible_png_ihdr_payload(data[16:29]):
         return False
     next_type = data[37:41]
     if len(next_type) != 4 or not all(byte in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" for byte in next_type):
@@ -84,6 +96,210 @@ def _valid_png_ihdr(data: bytes) -> bool:
     # complete next chunk gives us a strong anti-false-positive boundary.
     next_length = int.from_bytes(data[33:37], "big")
     return next_length <= 0x7FFFFFFF and 45 + next_length <= len(data)
+
+
+def _png_crc(raw_type: bytes, payload: bytes) -> int:
+    return binascii.crc32(raw_type + payload) & 0xFFFFFFFF
+
+
+def _png_chunk_layout_at(data: bytes, offset: int, *, max_length: int = _PNG_RECOVERY_CHUNK_LIMIT) -> tuple[int, bytes, int] | None:
+    """Read one bounded PNG chunk layout without trusting its CRC."""
+
+    if offset < 0 or offset + 12 > len(data):
+        return None
+    length = int.from_bytes(data[offset:offset + 4], "big")
+    raw_type = data[offset + 4:offset + 8]
+    if length > max_length or offset + 12 + length > len(data):
+        return None
+    if len(raw_type) != 4 or not all(byte in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" for byte in raw_type):
+        return None
+    payload_start = offset + 8
+    payload_end = payload_start + length
+    return payload_end + 4, raw_type, length
+
+
+def _valid_png_chunk_at(data: bytes, offset: int, *, max_length: int = _PNG_RECOVERY_CHUNK_LIMIT) -> tuple[int, bytes, int] | None:
+    """Validate one complete PNG chunk, including its CRC."""
+
+    parsed = _png_chunk_layout_at(data, offset, max_length=max_length)
+    if parsed is None:
+        return None
+    end, raw_type, length = parsed
+    payload_start = offset + 8
+    payload_end = payload_start + length
+    stored_crc = int.from_bytes(data[payload_end:payload_end + 4], "big")
+    return parsed if _png_crc(raw_type, data[payload_start:payload_end]) == stored_crc else None
+
+
+def _unique_single_byte_crc_repair(raw_type: bytes, payload: bytes, stored_crc: int) -> tuple[int, int, int] | None:
+    """Find a unique one-byte payload change proved by the stored CRC."""
+
+    if len(payload) > _PNG_RECOVERY_ANCILLARY_LIMIT:
+        return None
+    candidate: tuple[int, int, int] | None = None
+    mutable = bytearray(payload)
+    for index, original in enumerate(mutable):
+        for replacement in range(256):
+            if replacement == original:
+                continue
+            mutable[index] = replacement
+            if _png_crc(raw_type, bytes(mutable)) == stored_crc:
+                if candidate is not None:
+                    return None
+                candidate = (index, original, replacement)
+        mutable[index] = original
+    return candidate
+
+
+def _find_crc_proven_next_chunk(data: bytes, start: int) -> tuple[int, bytes, int] | None:
+    """Locate a nearby valid IDAT/IEND boundary without scanning arbitrary payloads."""
+
+    search_end = min(len(data), start + _PNG_RECOVERY_CHUNK_LIMIT + 12)
+    candidates: list[tuple[int, bytes, int]] = []
+    for marker in (b"IDAT", b"IEND"):
+        position = data.find(marker, start + 12, search_end)
+        while position >= 0:
+            offset = position - 4
+            parsed = _valid_png_chunk_at(data, offset)
+            if parsed is not None and parsed[1] == marker and offset >= start + 12:
+                candidates.append((offset, parsed[1], parsed[2]))
+                break
+            position = data.find(marker, position + 1, search_end)
+    return min(candidates, key=lambda item: item[0]) if candidates else None
+
+
+def _recover_corrupted_png_structure(data: bytes) -> dict[str, Any] | None:
+    """Recover a PNG whose chunk boundaries are damaged but CRCs remain usable.
+
+    The recovery is intentionally narrow: IHDR's CRC must prove the canonical
+    type, ancillary edits are limited to a unique one-byte CRC repair, and a
+    damaged image-data header must be bounded by a nearby CRC-valid chunk.
+    """
+
+    if len(data) < 45 or not _plausible_png_ihdr_payload(data[16:29]):
+        return None
+    if _png_crc(b"IHDR", data[16:29]) != int.from_bytes(data[29:33], "big"):
+        return None
+
+    fixed = bytearray(data)
+    signature_repaired = fixed[:8] != b"\x89PNG\r\n\x1a\n"
+    ihdr_type_repaired = fixed[12:16] != b"IHDR"
+    ihdr_length_repaired = fixed[8:12] != b"\x00\x00\x00\r"
+    if signature_repaired:
+        fixed[:8] = b"\x89PNG\r\n\x1a\n"
+    if ihdr_type_repaired:
+        fixed[12:16] = b"IHDR"
+    if ihdr_length_repaired:
+        fixed[8:12] = b"\x00\x00\x00\r"
+
+    cursor = 33
+    recovered_gap = False
+    ancillary_repairs: list[dict[str, Any]] = []
+    inferred_chunks: list[dict[str, Any]] = []
+    chunk_types: list[bytes] = [b"IHDR"]
+    while cursor + 12 <= len(data):
+        parsed = _png_chunk_layout_at(data, cursor)
+        if parsed is not None:
+            next_cursor, raw_type, length = parsed
+            payload_start = cursor + 8
+            payload_end = payload_start + length
+            stored_crc = int.from_bytes(data[payload_end:payload_end + 4], "big")
+            chunk_payload = data[payload_start:payload_end]
+            if _png_crc(raw_type, chunk_payload) != stored_crc:
+                # Only ancillary chunks are eligible for a byte-level repair;
+                # critical data must be recovered from a stronger boundary.
+                if not (raw_type[0] >= ord("a") and length <= _PNG_RECOVERY_ANCILLARY_LIMIT):
+                    return None
+                repair = _unique_single_byte_crc_repair(raw_type, chunk_payload, stored_crc)
+                if repair is None:
+                    return None
+                relative, original, replacement = repair
+                fixed[payload_start + relative] = replacement
+                ancillary_repairs.append({
+                    "chunk": raw_type.decode("ascii"),
+                    "offset": payload_start + relative,
+                    "from": f"{original:02x}",
+                    "to": f"{replacement:02x}",
+                })
+            chunk_types.append(raw_type)
+            cursor = next_cursor
+            if raw_type == b"IEND":
+                break
+            continue
+
+        if recovered_gap:
+            return None
+        data_start = cursor + 8
+        if data_start + 2 > len(data):
+            return None
+        cmf, flg = data[data_start:data_start + 2]
+        if (cmf & 0x0F) != 8 or (cmf << 8 | flg) % 31 != 0 or (flg & 0x20):
+            return None
+        next_chunk = _find_crc_proven_next_chunk(data, cursor)
+        if next_chunk is None:
+            return None
+        next_offset, next_type, _ = next_chunk
+        inferred_length = next_offset - cursor - 12
+        if inferred_length < 2 or inferred_length > _PNG_RECOVERY_CHUNK_LIMIT:
+            return None
+        inferred_payload = data[data_start:data_start + inferred_length]
+        stored_crc = int.from_bytes(data[data_start + inferred_length:data_start + inferred_length + 4], "big")
+        if _png_crc(b"IDAT", inferred_payload) != stored_crc:
+            return None
+        fixed[cursor:cursor + 4] = inferred_length.to_bytes(4, "big")
+        fixed[cursor + 4:cursor + 8] = b"IDAT"
+        inferred_chunks.append({
+            "offset": cursor,
+            "type": "IDAT",
+            "length": inferred_length,
+            "next_chunk_offset": next_offset,
+            "next_chunk_type": next_type.decode("ascii"),
+        })
+        chunk_types.append(b"IDAT")
+        recovered_gap = True
+        cursor = next_offset
+
+    # Leave the existing simple signature/length repair path responsible for
+    # that common case; this candidate is reserved for genuinely multi-stage
+    # corruption (a damaged type, CRC-proven payload edit, or broken boundary).
+    if not (ihdr_type_repaired or ancillary_repairs or inferred_chunks):
+        return None
+    if chunk_types.count(b"IHDR") != 1 or b"IDAT" not in chunk_types or b"IEND" not in chunk_types:
+        return None
+
+    repaired = bytes(fixed)
+    validation = parse_png(repaired, profile="quick")
+    properties = validation.get("properties", {})
+    if properties.get("bad_crc_count") != 0 or not properties.get("iend_present"):
+        return None
+    if any(finding.get("severity") == "error" for finding in validation.get("findings", [])):
+        return None
+    changes: list[str] = []
+    if signature_repaired:
+        changes.append("restore PNG signature")
+    if ihdr_type_repaired:
+        changes.append("restore CRC-proven IHDR chunk type")
+    if ihdr_length_repaired:
+        changes.append("restore canonical IHDR length")
+    if ancillary_repairs:
+        changes.append(f"repair {len(ancillary_repairs)} ancillary chunk byte using its stored CRC")
+    if inferred_chunks:
+        changes.append("infer CRC-proven IDAT boundary from the following valid chunk")
+    return {
+        "label": "png_structure_recovered",
+        "data": repaired,
+        "kind": "png",
+        "producer": "png-recovery",
+        "transformation": "; ".join(changes),
+        "reason": "PNG dimensions and IHDR CRC prove the header; ancillary-byte CRC evidence and a bounded zlib stream plus the next CRC-valid chunk prove the repaired image-data boundary.",
+        "details": {
+            "signature_repaired": signature_repaired,
+            "ihdr_type_repaired": ihdr_type_repaired,
+            "ihdr_length_repaired": ihdr_length_repaired,
+            "ancillary_byte_repairs": ancillary_repairs,
+            "inferred_chunks": inferred_chunks,
+        },
+    }
 
 
 def propose_header_repairs(data: bytes, *, profile: str = "balanced") -> list[dict[str, Any]]:
@@ -100,7 +316,10 @@ def propose_header_repairs(data: bytes, *, profile: str = "balanced") -> list[di
     payload = bytes(data)
     candidates: list[dict[str, Any]] = []
 
-    if _valid_png_ihdr(payload):
+    structural_png = _recover_corrupted_png_structure(payload)
+    if structural_png is not None:
+        candidates.append(structural_png)
+    elif _valid_png_ihdr(payload):
         bad_signature = payload[:8] != b"\x89PNG\r\n\x1a\n"
         bad_length = payload[8:12] != b"\x00\x00\x00\r"
         if bad_signature or bad_length:

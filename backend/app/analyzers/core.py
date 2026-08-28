@@ -165,7 +165,7 @@ class CandidateCollector:
         elif prefix.lower() in {"flag", "ctf", "picoctf", "htb", "thm", "ductf"}:
             score += 18
             reasons.append("uses a common CTF prefix")
-        deterministic = {"raw-bytes", "metadata", "png-text", "jpeg-comment", "barcode", "archive-member"}
+        deterministic = {"raw-bytes", "metadata", "png-text", "jpeg-comment", "svg-text", "barcode", "archive-member"}
         if method.split(":", 1)[0] in deterministic:
             score += 10
             reasons.append("came from a deterministic extraction")
@@ -222,22 +222,60 @@ def _svg_text_records(data: bytes, *, limit: int) -> list[dict[str, Any]]:
     if b"<svg" not in lowered or b"<text" not in lowered:
         return []
     node_pattern = re.compile(rb"<text\b[^>]*>(.*?)</text\s*>", re.IGNORECASE | re.DOTALL)
+    fragment_pattern = re.compile(rb"<tspan\b[^>]*>(.*?)</tspan\s*>", re.IGNORECASE | re.DOTALL)
     node_values: list[tuple[int, str]] = []
     records: list[dict[str, Any]] = []
+    compact_values: set[str] = set()
+
+    def decode_markup(raw: bytes) -> str:
+        without_tags = re.sub(rb"<[^>]{0,512}>", b"", raw)
+        return html.unescape(without_tags.decode("utf-8", "replace")).strip()
+
+    def add_compact(text: str, offset: int, *, fragments: int) -> None:
+        # Some SVG CTFs put a space after every character or divide the flag
+        # among tspans. Only emit a whitespace-free derivative when braces
+        # make it flag-shaped; ordinary SVG prose remains unchanged.
+        compact = "".join(character for character in text if not character.isspace())
+        if (
+            compact == text
+            or compact in compact_values
+            or not (7 <= len(compact) <= _MAX_CANDIDATE_LENGTH)
+            or "{" not in compact
+            or not compact.endswith("}")
+            or len(records) >= limit
+        ):
+            return
+        compact_values.add(compact)
+        records.append({
+            "source": "SVG compact ordered text",
+            "offset": offset,
+            "encoding": "svg-text-compact",
+            "text": display_text(compact, _MAX_CANDIDATE_LENGTH),
+            "confidence_hint": 12,
+            "transform_chain": [
+                f"extract ordered SVG text from {fragments} fragment(s)",
+                "remove whitespace separators",
+            ],
+        })
+
     for match in node_pattern.finditer(sample):
         if len(node_values) >= limit:
             break
-        raw = re.sub(rb"<[^>]{0,512}>", b"", match.group(1))
-        text = html.unescape(raw.decode("utf-8", "replace")).strip()
+        text = decode_markup(match.group(1))
         if not text:
             continue
         offset = int(match.start(1))
         node_values.append((offset, text))
         records.append({"source": "SVG text node", "offset": offset, "encoding": "svg-text", "text": display_text(text, 16_384), "confidence_hint": 8})
+        fragments = [decode_markup(fragment.group(1)) for fragment in fragment_pattern.finditer(match.group(1))]
+        fragments = [fragment for fragment in fragments if fragment]
+        ordered_text = "".join(fragments) if fragments else text
+        add_compact(ordered_text, offset, fragments=max(1, len(fragments)))
     if len(node_values) >= 2:
         joined = "".join(value for _, value in node_values)
         if joined and len(records) < limit:
             records.append({"source": "SVG ordered text nodes", "offset": node_values[0][0], "encoding": "svg-text-joined", "text": display_text(joined, 2_000_000), "confidence_hint": 10})
+            add_compact(joined, node_values[0][0], fragments=len(node_values))
     return records
 
 
