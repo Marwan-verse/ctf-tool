@@ -20,7 +20,7 @@ PROFILE_LIMITS: dict[str, dict[str, int]] = {
         "max_single_artifact": 48 * 1024 * 1024,
         "decode_depth": 2,
         "decode_nodes": 30,
-        "recursion_depth": 2,
+        "recursion_depth": 4,
         "tool_timeout": 20,
         "visual_megapixels": 24,
     },
@@ -32,7 +32,7 @@ PROFILE_LIMITS: dict[str, dict[str, int]] = {
         "max_single_artifact": 96 * 1024 * 1024,
         "decode_depth": 3,
         "decode_nodes": 100,
-        "recursion_depth": 3,
+        "recursion_depth": 12,
         "tool_timeout": 60,
         "visual_megapixels": 40,
     },
@@ -44,7 +44,7 @@ PROFILE_LIMITS: dict[str, dict[str, int]] = {
         "max_single_artifact": 192 * 1024 * 1024,
         "decode_depth": 4,
         "decode_nodes": 300,
-        "recursion_depth": 4,
+        "recursion_depth": 12,
         "tool_timeout": 180,
         "visual_megapixels": 64,
     },
@@ -77,7 +77,28 @@ MIME_BY_KIND = {
     "bzip2": "application/x-bzip2",
     "xz": "application/x-xz",
     "zstd": "application/zstd",
+    "7z": "application/x-7z-compressed",
+    "rar": "application/vnd.rar",
+    "tar": "application/x-tar",
     "pdf": "application/pdf",
+    "pcap": "application/vnd.tcpdump.pcap",
+    "pcapng": "application/x-pcapng",
+    "sqlite": "application/vnd.sqlite3",
+    "ole": "application/x-ole-storage",
+    "rtf": "application/rtf",
+    "eml": "message/rfc822",
+    "disk": "application/x-raw-disk-image",
+    "ewf": "application/x-ewf",
+    "registry": "application/x-windows-registry-hive",
+    "memory": "application/x-memory-dump",
+    "evtx": "application/x-windows-event-log",
+    "pst": "application/vnd.ms-outlook",
+    "shar": "application/x-shar",
+    "ar": "application/x-archive",
+    "lzip": "application/x-lzip",
+    "lz4": "application/x-lz4",
+    "lzma": "application/x-lzma",
+    "lzop": "application/x-lzop",
     "text": "text/plain",
     "binary": "application/octet-stream",
 }
@@ -133,6 +154,11 @@ def bounded_read(path: os.PathLike[str] | str, maximum: int) -> tuple[bytes, boo
 
 
 def sniff_kind(data: bytes, filename: str = "") -> str:
+    extension = Path(filename).suffix.lower()
+    if data.startswith(b"#!/bin/sh") and b"begin " in data[:64 * 1024] and b"uudecode" in data[:64 * 1024]:
+        return "shar"
+    if data.startswith(b"!<arch>\n"):
+        return "ar"
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return "png"
     if data.startswith(b"\xff\xd8\xff"):
@@ -173,6 +199,22 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "ico"
     if data.startswith(b"PK\x03\x04") or data.startswith(b"PK\x05\x06"):
         return "zip"
+    if data.startswith(b"7z\xbc\xaf'\x1c"):
+        return "7z"
+    if data.startswith(b"Rar!\x1a\x07"):
+        return "rar"
+    if data.startswith(b"LZIP\x01"):
+        return "lzip"
+    if data.startswith(b"\x04\x22\x4d\x18"):
+        return "lz4"
+    if data.startswith(b"\x89LZO\x00\r\n\x1a\n"):
+        return "lzop"
+    if len(data) >= 13 and data[0] in {0x5D, 0x5E, 0x5F, 0x60, 0x61}:
+        dictionary_size = int.from_bytes(data[1:5], "little")
+        if 4096 <= dictionary_size <= 128 * 1024 * 1024 and dictionary_size & (dictionary_size - 1) == 0:
+            return "lzma"
+    if len(data) >= 265 and data[257:263] in {b"ustar\x00", b"ustar "}:
+        return "tar"
     if data.startswith(b"\x1f\x8b"):
         return "gzip"
     if len(data) >= 2 and data[0] == 0x78 and ((data[0] << 8) + data[1]) % 31 == 0:
@@ -185,12 +227,38 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "zstd"
     if data.startswith(b"%PDF-"):
         return "pdf"
+    if data.startswith(b"SQLite format 3\x00"):
+        return "sqlite"
+    if data.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return "ole"
+    if data.startswith(b"{\\rtf"):
+        return "rtf"
+    if data.startswith(b"\x0a\x0d\x0d\x0a"):
+        return "pcapng"
+    if data[:4] in {
+        b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4",
+        b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d",
+    }:
+        return "pcap"
+    if data.startswith(b"EVF\x09\x0d\x0a\xff\x00"):
+        return "ewf"
+    if data.startswith(b"regf"):
+        return "registry"
+    if data.startswith(b"ElfFile\x00"):
+        return "evtx"
+    if data.startswith(b"!BDN"):
+        return "pst"
+    if data.startswith((b"MDMP", b"PAGEDUMP", b"PAGEDU64")):
+        return "memory"
+    if _looks_like_disk_image(data):
+        return "disk"
+    if extension == ".eml" or _looks_like_email(data[:64 * 1024]):
+        return "eml"
     markup_head = data[:8192].lstrip(b"\xef\xbb\xbf\x00\t\r\n ").lower()
     if b"<svg" in markup_head and (markup_head.startswith((b"<svg", b"<?xml", b"<!--"))):
         return "svg"
     if data and _looks_textual(data[:8192]):
         return "text"
-    extension = Path(filename).suffix.lower()
     return {
         ".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".jpe": "jpeg",
         ".gif": "gif", ".bmp": "bmp", ".webp": "webp", ".svg": "svg",
@@ -200,7 +268,66 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         ".mp3": "mp3", ".aac": "aac", ".m4a": "m4a", ".mp4": "m4a",
         ".au": "au", ".snd": "au", ".wma": "asf", ".amr": "amr", ".caf": "caf",
         ".mid": "midi", ".midi": "midi",
+        ".7z": "7z", ".rar": "rar", ".tar": "tar",
+        ".lzip": "lzip", ".lz4": "lz4", ".lzma": "lzma", ".lzo": "lzop", ".lzop": "lzop",
+        ".tgz": "gzip", ".tbz": "bzip2", ".tbz2": "bzip2", ".txz": "xz",
+        ".pcap": "pcap", ".cap": "pcap", ".pcapng": "pcapng",
+        ".sqlite": "sqlite", ".sqlite3": "sqlite", ".db": "sqlite",
+        ".doc": "ole", ".xls": "ole", ".ppt": "ole", ".msg": "ole",
+        ".rtf": "rtf", ".eml": "eml",
+        ".img": "disk", ".dd": "disk", ".iso": "disk", ".vhd": "disk", ".vhdx": "disk", ".vmdk": "disk",
+        ".e01": "ewf", ".ex01": "ewf", ".s01": "ewf",
+        ".dat": "binary", ".hive": "registry",
+        ".vmem": "memory", ".mem": "memory", ".lime": "memory", ".dmp": "memory", ".raw": "memory",
+        ".evtx": "evtx", ".pst": "pst", ".ost": "pst",
     }.get(extension, "binary")
+
+
+def _looks_like_email(data: bytes) -> bool:
+    """Recognize an RFC 5322-style message without treating arbitrary text as mail."""
+
+    if not data:
+        return False
+    head = data.replace(b"\r\n", b"\n")
+    separator = head.find(b"\n\n")
+    header = head[:separator if separator >= 0 else min(len(head), 16 * 1024)]
+    names = set()
+    for line in header.splitlines()[:200]:
+        match = re.match(br"^([A-Za-z][A-Za-z0-9-]{0,63}):", line)
+        if match:
+            names.add(match.group(1).lower())
+    return bool({b"from", b"to", b"subject", b"date", b"message-id"} & names) and (
+        b"mime-version" in names or b"content-type" in names or len(names) >= 4
+    )
+
+
+def _looks_like_disk_image(data: bytes) -> bool:
+    """Recognize common raw disk/filesystem headers using bounded invariants."""
+
+    if len(data) >= 520 and data[512:520] == b"EFI PART":
+        return True
+    if len(data) >= 512 and data[510:512] == b"\x55\xaa":
+        entries = data[446:510]
+        plausible = 0
+        for offset in range(0, len(entries), 16):
+            entry = entries[offset:offset + 16]
+            if len(entry) < 16 or entry[0] not in {0x00, 0x80} or entry[4] == 0:
+                continue
+            start = int.from_bytes(entry[8:12], "little")
+            sectors = int.from_bytes(entry[12:16], "little")
+            if start > 0 and sectors > 0:
+                plausible += 1
+        if plausible:
+            return True
+    if len(data) >= 1082 and data[1080:1082] == b"\x53\xef":
+        return True
+    if len(data) >= 11 and data[3:11] == b"NTFS    ":
+        return True
+    if len(data) >= 90 and (data[54:62].startswith(b"FAT") or data[82:90].startswith(b"FAT")):
+        return True
+    if len(data) >= 32774 and data[32769:32774] == b"CD001":
+        return True
+    return False
 
 
 def mime_for(kind: str, filename: str = "") -> str:
@@ -215,7 +342,12 @@ def extension_for(kind: str) -> str:
         "mp3": ".mp3", "aac": ".aac", "m4a": ".m4a", "au": ".au",
         "asf": ".wma", "amr": ".amr", "caf": ".caf", "midi": ".mid",
         "gzip": ".gz", "zlib": ".zlib", "bzip2": ".bz2", "xz": ".xz", "zstd": ".zst",
-        "pdf": ".pdf", "text": ".txt",
+        "7z": ".7z", "rar": ".rar", "tar": ".tar", "shar": ".shar", "ar": ".a",
+        "lzip": ".lz", "lz4": ".lz4", "lzma": ".lzma", "lzop": ".lzo",
+        "pdf": ".pdf", "pcap": ".pcap", "pcapng": ".pcapng", "sqlite": ".sqlite",
+        "ole": ".ole", "rtf": ".rtf", "eml": ".eml", "disk": ".img", "ewf": ".E01",
+        "registry": ".hive", "memory": ".mem", "text": ".txt",
+        "evtx": ".evtx", "pst": ".pst",
     }.get(kind, ".bin")
 
 
@@ -309,6 +441,8 @@ def find_magic_offsets(data: bytes, maximum_per_kind: int = 20) -> list[dict[str
         "gif89a": b"GIF89a", "zip": b"PK\x03\x04", "pdf": b"%PDF-",
         "gzip": b"\x1f\x8b\x08", "bzip2": b"BZh", "xz": b"\xfd7zXZ\x00",
         "7zip": b"7z\xbc\xaf'\x1c", "rar": b"Rar!\x1a\x07", "sqlite": b"SQLite format 3\x00",
+        "pcapng": b"\x0a\x0d\x0d\x0a", "ole": b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",
+        "registry": b"regf", "evtx": b"ElfFile\x00", "pst": b"!BDN",
     }
     hits: list[dict[str, Any]] = []
     for name, signature in signatures.items():

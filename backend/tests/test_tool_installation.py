@@ -91,6 +91,34 @@ def test_web_repair_tools_are_backed_by_fixed_wsl_packages() -> None:
         assert tool_installation.install_strategy(tool_id) == "Kali WSL package"
 
 
+def test_extended_forensics_tools_are_allowlisted_to_fixed_packages() -> None:
+    expected = {
+        "capinfos": "wireshark-common",
+        "tshark_usb_hid": "tshark",
+        "tshark_tftp_objects": "tshark",
+        "tshark_imf_objects": "tshark",
+        "pcapfix": "pcapfix",
+        "sqlite3": "sqlite3",
+        "olevba": "oletools",
+        "rtfobj": "oletools",
+        "mmls": "sleuthkit",
+        "tsk_recover": "sleuthkit",
+        "ewfinfo": "ewf-tools",
+        "reglookup": "reglookup",
+        "readpst": "pst-utils",
+    }
+    for tool_id, package in expected.items():
+        assert tool_installation.WSL_APT_PACKAGES[tool_id] == (package,)
+        assert tool_id in tool_installation.INSTALLABLE_TOOL_IDS
+        assert tool_installation.install_strategy(tool_id) == "Kali WSL package"
+
+    assert tool_installation.VOLATILITY3_VERSION == "2.28.0"
+    assert "volatility3==2.28.0" in tool_installation.VOLATILITY3_INSTALL_SCRIPT
+    assert tool_installation.PYTHON_EVTX_VERSION == "0.8.1"
+    assert "python-evtx==0.8.1" in tool_installation.PYTHON_EVTX_INSTALL_SCRIPT
+    assert tool_installation.WINGET_PACKAGE_IDS["tshark"] == "WiresharkFoundation.Wireshark"
+
+
 def test_shared_winget_audio_package_is_installed_once(monkeypatch: pytest.MonkeyPatch) -> None:
     tool_ids = ["ffprobe", "ffmpeg_spectrogram", "ffmpeg_pcm"]
     winget = Path("C:/Windows/System32/winget.exe")

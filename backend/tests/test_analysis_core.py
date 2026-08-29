@@ -95,3 +95,23 @@ def test_svg_tspans_with_character_spacing_are_compacted_safely() -> None:
         "extract ordered SVG text from 8 fragment(s)",
         "remove whitespace separators",
     ]
+
+
+def test_unicode_whitespace_bitstream_is_recovered() -> None:
+    message = b"\npicoCTF{not_all_spaces_are_created_equal}\n"
+    bits = "".join(f"{byte:08b}" for byte in message)
+    encoded = "".join("\u2003" if bit == "1" else " " for bit in bits)
+
+    report = inspect_bytes(encoded.encode("utf-8"), max_strings=100)
+    recovered = [record for record in report["strings"] if record["encoding"] == "whitespace-bits"]
+
+    assert recovered
+    assert any(record["text"] == message.decode().strip() for record in recovered)
+    assert any("U+0020/U+2003" in step for step in recovered[0]["transform_chain"])
+
+
+def test_unicode_confusables_are_normalized_for_flag_scanning() -> None:
+    report = inspect_bytes("ＩＣＣ{ｕｎｉｃｏｄｅ_ｆｌａｇ}".encode("utf-8"), max_strings=100)
+
+    recovered = [record for record in report["strings"] if record["encoding"] == "unicode-normalization"]
+    assert recovered and recovered[0]["text"] == "ICC{unicode_flag}"

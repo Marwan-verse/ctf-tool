@@ -696,6 +696,57 @@ def _add_lsb_analysis(result: dict[str, Any], base: Any, profile: str) -> None:
                     })
                     noteworthy += 1
 
+    # A recurring image-writeup trick is to select pixels by luminance/value
+    # before reading their LSBs (the payload is sparse rather than sequential
+    # over the whole image).  Try a small, deterministic set of coarse ranges
+    # after the ordinary zsteg-style streams.  The cap keeps this a review
+    # aid, not an unbounded combinatorial search.
+    filtered_limit = min(len(raw_channels["R"]), 4 * 1024 * 1024)
+    if filtered_limit >= 64:
+        red = raw_channels["R"][:filtered_limit]
+        green = raw_channels["G"][:filtered_limit]
+        blue = raw_channels["B"][:filtered_limit]
+        luminance = [((299 * red[index] + 587 * green[index] + 114 * blue[index]) // 1000) for index in range(filtered_limit)]
+        ranges = (("dark", 0, 64), ("mid", 65, 192), ("light", 193, 255), ("extreme", 0, 32))
+        filtered_emitted = 0
+        filter_bits = [0] if profile == "quick" else ([0, 1, 7] if profile == "balanced" else list(range(8)))
+        filter_orders = ("RGB", "R", "G", "B") if profile == "quick" else ("RGB", "R", "G", "B", "BGR")
+        for range_name, lower, upper in ranges:
+            selected = [index for index, value in enumerate(luminance) if lower <= value <= upper]
+            if len(selected) < 64:
+                continue
+            selected_channels = {
+                "R": bytes(red[index] for index in selected),
+                "G": bytes(green[index] for index in selected),
+                "B": bytes(blue[index] for index in selected),
+            }
+            for channel_order in filter_orders:
+                source_channels = [selected_channels[name] for name in channel_order]
+                for bit in filter_bits:
+                    packed = _pack_channel_bits(source_channels, len(selected), bit, "msb-first", max_bits)
+                    if not packed:
+                        continue
+                    records = list(iter_ascii_strings(packed, minimum=4, limit=1000))
+                    interesting_records = [record for record in records if "{" in record["text"] or "}" in record["text"] or len(record["text"]) >= 12]
+                    label = f"lsb:value-{range_name}:{channel_order}:bit{bit}:msb-first"
+                    for record in interesting_records[:100]:
+                        result["text_records"].append({
+                            "source": label, "offset": record["offset"], "text": display_text(record["text"], 16_384),
+                            "transform_chain": [f"select luminance {lower}..{upper}", f"extract bit {bit} from {channel_order}", "msb-first"],
+                        })
+                    detected = sniff_kind(packed)
+                    sample = packed[:8192]
+                    text_ratio = sum(1 for value in sample if value in (9, 10, 13) or 32 <= value <= 126) / len(sample) if sample else 0.0
+                    braces = any("{" in record["text"] and "}" in record["text"] for record in records)
+                    if filtered_emitted < 16 and (detected != "binary" or text_ratio >= 0.65 or braces):
+                        result["stego_streams"].append({
+                            "label": label.replace(":", "_"), "title": label, "data": packed,
+                            "producer": "built-in-lsb-value-filter", "transformation": label, "kind": detected,
+                            "parameters": {"value_range": [lower, upper], "channel_order": channel_order, "bit": bit, "packing": "msb-first", "selected_pixels": len(selected), "scanned_pixels": filtered_limit},
+                            "entropy": round(byte_entropy(packed[:1_000_000]), 5), "text_ratio": round(text_ratio, 5),
+                        })
+                        filtered_emitted += 1
+
 
 def _add_jpeg_coefficient_analysis(result: dict[str, Any], path: Any, profile: str) -> dict[str, Any] | None:
     """Expose JSteg-style AC parity streams from a baseline JPEG.

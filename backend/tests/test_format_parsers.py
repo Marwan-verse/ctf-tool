@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import binascii
+import bz2
 import io
 import struct
 import zipfile
+import zlib
 from pathlib import Path
 
 from app.analyzers.formats import analyze_format, parse_bmp, parse_png, propose_header_repairs
@@ -141,3 +143,50 @@ def test_bmp_interleaved_word_lane_recovers_and_trims_zip() -> None:
     with zipfile.ZipFile(io.BytesIO(recovered["data"])) as archive:
         assert archive.read("clue.txt") == b"picoCTF{synthetic_bmp_word_lane}"
     assert any(finding["title"] == "File hidden in a BMP word lane" for finding in result["findings"])
+
+
+def test_pdf_metadata_streams_and_trailing_payload_are_recovered() -> None:
+    compressed = zlib.compress(b"flag{pdf_flate_stream}")
+    pdf = (
+        b"%PDF-1.7\n1 0 obj\n<< /Title (forensics) /JavaScript true /Length 20 >>\n"
+        b"stream\nflag{pdf_stream}\nendstream\nendobj\n"
+        b"2 0 obj\n<< /Filter /FlateDecode /EmbeddedFile true /Length "
+        + str(len(compressed)).encode()
+        + b" >>\nstream\n"
+        + compressed
+        + b"\nendstream\nendobj\n%%EOF\nPK\x03\x04flag{pdf_trailer}"
+    )
+    result = analyze_format("pdf", pdf, profile="deep")
+
+    assert result["properties"]["version"] == "1.7"
+    assert any("forensics" in record["text"] for record in result["text_records"])
+    assert any(b"flag{pdf_stream}" in item["data"] for item in result["extracted"])
+    assert any(b"flag{pdf_flate_stream}" in item["data"] for item in result["extracted"])
+    assert any(item["label"] == "pdf_trailing_data" for item in result["extracted"])
+    assert any(finding["title"] == "PDF active-content markers detected" for finding in result["findings"])
+
+
+def test_corrupted_bzip2_header_gets_unique_decompression_proven_repair() -> None:
+    original = bz2.compress(b"flag{bzip2_header}")
+    corrupted = bytearray(original)
+    corrupted[3] = ord("0")
+
+    [candidate] = [item for item in propose_header_repairs(bytes(corrupted), profile="deep") if item["kind"] == "bzip2"]
+
+    assert candidate["data"] == original
+    assert bz2.decompress(candidate["data"]) == b"flag{bzip2_header}"
+
+
+def test_corrupted_bmp_height_gets_exact_row_stride_repair() -> None:
+    width, height, bpp = 4, 3, 24
+    row_stride = ((width * bpp + 31) // 32) * 4
+    pixel_offset = 54
+    bmp = bytearray(pixel_offset + row_stride * height)
+    bmp[:2] = b"BM"
+    struct.pack_into("<I", bmp, 2, len(bmp))
+    struct.pack_into("<I", bmp, 10, pixel_offset)
+    struct.pack_into("<IiiHHII", bmp, 14, 40, width, 0, 1, bpp, 0, row_stride * height)
+    [candidate] = [item for item in propose_header_repairs(bytes(bmp), profile="deep") if item["kind"] == "bmp"]
+
+    assert int.from_bytes(candidate["data"][22:26], "little", signed=True) == height
+    assert parse_bmp(candidate["data"], profile="quick")["properties"]["height"] == height

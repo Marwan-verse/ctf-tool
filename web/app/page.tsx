@@ -5,6 +5,7 @@ import { type CSSProperties, type ClipboardEvent, type DragEvent, type FormEvent
 type Profile = 'quick' | 'balanced' | 'deep';
 type EvidenceSection = 'image' | 'audio' | 'corrupted';
 type Screen = 'setup' | 'running' | 'results';
+type FileDetection = { label: string; source: 'content' | 'browser' | 'extension' | 'scanning' };
 type ColorTheme = 'light' | 'dark';
 type UiPreferences = { theme: ColorTheme; zoom: number };
 type ResultTab = 'overview' | 'repairs' | 'audio' | 'candidates' | 'artifacts' | 'visual' | 'metadata' | 'hex' | 'tools' | 'methods';
@@ -412,6 +413,64 @@ const resultTabs: Array<{ id: ResultTab; label: string }> = [
   { id: 'methods', label: 'Coverage & logs' },
 ];
 
+function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
+  const startsWith = (...values: number[]) => values.every((value, index) => bytes[index] === value);
+  const ascii = (offset = 0, length = 64) => new TextDecoder().decode(bytes.slice(offset, offset + length));
+  const extension = file.name.includes('.') ? file.name.split('.').pop()?.toLowerCase() : '';
+  const extensionLabels: Record<string, string> = {
+    jpg: 'JPEG image', jpeg: 'JPEG image', png: 'PNG image', apng: 'APNG image', gif: 'GIF image',
+    bmp: 'BMP image', webp: 'WebP image', svg: 'SVG document', tif: 'TIFF image', tiff: 'TIFF image', ico: 'ICO image',
+    wav: 'WAV audio', wave: 'WAV audio', mp3: 'MP3 audio', flac: 'FLAC audio', ogg: 'Ogg audio', opus: 'Opus audio',
+    m4a: 'M4A / AAC audio', aac: 'AAC audio', aif: 'AIFF audio', aiff: 'AIFF audio', au: 'AU audio', snd: 'AU audio',
+    wma: 'WMA audio', amr: 'AMR audio', caf: 'CAF audio', mid: 'MIDI file', midi: 'MIDI file',
+    pdf: 'PDF document', zip: 'ZIP archive', docx: 'ZIP / Office container', xlsx: 'ZIP / Office container', pptx: 'ZIP / Office container',
+    '7z': '7-Zip archive', rar: 'RAR archive', tar: 'TAR archive', gz: 'GZip stream', bz2: 'BZip2 stream', xz: 'XZ stream', zst: 'Zstandard stream',
+    pcap: 'PCAP capture', pcapng: 'PCAPNG capture', db: 'SQLite database', sqlite: 'SQLite database', sqlite3: 'SQLite database',
+    eml: 'RFC 5322 email', rtf: 'RTF document', evtx: 'Windows EVTX log', pst: 'Outlook PST store', ost: 'Outlook OST store',
+    e01: 'EWF / E01 disk image', raw: 'Raw disk or memory image', img: 'Raw disk image', dd: 'Raw disk image', vmem: 'Memory dump', dmp: 'Memory or crash dump',
+  };
+
+  if (startsWith(0x89, 0x50, 0x4e, 0x47)) return { label: 'PNG image', source: 'content' };
+  if (startsWith(0xff, 0xd8, 0xff)) return { label: 'JPEG image', source: 'content' };
+  if (ascii(0, 6) === 'GIF87a' || ascii(0, 6) === 'GIF89a') return { label: 'GIF image', source: 'content' };
+  if (startsWith(0x42, 0x4d)) return { label: 'BMP image', source: 'content' };
+  if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP') return { label: 'WebP image', source: 'content' };
+  if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WAVE') return { label: 'WAV audio', source: 'content' };
+  if (startsWith(0x49, 0x44, 0x33) || (bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0)) return { label: 'MP3 audio', source: 'content' };
+  if (ascii(0, 4) === 'fLaC') return { label: 'FLAC audio', source: 'content' };
+  if (ascii(0, 4) === 'OggS') return { label: 'Ogg audio', source: 'content' };
+  if (ascii(0, 4) === '%PDF') return { label: 'PDF document', source: 'content' };
+  if (startsWith(0x50, 0x4b, 0x03, 0x04) || startsWith(0x50, 0x4b, 0x05, 0x06) || startsWith(0x50, 0x4b, 0x07, 0x08)) return { label: 'ZIP archive / Office container', source: 'content' };
+  if (startsWith(0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c)) return { label: '7-Zip archive', source: 'content' };
+  if (startsWith(0x52, 0x61, 0x72, 0x21, 0x1a, 0x07)) return { label: 'RAR archive', source: 'content' };
+  if (startsWith(0x1f, 0x8b)) return { label: 'GZip stream', source: 'content' };
+  if (startsWith(0x42, 0x5a, 0x68)) return { label: 'BZip2 stream', source: 'content' };
+  if (startsWith(0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00)) return { label: 'XZ stream', source: 'content' };
+  if (startsWith(0x28, 0xb5, 0x2f, 0xfd)) return { label: 'Zstandard stream', source: 'content' };
+  if (ascii(257, 5) === 'ustar') return { label: 'TAR archive', source: 'content' };
+  if (ascii(0, 16) === 'SQLite format 3\u0000') return { label: 'SQLite database', source: 'content' };
+  if (startsWith(0xd4, 0xc3, 0xb2, 0xa1) || startsWith(0xa1, 0xb2, 0xc3, 0xd4) || startsWith(0x4d, 0x3c, 0xb2, 0xa1) || startsWith(0xa1, 0xb2, 0x3c, 0x4d)) return { label: 'PCAP capture', source: 'content' };
+  if (startsWith(0x0a, 0x0d, 0x0d, 0x0a)) return { label: 'PCAPNG capture', source: 'content' };
+  if (startsWith(0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1)) return { label: 'OLE / legacy Office document', source: 'content' };
+  if (ascii(0, 5) === '{\\rtf') return { label: 'RTF document', source: 'content' };
+  if (ascii(0, 7) === 'ElfFile') return { label: 'Windows EVTX log', source: 'content' };
+  if (ascii(0, 4) === 'regf') return { label: 'Windows registry hive', source: 'content' };
+  if (ascii(0, 4) === '!BDN') return { label: 'Outlook PST / OST store', source: 'content' };
+  if (startsWith(0x7f, 0x45, 0x4c, 0x46)) return { label: 'ELF executable', source: 'content' };
+  if (startsWith(0x4d, 0x5a)) return { label: 'Windows PE executable', source: 'content' };
+  if (ascii(0, 4) === 'MThd') return { label: 'MIDI file', source: 'content' };
+  if (ascii(0, 5).trimStart().startsWith('<svg')) return { label: 'SVG image', source: 'content' };
+  if (/^(From:|Received:|MIME-Version:|Subject:)/m.test(ascii(0, 1024))) return { label: 'RFC 5322 email', source: 'content' };
+  if (file.type) return { label: file.type, source: 'browser' };
+  if (extension && extensionLabels[extension]) return { label: extensionLabels[extension], source: 'extension' };
+  return { label: 'Unknown binary / text file', source: 'content' };
+}
+
+async function detectClientFileType(file: File): Promise<FileDetection> {
+  const bytes = new Uint8Array(await file.slice(0, 64 * 1024).arrayBuffer());
+  return clientFileTypeFromBytes(bytes, file);
+}
+
 function getJobId(job: Job | null) { return job?.id || job?.job_id || ''; }
 function jobName(job: Job | null) { return job?.original_filename || job?.original_name || job?.filename || ''; }
 function sectionForJob(job: Job | null): EvidenceSection {
@@ -685,8 +744,10 @@ function HomeWorkbench() {
   const [evidenceSection, setEvidenceSection] = useState<EvidenceSection>('image');
   const [screen, setScreen] = useState<Screen>('setup');
   const [profile, setProfile] = useState<Profile>('balanced');
-  const [scanOptions, setScanOptions] = useState<ScanOptions>({ ...profileOptionDefaults.balanced, evidence_type: 'image' });
+  const [scanOptions, setScanOptions] = useState<ScanOptions>({ ...profileOptionDefaults.balanced, evidence_type: 'auto' });
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [fileDetection, setFileDetection] = useState<FileDetection | null>(null);
+  const fileDetectionRequest = useRef(0);
   const [flagPrefix, setFlagPrefix] = useState('');
   const [password, setPassword] = useState('');
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -875,6 +936,17 @@ function HomeWorkbench() {
 
   const result = job?.result;
   const sectionCopy = SECTION_COPY[evidenceSection];
+  const setupCopy = {
+    ...sectionCopy,
+    symbol: '◈',
+    setupEyebrow: 'Universal file forensics',
+    headline: 'Drop any file. Find what it is hiding.',
+    dropTitle: 'Drop any file here',
+    formatCopy: 'Images, audio, archives, documents, captures, disk images and more',
+    accept: '*/*',
+    analyzeLabel: 'Analyze file',
+    selectedNote: 'Type detected from content before the scan begins',
+  };
   const currentConfigurableMethods = configurableMethodsFor(evidenceSection);
   const currentMethodGroups = methodGroupsFor(evidenceSection);
   const isAudioResult = result?.section === 'audio' || job?.options?.evidence_type === 'audio' || evidenceSection === 'audio';
@@ -1048,6 +1120,13 @@ function HomeWorkbench() {
     if (!file) return;
     if (file.size > 100 * 1024 * 1024) { setError('That file is larger than the 100 MB safety limit.'); return; }
     setSelectedFile(file);
+    const request = ++fileDetectionRequest.current;
+    setFileDetection({ label: 'Inspecting file signature…', source: 'scanning' });
+    void detectClientFileType(file).then((detected) => {
+      if (request === fileDetectionRequest.current) setFileDetection(detected);
+    }).catch(() => {
+      if (request === fileDetectionRequest.current) setFileDetection({ label: 'Type will be detected by the analysis engine', source: 'scanning' });
+    });
   }
 
   function handleDrop(event: DragEvent<HTMLDivElement>) {
@@ -1065,7 +1144,7 @@ function HomeWorkbench() {
     form.append('profile', profile);
     if (flagPrefix.trim()) form.append('flag_prefix', flagPrefix.trim());
     if (password) form.append('password', password);
-    form.append('options', JSON.stringify({ ...scanOptions, evidence_type: evidenceSection }));
+    form.append('options', JSON.stringify({ ...scanOptions, evidence_type: 'auto' }));
     try {
       const created = await readJson(await fetch(`${API_BASE}/api/jobs`, { method: 'POST', body: form })) as Job;
       setJob(created);
@@ -1351,7 +1430,12 @@ function HomeWorkbench() {
 
   function resetScan() {
     setScreen('setup');
+    setEvidenceSection('image');
     setSelectedFile(null);
+    setFileDetection(null);
+    fileDetectionRequest.current += 1;
+    if (fileInput.current) fileInput.current.value = '';
+    setScanOptions((current) => ({ ...current, evidence_type: 'auto' }));
     setJob(null);
     setError('');
     setActivity([]);
@@ -1547,11 +1631,8 @@ function HomeWorkbench() {
           <span><strong>Forenscope</strong><small>CTF workbench</small></span>
         </button>
 
-        <nav aria-label="Forensics sections">
-          <p className="nav-label">Analyze</p>
-          <button className={`nav-item ${evidenceSection === 'image' ? 'active' : ''}`} onClick={() => selectEvidenceSection('image')}><span>◫</span>Image</button>
-          <button className={`nav-item ${evidenceSection === 'audio' ? 'active' : ''}`} onClick={() => selectEvidenceSection('audio')}><span>≋</span>Audio<em>Ready</em></button>
-          <button className={`nav-item ${evidenceSection === 'corrupted' ? 'active' : ''}`} onClick={() => selectEvidenceSection('corrupted')}><span>⌁</span>Corrupted files<em>Ready</em></button>
+        <nav aria-label="Forensics workspace">
+          <button className="nav-item active universal-nav-item" onClick={resetScan}><span>◈</span>New analysis</button>
           <p className="nav-label second">Workspace</p>
           <button className="nav-item" onClick={() => document.getElementById('recent-scans')?.scrollIntoView({ behavior: 'smooth' })}><span>◷</span>Recent scans</button>
           <button className="nav-item" onClick={() => setShowAdvanced(true)}><span>⌘</span>Scan settings</button>
@@ -1579,7 +1660,7 @@ function HomeWorkbench() {
         {screen === 'setup' && (
           <>
             <header className="topbar">
-              <div><p className="eyebrow">{sectionCopy.setupEyebrow}</p><h1>{sectionCopy.headline}</h1></div>
+              <div><p className="eyebrow">{setupCopy.setupEyebrow}</p><h1>{setupCopy.headline}</h1></div>
               <div className="top-actions">
                 <button className="icon-button" aria-label="Open method settings" onClick={() => setShowAdvanced(true)}>⚙</button>
                 <button className="new-scan" onClick={() => fileInput.current?.click()}>New scan <span>＋</span></button>
@@ -1596,27 +1677,28 @@ function HomeWorkbench() {
                   onDrop={handleDrop}
                   onClick={() => !selectedFile && fileInput.current?.click()}
                 >
-                  <input ref={fileInput} className="sr-only" type="file" accept={sectionCopy.accept} onChange={(event) => selectFile(event.target.files?.[0])} />
+                  <input ref={fileInput} className="sr-only" type="file" accept={setupCopy.accept} onChange={(event) => selectFile(event.target.files?.[0])} />
                   {!selectedFile ? (
                     <>
                       <div className="upload-icon" aria-hidden="true"><span>↑</span></div>
                       <p className="card-kicker">Start an investigation</p>
-                      <h2>{sectionCopy.dropTitle}</h2>
-                      <p className="upload-copy">{sectionCopy.formatCopy} · up to 100 MB</p>
-                      <button className="choose-button" onClick={(event) => { event.stopPropagation(); fileInput.current?.click(); }}>Choose evidence file</button>
-                      <p className="evidence-note"><span>◇</span>{evidenceSection === 'corrupted' ? 'The original is hashed; repairs are always separate copies' : 'The original is hashed and never modified'}</p>
+                      <h2>{setupCopy.dropTitle}</h2>
+                      <p className="upload-copy">{setupCopy.formatCopy} · up to 100 MB</p>
+                      <button className="choose-button" onClick={(event) => { event.stopPropagation(); fileInput.current?.click(); }}>Choose a file</button>
+                      <p className="evidence-note"><span>◇</span>Content signatures detect the real type, even when the extension is missing or wrong</p>
                     </>
                   ) : (
                     <>
-                      <div className="file-seal" aria-hidden="true"><span>{sectionCopy.symbol}</span><i>Evidence</i></div>
+                      <div className="file-seal" aria-hidden="true"><span>{setupCopy.symbol}</span><i>Evidence</i></div>
                       <p className="card-kicker">Evidence selected</p>
                       <h2 className="file-name">{selectedFile.name}</h2>
-                      <div className="file-facts"><span>{formatBytes(selectedFile.size)}</span><span>SHA-256 on ingest</span><span>Type verified by content</span></div>
+                      <div className="file-facts"><span>{formatBytes(selectedFile.size)}</span><span>SHA-256 on ingest</span><span className={`file-type-fact ${fileDetection?.source === 'scanning' ? 'scanning' : ''}`}>{fileDetection?.label || 'Detecting type…'}</span></div>
+                      <p className="file-detection-note">{fileDetection?.source === 'content' ? 'Detected from the file signature' : fileDetection?.source === 'extension' ? 'Detected from the filename extension; the engine will verify it' : fileDetection?.source === 'browser' ? 'Browser MIME hint; the engine will verify it' : 'Reading the first bytes to identify the format…'}</p>
                       <div className="file-actions">
-                        <button className="choose-button" onClick={(event) => { event.stopPropagation(); startScan(); }}>{sectionCopy.analyzeLabel} <span>→</span></button>
+                        <button className="choose-button" onClick={(event) => { event.stopPropagation(); startScan(); }}>{setupCopy.analyzeLabel} <span>→</span></button>
                         <button className="replace-button" onClick={(event) => { event.stopPropagation(); fileInput.current?.click(); }}>Replace</button>
                       </div>
-                      <p className="evidence-note"><span>◇</span>{sectionCopy.selectedNote}</p>
+                      <p className="evidence-note"><span>◇</span>{setupCopy.selectedNote}</p>
                     </>
                   )}
                 </div>

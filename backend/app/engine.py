@@ -7,6 +7,7 @@ import json
 import lzma
 import os
 import re
+import tarfile
 import time
 import uuid
 import zipfile
@@ -31,7 +32,9 @@ from .analyzers.common import (
     utc_now,
 )
 from .analyzers.audio import AUDIO_KINDS, analyze_audio
+from .analyzers.archive import carve_zip_local_header_extras, trim_zip_archive
 from .analyzers.core import BoundedDecoder, CandidateCollector, inspect_bytes
+from .analyzers.compression import DECODERS, CompressionError
 from .analyzers.crypto import analyze_encrypted_payloads
 from .analyzers.external import ExternalToolRunner, TOOL_SPECS
 from .analyzers.formats import analyze_format, propose_header_repairs
@@ -40,6 +43,17 @@ from .analyzers.visual import analyze_visual
 
 SUPPORTED_IMAGE_FORMATS = ["PNG/APNG", "JPEG/MPO", "GIF", "BMP", "WebP", "SVG text", "TIFF/BigTIFF", "ICO/CUR"]
 SUPPORTED_AUDIO_FORMATS = ["WAV/PCM", "AIFF/AIFC", "FLAC", "Ogg/Opus", "MP3", "AAC/M4A", "AU", "WMA/ASF", "AMR", "CAF", "MIDI"]
+SUPPORTED_DOCUMENT_FORMATS = ["PDF"]
+SUPPORTED_FORENSIC_FORMATS = [
+    "PCAP/PCAPNG", "SQLite", "OLE/RTF/EML", "TAR/7z/RAR", "shar/uuencode/ar", "LZIP/LZ4/LZMA/LZOP",
+    "raw disk/ISO", "E01/EWF", "Windows registry hive", "memory/crash dump",
+    "Windows EVTX", "Outlook PST/OST",
+]
+BUILT_IN_STRUCTURE_KINDS = {
+    "png", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "pdf",
+    "pcap", "pcapng", "sqlite", "ole", "rtf", "eml", "disk", "ewf", "registry", "memory", "evtx", "pst",
+    "shar", "ar", "lzip", "lz4", "lzma", "lzop",
+}
 
 
 class ArtifactStore:
@@ -218,7 +232,7 @@ class AnalysisEngine:
             analysis_options.update(options)
         limits = dict(PROFILE_LIMITS[profile])
         if isinstance(analysis_options.get("max_recursion_depth"), int):
-            limits["recursion_depth"] = max(1, min(4, int(analysis_options["max_recursion_depth"])))
+            limits["recursion_depth"] = max(1, min(12, int(analysis_options["max_recursion_depth"])))
         if isinstance(analysis_options.get("max_artifacts"), int):
             limits["max_artifacts"] = max(25, min(500, int(analysis_options["max_artifacts"])))
         if isinstance(analysis_options.get("tool_timeout_seconds"), int):
@@ -317,7 +331,12 @@ class AnalysisEngine:
             core_details = inspect_bytes(source_data, max_strings=limits["max_strings"])
             collector.scan_bytes(source_data, source_artifact_id=source_id, method="raw-bytes")
             for record in core_details["strings"]:
-                record_method = _text_method(record.get("source", "")) if str(record.get("encoding", "")).startswith("svg-") else f"strings:{record['encoding']}"
+                encoding = str(record.get("encoding", ""))
+                record_method = (
+                    _text_method(record.get("source", ""))
+                    if encoding.startswith("svg-") or encoding in {"whitespace-bits", "unicode-normalization"}
+                    else f"strings:{encoding}"
+                )
                 collector.scan_text(
                     record["text"], source_artifact_id=source_id, method=record_method,
                     offset=record["offset"], transform_chain=record.get("transform_chain"),
@@ -386,11 +405,11 @@ class AnalysisEngine:
                             "details": {"format": analysis_kind, "transformation": primary.get("transformation"), "reason": primary.get("reason")},
                         }, source_id, "header-recovery")
                 format_root = analyze_format(analysis_kind, analysis_data, profile=profile)
-                structure_status = "completed" if analysis_kind in {"png", "jpeg", "gif", "bmp", "webp", "tiff", "ico"} else "skipped"
+                structure_status = "completed" if analysis_kind in BUILT_IN_STRUCTURE_KINDS else "skipped"
                 structure_summary = (
                     f"Parsed {analysis_kind} structure with {len(format_root['findings'])} notable finding(s), "
                     f"{len(format_root['extracted'])} extracted object(s), and {len(format_root['repairs'])} repair candidate(s)."
-                    if structure_status == "completed" else f"No image-specific parser is registered for detected type {source_kind}."
+                    if structure_status == "completed" else f"No built-in format parser is registered for detected type {source_kind}."
                 )
                 for finding in format_root["findings"]:
                     add_finding(finding, source_id, "built-in-structure")
@@ -439,7 +458,7 @@ class AnalysisEngine:
                     elif reason:
                         log("warning", f"Skipped repair candidate {repair['label']}: {reason}", "built-in-structure")
             methods.append({
-                "id": "built-in-structure", "name": "Built-in image structure parser", "category": "structure",
+                "id": "built-in-structure", "name": "Built-in image/document structure parser", "category": "structure",
                 "status": structure_status, "applicable": structure_status != "skipped",
                 "started_at": utc_now(), "duration_ms": int((time.monotonic() - structure_start) * 1000),
                 "summary": structure_summary, "tool": {"executable": "Python stdlib", "resolved": None, "version": None},
@@ -496,6 +515,20 @@ class AnalysisEngine:
             recursive_start = time.monotonic()
             recursive_processed = 0
             archive_members = 0
+            zip_local_extra_artifacts = 0
+
+            # ZIP-family inputs are safe to traverse through the stdlib
+            # metadata reader.  Queue the immutable source at depth zero so
+            # ordinary members (and OOXML packages) are handled in every
+            # profile, while all generated bytes still pass ArtifactStore's
+            # limits and lineage checks.
+            if (
+                analysis_options["recursive_extraction"]
+                and not read_truncated
+                and source_kind in {"zip", "tar", "gzip", "bzip2", "xz", "lzip", "lz4", "lzma", "lzop"}
+            ):
+                derived_queue.appendleft((source_id, source_data, source_kind, 0))
+
             while analysis_options["recursive_extraction"] and derived_queue and len(store.artifacts) < limits["max_artifacts"]:
                 check_cancelled(is_cancelled)
                 artifact_id, artifact_data, artifact_kind, depth = derived_queue.popleft()
@@ -503,13 +536,20 @@ class AnalysisEngine:
                     continue
                 processed_artifacts.add(artifact_id)
                 recursive_processed += 1
-                collector.scan_bytes(artifact_data, source_artifact_id=artifact_id, method="recursive-raw", confidence_hint=5)
+                artifact_record = store.get(artifact_id)
+                archive_member_scan = any(
+                    str(lineage.get("producer", "")) == "zipfile"
+                    for lineage in artifact_record.get("lineage", [])
+                    if isinstance(lineage, dict)
+                )
+                recursive_scan_method = "archive-member" if archive_member_scan else "recursive-raw"
+                collector.scan_bytes(artifact_data, source_artifact_id=artifact_id, method=recursive_scan_method, confidence_hint=5)
                 local_core = inspect_bytes(artifact_data, max_strings=min(2_000, limits["max_strings"]))
                 for record in local_core["strings"]:
-                    collector.scan_text(record["text"], source_artifact_id=artifact_id, method=f"recursive-strings:{record['encoding']}", offset=record["offset"], confidence_hint=5)
+                    collector.scan_text(record["text"], source_artifact_id=artifact_id, method=f"{recursive_scan_method}:{record['encoding']}", offset=record["offset"], confidence_hint=5)
                     if len(all_string_seeds) < limits["max_strings"] * 2:
                         all_string_seeds.append({**record, "artifact_id": artifact_id})
-                if artifact_kind in {"png", "jpeg", "gif", "bmp", "webp", "tiff", "ico"}:
+                if artifact_kind in BUILT_IN_STRUCTURE_KINDS:
                     nested = analyze_format(artifact_kind, artifact_data, profile=profile)
                     for finding in nested["findings"]:
                         add_finding(finding, artifact_id, "recursive-structure")
@@ -529,9 +569,26 @@ class AnalysisEngine:
                                 derived_queue.append((child_id, extracted["data"], extracted.get("kind") or sniff_kind(extracted["data"]), depth + 1))
                             elif reason:
                                 log("warning", f"Skipped nested artifact {extracted['label']}: {reason}", "recursive-structure")
-                if artifact_kind in {"zip", "gzip", "bzip2", "xz"} and depth < limits["recursion_depth"]:
+                if artifact_kind == "zip" and depth < limits["recursion_depth"]:
+                    zip_local_extra_artifacts += self._carve_zip_local_extras(
+                        artifact_data, artifact_id, depth, store, derived_queue, log,
+                    )
+                if artifact_kind in {"zip", "tar", "gzip", "bzip2", "xz", "lzip", "lz4", "lzma", "lzop"} and depth < limits["recursion_depth"]:
                     members = self._expand_archive(artifact_data, artifact_kind, artifact_id, depth, store, derived_queue, add_finding, log, password=password)
                     archive_members += members
+            methods.append({
+                "id": "zip-local-extra-carver", "name": "ZIP local-header extra-field recovery", "category": "embedded-data",
+                "status": "completed" if analysis_options["recursive_extraction"] and not read_truncated else "skipped",
+                "applicable": True, "started_at": recursive_start if analysis_options["recursive_extraction"] and not read_truncated else None,
+                "duration_ms": 0,
+                "summary": (
+                    f"Recovered {zip_local_extra_artifacts} validated embedded ZIP archive(s) from local-file-header extra fields."
+                    if analysis_options["recursive_extraction"] and not read_truncated
+                    else "Local-header extra-field recovery requires complete input bytes and recursive extraction."
+                ),
+                "tool": {"executable": "Python stdlib", "resolved": "built-in", "version": "1"},
+                "details": {"recovered_archives": zip_local_extra_artifacts, "max_candidates_per_archive": 16},
+            })
             methods.append({
                 "id": "recursive-analysis", "name": "Recursive artifact and archive analysis", "category": "embedded-data",
                 "status": "completed" if analysis_options["recursive_extraction"] else "skipped",
@@ -704,9 +761,13 @@ class AnalysisEngine:
                 if not analysis_options["barcodes"]:
                     excluded_tool_ids.add("zbarimg")
                 if not analysis_options["recursive_extraction"]:
-                    excluded_tool_ids.update({"binwalk", "foremost", "7z"})
+                    excluded_tool_ids.update({
+                        "binwalk", "foremost", "7z", "7z_extract", "tshark_http_objects",
+                        "tshark_smb_objects", "tshark_tftp_objects", "tshark_imf_objects",
+                        "oleobj", "rtfobj", "tsk_recover", "readpst",
+                    })
                 if not analysis_options["repairs"]:
-                    excluded_tool_ids.add("jpegtran")
+                    excluded_tool_ids.update({"jpegtran", "pcapfix"})
                 if excluded_tool_ids:
                     selected_tool_ids = (
                         {spec.tool_id for spec in TOOL_SPECS}
@@ -740,14 +801,44 @@ class AnalysisEngine:
                 extracted_items = method.pop("extracted", [])
                 extracted_artifact_ids: list[str] = []
                 for extracted in extracted_items:
-                    artifact_id, created, reason = store.add_bytes(
-                        extracted["data"], label=extracted["label"], parent_id=source_id,
+                    payload = bytes(extracted["data"])
+                    payload_kind = str(extracted.get("kind") or sniff_kind(payload))
+                    artifact_id, _, reason = store.add_bytes(
+                        payload, label=extracted["label"], parent_id=source_id,
                         producer=extracted.get("producer", method_id), transformation=extracted.get("transformation", "external extraction"),
-                        offset=extracted.get("offset"), kind=extracted.get("kind"), depth=1,
+                        offset=extracted.get("offset"), kind=payload_kind, depth=1,
                     )
                     if artifact_id:
                         extracted_artifact_ids.append(artifact_id)
-                        collector.scan_bytes(extracted["data"], source_artifact_id=artifact_id, method=method_id, confidence_hint=12)
+                        collector.scan_bytes(payload, source_artifact_id=artifact_id, method=method_id, confidence_hint=12)
+                        external_core = inspect_bytes(payload[:8 * 1024 * 1024], max_strings=2_000)
+                        for record in external_core["strings"]:
+                            collector.scan_text(
+                                record["text"], source_artifact_id=artifact_id,
+                                method=f"{method_id}:{record['encoding']}", offset=record["offset"], confidence_hint=7,
+                            )
+                        if payload_kind in BUILT_IN_STRUCTURE_KINDS:
+                            nested_external = analyze_format(payload_kind, payload, profile=profile)
+                            for finding in nested_external["findings"]:
+                                add_finding(finding, artifact_id, f"{method_id}-structure")
+                            for record in nested_external["text_records"]:
+                                collector.scan_text(
+                                    record.get("text", ""), source_artifact_id=artifact_id,
+                                    method=_text_method(record.get("source", f"{method_id}-structure")),
+                                    offset=record.get("offset"), confidence_hint=10,
+                                )
+                            for child in nested_external["extracted"][:32]:
+                                child_payload = bytes(child["data"])
+                                child_id, _, child_reason = store.add_bytes(
+                                    child_payload, label=child["label"], parent_id=artifact_id,
+                                    producer=child.get("producer", f"{method_id}-structure"),
+                                    transformation=child.get("transformation", "extract from external-tool artifact"),
+                                    offset=child.get("offset"), kind=child.get("kind"), depth=2,
+                                )
+                                if child_id:
+                                    collector.scan_bytes(child_payload, source_artifact_id=child_id, method=method_id, confidence_hint=12)
+                                elif child_reason:
+                                    log("warning", f"Skipped nested {method_id} artifact {child['label']}: {child_reason}", method_id)
                     elif reason:
                         log("warning", f"Skipped {method_id} artifact {extracted['label']}: {reason}", method_id)
                 method["artifact_ids"] = extracted_artifact_ids
@@ -881,18 +972,17 @@ class AnalysisEngine:
                     "summary": "Spectrogram analysis is available from Forenscope's Audio section and is not applicable to image evidence.",
                     "tool": {"executable": "FFmpeg", "resolved": None, "version": None}, "details": {},
                 },
-                {
+                *([] if source_kind == "pdf" else [{
                     "id": "pdfinfo", "name": "pdfinfo", "category": "document",
                     "status": "skipped", "applicable": False, "started_at": None, "duration_ms": 0,
                     "summary": "pdfinfo is not applicable to the image section.",
                     "tool": {"executable": "pdfinfo", "resolved": None, "version": None}, "details": {},
-                },
-                {
+                }, {
                     "id": "pdfid", "name": "PDFiD", "category": "document",
                     "status": "skipped", "applicable": False, "started_at": None, "duration_ms": 0,
                     "summary": "PDFiD is not applicable to the image section.",
                     "tool": {"executable": "pdfid", "resolved": None, "version": None}, "details": {},
-                },
+                }]),
             ])
 
             report_status = "completed"
@@ -916,6 +1006,8 @@ class AnalysisEngine:
             "profile": profile,
             "section": report_section,
             "supported_image_formats": SUPPORTED_IMAGE_FORMATS,
+            "supported_document_formats": SUPPORTED_DOCUMENT_FORMATS,
+            "supported_forensic_formats": SUPPORTED_FORENSIC_FORMATS,
             "method_status_counts": dict(method_status_counts),
             "missing_optional_tools": missing_optional,
             "optional_tools_declared": [spec.tool_id for spec in TOOL_SPECS],
@@ -1481,6 +1573,58 @@ class AnalysisEngine:
         return count
 
     @staticmethod
+    def _carve_zip_local_extras(
+        data: bytes,
+        parent_id: str,
+        depth: int,
+        store: ArtifactStore,
+        queue: deque[tuple[str, bytes, str, int]],
+        log: Callable[..., None],
+    ) -> int:
+        """Persist validated ZIPs hidden in local-file-header extra bytes."""
+
+        recovered = carve_zip_local_header_extras(
+            data,
+            max_candidates=16,
+            max_archive_size=store.limits["max_single_artifact"],
+            max_member_size=store.limits["max_single_artifact"],
+            max_total_size=store.limits["max_artifact_bytes"],
+        )
+        count = 0
+        for candidate in recovered:
+            offset = int(candidate["offset"])
+            label = f"embedded_zip_local_extra_at_{offset:x}"
+            artifact_id, created, reason = store.add_bytes(
+                candidate["data"],
+                label=label,
+                parent_id=parent_id,
+                producer="zip-local-header-extra",
+                transformation="carve validated ZIP from local-file-header extra field",
+                offset=offset,
+                kind="zip",
+                depth=depth + 1,
+                parameters={
+                    "outer_member": display_text(candidate.get("outer_member", ""), 500),
+                    "header_offset": int(candidate.get("header_offset", -1)),
+                    "extra_offset": int(candidate.get("extra_offset", -1)),
+                    "extra_length": int(candidate.get("extra_length", 0)),
+                    "archive_size": int(candidate.get("archive_size", len(candidate["data"]))),
+                    "entry_count": int(candidate.get("entry_count", 0)),
+                },
+            )
+            if artifact_id:
+                # Count validated candidates even when ArtifactStore
+                # deduplicates one already created by the generic signature
+                # carver; the latter still receives this method's stronger
+                # local-header provenance in its lineage.
+                count += 1
+                if created:
+                    queue.append((artifact_id, candidate["data"], "zip", depth + 1))
+            elif reason:
+                log("warning", f"Skipped local-header ZIP candidate: {reason}", "zip-local-extra-carver")
+        return count
+
+    @staticmethod
     def _expand_archive(
         data: bytes, kind: str, parent_id: str, depth: int, store: ArtifactStore,
         queue: deque[tuple[str, bytes, str, int]], add_finding: Callable[..., None], log: Callable[..., None],
@@ -1542,10 +1686,61 @@ class AnalysisEngine:
                 }, parent_id, "recursive-analysis")
             return count
 
+        if kind == "tar":
+            try:
+                with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
+                    members = archive.getmembers()
+                    if len(members) > 1000:
+                        add_finding({
+                            "severity": "warning", "category": "resource-limit", "title": "TAR entry count bounded",
+                            "description": "Only the first 1,000 regular-file entries were considered.",
+                            "details": {"declared_entries": len(members)},
+                        }, parent_id, "recursive-analysis")
+                    for member in members[:1000]:
+                        if not member.isfile() or member.size <= 0:
+                            continue
+                        if member.size > store.limits["max_single_artifact"]:
+                            log("warning", f"Skipped oversized TAR member {display_text(member.name, 200)}", "recursive-analysis", size=member.size)
+                            continue
+                        try:
+                            source = archive.extractfile(member)
+                            if source is None:
+                                continue
+                            with source:
+                                payload = source.read(store.limits["max_single_artifact"] + 1)
+                        except (OSError, EOFError, tarfile.TarError) as exc:
+                            log("warning", f"Could not read TAR member {display_text(member.name, 200)}: {display_text(exc, 300)}", "recursive-analysis")
+                            continue
+                        if len(payload) > store.limits["max_single_artifact"]:
+                            continue
+                        detected = sniff_kind(payload, member.name)
+                        artifact_id, created, reason = store.add_bytes(
+                            payload, label=f"tar_{Path(member.name).name or 'member'}", parent_id=parent_id,
+                            producer="tarfile", transformation="read regular TAR member without materializing its supplied path",
+                            kind=detected, depth=depth + 1,
+                            parameters={"archive_name": display_text(member.name, 500), "declared_size": member.size},
+                        )
+                        if artifact_id and created:
+                            queue.append((artifact_id, payload, detected, depth + 1))
+                            count += 1
+                        elif reason:
+                            log("warning", f"Skipped TAR member artifact: {reason}", "recursive-analysis")
+            except (tarfile.TarError, OSError, ValueError) as exc:
+                add_finding({
+                    "severity": "warning", "category": "archive", "title": "TAR parsing failed safely",
+                    "description": "The candidate TAR could not be traversed by the bounded stdlib reader.",
+                    "details": {"error": f"{type(exc).__name__}: {display_text(exc, 300)}"},
+                }, parent_id, "recursive-analysis")
+            return count
+
         decompressors = {
             "gzip": lambda value: _read_stream_bounded(gzip.GzipFile(fileobj=io.BytesIO(value)), store.limits["max_single_artifact"]),
             "bzip2": lambda value: _decompress_incremental(bz2.BZ2Decompressor(), value, store.limits["max_single_artifact"]),
             "xz": lambda value: _decompress_incremental(lzma.LZMADecompressor(), value, store.limits["max_single_artifact"]),
+            "lzip": lambda value: DECODERS["lzip"](value, store.limits["max_single_artifact"]),
+            "lz4": lambda value: DECODERS["lz4"](value, store.limits["max_single_artifact"]),
+            "lzma": lambda value: DECODERS["lzma"](value, store.limits["max_single_artifact"]),
+            "lzop": lambda value: DECODERS["lzop"](value, store.limits["max_single_artifact"]),
         }
         try:
             payload = decompressors[kind](data)
@@ -1557,9 +1752,31 @@ class AnalysisEngine:
             if artifact_id and created:
                 queue.append((artifact_id, payload, detected, depth + 1))
                 count += 1
+                # Compression layers frequently terminate in a textual hex
+                # dump split across line boundaries.  Decode the complete
+                # bounded payload here so later decoder fan-out cannot starve
+                # this deterministic child behind unrelated shell strings.
+                if detected == "text":
+                    try:
+                        text_payload = payload.decode("ascii").strip()
+                        compact = re.sub(r"\s+", "", text_payload)
+                        if len(compact) >= 12 and len(compact) % 2 == 0 and re.fullmatch(r"[0-9A-Fa-f]+", compact):
+                            hex_payload = bytes.fromhex(compact)
+                            hex_id, hex_created, hex_reason = store.add_bytes(
+                                hex_payload, label=f"{kind}_hex_decoded", parent_id=artifact_id,
+                                producer="bounded-hex-decoder", transformation=f"decode hexadecimal text after {kind} decompression",
+                                kind=sniff_kind(hex_payload), depth=depth + 2,
+                            )
+                            if hex_id and hex_created:
+                                queue.append((hex_id, hex_payload, sniff_kind(hex_payload), depth + 2))
+                                count += 1
+                            elif hex_reason:
+                                log("warning", f"Skipped decompressed hex artifact: {hex_reason}", "recursive-analysis")
+                    except (UnicodeDecodeError, ValueError):
+                        pass
             elif reason:
                 log("warning", f"Skipped decompressed artifact: {reason}", "recursive-analysis")
-        except (OSError, EOFError, ValueError, lzma.LZMAError) as exc:
+        except (OSError, EOFError, ValueError, CompressionError, lzma.LZMAError) as exc:
             add_finding({
                 "severity": "warning", "category": "archive", "title": f"{kind.upper()} decompression failed safely",
                 "description": "The compressed artifact was malformed or exceeded a configured limit.",
@@ -1577,6 +1794,15 @@ def _kind_from_extension(extension: str) -> str | None:
         ".png": "png", ".apng": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".jpe": "jpeg", ".mpo": "jpeg",
         ".gif": "gif", ".bmp": "bmp", ".dib": "bmp", ".webp": "webp", ".svg": "svg",
         ".tif": "tiff", ".tiff": "tiff", ".ico": "ico", ".cur": "ico",
+        ".pdf": "pdf",
+        ".pcap": "pcap", ".cap": "pcap", ".pcapng": "pcapng",
+        ".sqlite": "sqlite", ".sqlite3": "sqlite", ".db": "sqlite",
+        ".doc": "ole", ".xls": "ole", ".ppt": "ole", ".msg": "ole", ".rtf": "rtf", ".eml": "eml",
+        ".img": "disk", ".dd": "disk", ".iso": "disk", ".vhd": "disk", ".vhdx": "disk", ".vmdk": "disk",
+        ".e01": "ewf", ".ex01": "ewf", ".s01": "ewf", ".hive": "registry",
+        ".vmem": "memory", ".mem": "memory", ".lime": "memory", ".dmp": "memory", ".raw": "memory",
+        ".evtx": "evtx", ".pst": "pst", ".ost": "pst",
+        ".7z": "7z", ".rar": "rar", ".tar": "tar",
     }.get(extension)
 
 
@@ -1596,6 +1822,10 @@ def _text_method(source: str) -> str:
         return "metadata"
     if "lsb:" in lowered:
         return "built-in-lsb"
+    if "whitespace" in lowered:
+        return "whitespace-steg"
+    if "unicode" in lowered or "confusable" in lowered or "normalization" in lowered:
+        return "unicode-normalization"
     return "structured-text"
 
 
@@ -1635,6 +1865,14 @@ def _text_ratio(data: bytes) -> float:
 
 def _bounded_carve(data: bytes, offset: int, kind: str, maximum: int) -> bytes:
     available = data[offset:offset + maximum]
+    if kind == "zip":
+        trimmed = trim_zip_archive(
+            available,
+            max_size=maximum,
+            max_member_size=maximum,
+            max_total_size=maximum * 4,
+        )
+        return trimmed[0] if trimmed else b""
     if kind == "png":
         iend = available.find(b"IEND", 8)
         if iend >= 0 and iend + 8 <= len(available):

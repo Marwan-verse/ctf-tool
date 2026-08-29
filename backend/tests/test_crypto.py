@@ -19,6 +19,15 @@ def openssl_salted_fixture(passphrase: bytes, plaintext: bytes, digest_name: str
     return b"Salted__" + salt + encryptor.update(padded) + encryptor.finalize()
 
 
+def openssl_des3_salted_fixture(passphrase: bytes, plaintext: bytes) -> bytes:
+    salt = b"76543210"
+    key, iv = _evp_bytes_to_key(passphrase, salt, key_size=24, iv_size=8, digest_name="md5")
+    padding = 8 - (len(plaintext) % 8)
+    padded = plaintext + bytes([padding]) * padding
+    encryptor = Cipher(algorithms.TripleDES(key), modes.CBC(iv)).encryptor()
+    return b"Salted__" + salt + encryptor.update(padded) + encryptor.finalize()
+
+
 def test_detects_and_decrypts_base64_openssl_payload() -> None:
     passphrase = "correct horse battery staple"
     plaintext = b"flag{openssl_recovery_fixture} " + (b"encrypted payload context " * 20)
@@ -62,6 +71,18 @@ def test_openssl_sha256_kdf_variant_is_supported() -> None:
     )
 
     assert report["decryptions"][0]["algorithm"] == "openssl-aes-256-cbc"
+    assert report["decryptions"][0]["data"] == plaintext
+
+
+def test_openssl_des3_envelope_is_supported() -> None:
+    passphrase = "des3-secret"
+    plaintext = b"flag{openssl_des3_fixture}"
+    report = analyze_encrypted_payloads(
+        [{"artifact_id": "artifact-des3", "label": "des3", "kind": "binary", "data": openssl_des3_salted_fixture(passphrase.encode(), plaintext)}],
+        passphrase=passphrase,
+    )
+
+    assert report["decryptions"][0]["algorithm"] == "openssl-des-ede3-cbc"
     assert report["decryptions"][0]["data"] == plaintext
 
 

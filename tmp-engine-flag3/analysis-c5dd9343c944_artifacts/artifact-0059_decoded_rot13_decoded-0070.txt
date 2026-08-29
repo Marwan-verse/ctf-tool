@@ -1,0 +1,1 @@
+vs grfg -a "${xrrc_svyr}" && grfg -s 'synt'

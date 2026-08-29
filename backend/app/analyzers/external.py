@@ -45,6 +45,13 @@ class ResolvedTool:
 
 IMAGE_KINDS = frozenset({"png", "jpeg", "gif", "bmp", "webp", "tiff", "ico"})
 AUDIO_KINDS = frozenset({"audio", "wav", "aiff", "flac", "ogg", "mp3", "aac", "m4a", "au", "asf", "amr", "caf", "midi"})
+PDF_KINDS = frozenset({"pdf"})
+TEXT_KINDS = frozenset({"text", "svg"})
+NETWORK_KINDS = frozenset({"pcap", "pcapng"})
+ARCHIVE_KINDS = frozenset({"zip", "7z", "rar", "tar", "gzip", "bzip2", "xz", "zstd"})
+OFFICE_KINDS = frozenset({"ole", "rtf", "zip"})
+DISK_KINDS = frozenset({"disk", "ewf"})
+MEMORY_KINDS = frozenset({"memory"})
 
 
 TOOL_SPECS: tuple[ToolSpec, ...] = (
@@ -70,6 +77,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("binwalk", "binwalk", "Binwalk signature scan", "embedded-data", None, frozenset({"balanced", "deep"})),
     ToolSpec("foremost", "foremost", "Foremost recursive header/footer carving", "embedded-data", None, frozenset({"balanced", "deep"})),
     ToolSpec("7z", "7z", "7-Zip embedded/archive listing", "embedded-data", None, frozenset({"deep"})),
+    ToolSpec("7z_extract", "7z", "7-Zip bounded flat archive extraction", "embedded-data", ARCHIVE_KINDS, frozenset({"deep"}), "https://7-zip.org/"),
     ToolSpec("tiffinfo", "tiffinfo", "libtiff tiffinfo", "structure", frozenset({"tiff"}), frozenset({"balanced", "deep"})),
     ToolSpec("tiffdump", "tiffdump", "libtiff directory dump", "structure", frozenset({"tiff"}), frozenset({"deep"})),
     ToolSpec("webpinfo", "webpinfo", "WebP RIFF inspection", "structure", frozenset({"webp"}), frozenset({"quick", "balanced", "deep"})),
@@ -78,6 +86,38 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("gifsicle_repair", "gifsicle", "Gifsicle tolerant GIF rewrite", "repair", frozenset({"gif"}), frozenset({"balanced", "deep"}), "https://www.lcdf.org/gifsicle/"),
     ToolSpec("zipfix", "zip", "Info-ZIP archive repair", "repair", frozenset({"zip"}), frozenset({"deep"}), "https://infozip.sourceforge.net/"),
     ToolSpec("zipfix_deep", "zip", "Info-ZIP deep archive repair", "repair", frozenset({"zip"}), frozenset({"deep"}), "https://infozip.sourceforge.net/"),
+    ToolSpec("pdfinfo", "pdfinfo", "Poppler PDF metadata and page inspection", "metadata", PDF_KINDS, frozenset({"quick", "balanced", "deep"}), "https://poppler.freedesktop.org/"),
+    ToolSpec("pdftotext", "pdftotext", "Poppler PDF text extraction", "strings", PDF_KINDS, frozenset({"balanced", "deep"}), "https://poppler.freedesktop.org/"),
+    ToolSpec("pdfimages", "pdfimages", "Poppler PDF embedded-image extraction", "embedded-data", PDF_KINDS, frozenset({"deep"}), "https://poppler.freedesktop.org/"),
+    ToolSpec("pdfdetach_list", "pdfdetach", "Poppler PDF attachment listing", "embedded-data", PDF_KINDS, frozenset({"deep"}), "https://poppler.freedesktop.org/"),
+    ToolSpec("pdfdetach", "pdfdetach", "Poppler PDF attachment extraction", "embedded-data", PDF_KINDS, frozenset({"deep"}), "https://poppler.freedesktop.org/"),
+    ToolSpec("qpdf", "qpdf", "qpdf PDF structure and repair check", "repair", PDF_KINDS, frozenset({"deep"}), "https://qpdf.readthedocs.io/"),
+    ToolSpec("stegsnow", "stegsnow", "SNOW whitespace steganography decoder", "steganography", TEXT_KINDS, frozenset({"deep"}), "http://www.darkside.com.au/snow/"),
+    ToolSpec("capinfos", "capinfos", "Wireshark capture metadata", "network-metadata", NETWORK_KINDS, frozenset({"quick", "balanced", "deep"}), "https://www.wireshark.org/docs/man-pages/capinfos.html"),
+    ToolSpec("tshark", "tshark", "TShark packet and protocol summary", "network", NETWORK_KINDS, frozenset({"balanced", "deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("tshark_fields", "tshark", "TShark forensic field extraction", "network", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("tshark_usb_hid", "tshark", "TShark USB HID keystroke recovery", "network-decoding", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("tshark_http_objects", "tshark", "TShark HTTP object extraction", "embedded-data", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("tshark_smb_objects", "tshark", "TShark SMB object extraction", "embedded-data", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("tshark_tftp_objects", "tshark", "TShark TFTP object extraction", "embedded-data", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("tshark_imf_objects", "tshark", "TShark email object extraction", "embedded-data", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("pcapfix", "pcapfix", "pcapfix non-destructive capture repair", "repair", NETWORK_KINDS, frozenset({"balanced", "deep"}), "https://github.com/Rup0rt/pcapfix"),
+    ToolSpec("sqlite3", "sqlite3", "SQLite read-only safe database dump", "database", frozenset({"sqlite"}), frozenset({"balanced", "deep"}), "https://www.sqlite.org/cli.html"),
+    ToolSpec("oleid", "oleid", "Oletools document risk indicators", "document", OFFICE_KINDS, frozenset({"balanced", "deep"}), "https://github.com/decalage2/oletools"),
+    ToolSpec("olevba", "olevba", "Oletools VBA extraction and deobfuscation", "document", OFFICE_KINDS, frozenset({"deep"}), "https://github.com/decalage2/oletools"),
+    ToolSpec("oleobj", "oleobj", "Oletools embedded OLE object extraction", "embedded-data", frozenset({"ole", "zip"}), frozenset({"deep"}), "https://github.com/decalage2/oletools"),
+    ToolSpec("rtfobj", "rtfobj", "Oletools RTF object extraction", "embedded-data", frozenset({"rtf"}), frozenset({"deep"}), "https://github.com/decalage2/oletools"),
+    ToolSpec("mmls", "mmls", "Sleuth Kit partition layout", "disk", DISK_KINDS, frozenset({"quick", "balanced", "deep"}), "https://www.sleuthkit.org/"),
+    ToolSpec("fsstat", "fsstat", "Sleuth Kit filesystem metadata", "disk", frozenset({"disk"}), frozenset({"balanced", "deep"}), "https://www.sleuthkit.org/"),
+    ToolSpec("fls", "fls", "Sleuth Kit recursive allocated/deleted file listing", "disk", frozenset({"disk"}), frozenset({"deep"}), "https://www.sleuthkit.org/"),
+    ToolSpec("tsk_recover", "tsk_recover", "Sleuth Kit allocated/deleted file recovery", "embedded-data", frozenset({"disk"}), frozenset({"deep"}), "https://www.sleuthkit.org/"),
+    ToolSpec("ewfinfo", "ewfinfo", "libewf acquisition and media metadata", "disk", frozenset({"ewf"}), frozenset({"quick", "balanced", "deep"}), "https://github.com/libyal/libewf"),
+    ToolSpec("reglookup", "reglookup", "Read-only Windows registry hive enumeration", "registry", frozenset({"registry"}), frozenset({"balanced", "deep"}), "https://projects.sentinelchicken.org/reglookup/"),
+    ToolSpec("evtx_dump", "evtx_dump.py", "python-evtx event XML rendering", "event-log", frozenset({"evtx"}), frozenset({"balanced", "deep"}), "https://github.com/williballenthin/python-evtx"),
+    ToolSpec("lspst", "lspst", "libpst Outlook store listing", "email", frozenset({"pst"}), frozenset({"balanced", "deep"}), "https://www.five-ten-sg.com/libpst/"),
+    ToolSpec("readpst", "readpst", "libpst deleted-mail and attachment extraction", "embedded-data", frozenset({"pst"}), frozenset({"deep"}), "https://www.five-ten-sg.com/libpst/"),
+    ToolSpec("volatility3_banners", "vol", "Volatility 3 memory banner scan", "memory", MEMORY_KINDS, frozenset({"deep"}), "https://github.com/volatilityfoundation/volatility3"),
+    ToolSpec("volatility3_windows", "vol", "Volatility 3 offline Windows process triage", "memory", MEMORY_KINDS, frozenset({"deep"}), "https://github.com/volatilityfoundation/volatility3"),
     ToolSpec("tesseract", "tesseract", "Tesseract OCR command-line cross-check", "ocr", IMAGE_KINDS, frozenset({"balanced", "deep"})),
     ToolSpec("zbarimg", "zbarimg", "ZBar barcode command-line cross-check", "barcodes", IMAGE_KINDS, frozenset({"balanced", "deep"})),
     ToolSpec("ffprobe", "ffprobe", "FFprobe stream and codec inspection", "audio-metadata", AUDIO_KINDS, frozenset({"quick", "balanced", "deep"})),
@@ -88,6 +128,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("mediainfo", "mediainfo", "MediaInfo audio container inspection", "audio-metadata", AUDIO_KINDS, frozenset({"balanced", "deep"})),
     ToolSpec("multimon_ng", "multimon-ng", "multimon-ng DTMF and AFSK decoder", "audio-decoding", frozenset({"wav"}), frozenset({"deep"})),
     ToolSpec("minimodem", "minimodem", "minimodem 1200-baud FSK decoder", "audio-decoding", frozenset({"wav"}), frozenset({"deep"})),
+    ToolSpec("minimodem_300", "minimodem", "minimodem 300-baud Bell 103 FSK decoder", "audio-decoding", frozenset({"wav"}), frozenset({"deep"})),
 )
 
 
@@ -189,6 +230,8 @@ def _well_known_tool_directories(executable: str) -> tuple[str, ...]:
                 directories.extend(root.glob("ImageMagick-*"))
     elif executable in {"7z"}:
         directories.extend(root / "7-Zip" for root in program_roots)
+    elif executable in {"tshark", "capinfos"}:
+        directories.extend(root / "Wireshark" for root in program_roots)
     elif executable == "tesseract":
         directories.extend(root / "Tesseract-OCR" for root in program_roots)
     elif executable == "openstego":
@@ -387,7 +430,13 @@ class ExternalToolRunner:
             if selected_tools is not None and spec.tool_id not in selected_tools:
                 results.append(self._not_run(spec, "skipped", "Disabled in this job's analysis settings."))
                 continue
-            if not allow_extraction and spec.tool_id in {"foremost", "jpseek", "openstego", "outguess", "steghide", "stegseek", "ffmpeg_spectrogram", "ffmpeg_pcm", "sox_spectrogram"}:
+            if not allow_extraction and spec.tool_id in {
+                "foremost", "jpseek", "openstego", "outguess", "steghide", "stegseek",
+                "ffmpeg_spectrogram", "ffmpeg_pcm", "sox_spectrogram", "pdfimages", "pdfdetach",
+                "7z_extract", "tshark_http_objects", "tshark_smb_objects", "tshark_tftp_objects",
+                "tshark_imf_objects", "pcapfix", "oleobj", "rtfobj", "tsk_recover",
+                "readpst",
+            }:
                 results.append(self._not_run(spec, "skipped", "External payload extraction is disabled in this job's settings."))
                 continue
             if spec.kinds is not None and kind not in spec.kinds:
@@ -440,6 +489,7 @@ class ExternalToolRunner:
         foremost_inputs_scanned = 0
         foremost_depth_reached = 0
         foremost_recursive_failures = 0
+        disk_offsets: list[int] = []
         with tempfile.TemporaryDirectory(prefix=f"{spec.tool_id}-", dir=str(work_dir)) as temp_name:
             temp_dir = Path(temp_name)
             # WSL can retain its Windows current-working-directory handle briefly
@@ -497,6 +547,11 @@ class ExternalToolRunner:
                     executable, "extract", "-sf", str(input_path), "-p", steghide_password,
                     "-xf", str(extracted_path), "-f",
                 ]
+            elif spec.tool_id == "stegsnow":
+                argv = [executable, "-C", "-Q"]
+                if password is not None:
+                    argv.extend(["-p", password])
+                argv.append(str(input_path))
             elif spec.tool_id == "outguess":
                 if password is None:
                     return self._not_run(spec, "skipped", "A passphrase is required for bounded OutGuess extraction.", executable=resolution.display)
@@ -524,6 +579,13 @@ class ExternalToolRunner:
                 argv = [executable, "-Q", "-i", str(input_path), "-o", str(first_output_dir)]
             elif spec.tool_id == "7z":
                 argv = [executable, "l", "-slt", "--", str(input_path)]
+            elif spec.tool_id == "7z_extract":
+                extracted_dir = temp_dir / "7z-flat-output"
+                extracted_dir.mkdir()
+                argv = [executable, "e", "-y", "-bd", "-bb0", f"-o{extracted_dir}"]
+                if password is not None:
+                    argv.append(f"-p{password}")
+                argv.extend(["--", str(input_path)])
             elif spec.tool_id == "tiffinfo":
                 argv = [executable, str(input_path)]
             elif spec.tool_id == "tiffdump":
@@ -543,6 +605,123 @@ class ExternalToolRunner:
             elif spec.tool_id == "zipfix_deep":
                 extracted_path = temp_dir / "zipfix_deep_repaired.zip"
                 argv = [executable, "-FF", str(input_path), "--out", str(extracted_path)]
+            elif spec.tool_id == "pdfinfo":
+                argv = [executable, str(input_path)]
+            elif spec.tool_id == "pdftotext":
+                extracted_path = temp_dir / "pdftotext.txt"
+                argv = [executable, "-enc", "UTF-8", "-nopgbrk", str(input_path), str(extracted_path)]
+            elif spec.tool_id == "pdfimages":
+                extracted_dir = temp_dir / "pdfimages-output"
+                extracted_dir.mkdir()
+                argv = [executable, "-all", str(input_path), str(extracted_dir / "image")]
+            elif spec.tool_id == "pdfdetach":
+                extracted_dir = temp_dir / "pdfdetach-output"
+                extracted_dir.mkdir()
+                argv = [executable, "-saveall", "-o", str(extracted_dir), str(input_path)]
+            elif spec.tool_id == "pdfdetach_list":
+                argv = [executable, "-list", str(input_path)]
+            elif spec.tool_id == "qpdf":
+                argv = [executable, "--check", str(input_path)]
+            elif spec.tool_id == "capinfos":
+                argv = [executable, "-M", str(input_path)]
+            elif spec.tool_id == "tshark":
+                argv = [executable, "-n", "-r", str(input_path), "-c", "5000"]
+            elif spec.tool_id == "tshark_fields":
+                argv = [
+                    executable, "-n", "-r", str(input_path), "-c", "20000",
+                    "-T", "fields", "-E", "header=y", "-E", "separator=/t", "-E", "occurrence=a",
+                    "-e", "frame.number", "-e", "frame.time_epoch", "-e", "frame.protocols",
+                    "-e", "ip.src", "-e", "ip.dst", "-e", "ipv6.src", "-e", "ipv6.dst",
+                    "-e", "tcp.stream", "-e", "tcp.srcport", "-e", "tcp.dstport", "-e", "tcp.seq",
+                    "-e", "udp.stream", "-e", "udp.srcport", "-e", "udp.dstport",
+                    "-e", "dns.qry.name", "-e", "dns.qry.type", "-e", "dns.resp.name",
+                    "-e", "dns.a", "-e", "dns.aaaa", "-e", "dns.cname", "-e", "dns.txt",
+                    "-e", "http.request.method", "-e", "http.host", "-e", "http.request.uri",
+                    "-e", "http.request.full_uri", "-e", "http.response.code", "-e", "http.content_type",
+                    "-e", "ftp.request.command", "-e", "ftp.request.arg",
+                    "-e", "ftp.response.code", "-e", "ftp.response.arg",
+                    "-e", "smtp.req.command", "-e", "smtp.req.parameter",
+                    "-e", "smtp.response.code", "-e", "smtp.rsp.parameter",
+                    "-e", "imf.from", "-e", "imf.to", "-e", "imf.subject", "-e", "imf.content.type",
+                    "-e", "irc.request", "-e", "irc.response",
+                    "-e", "icmp.type", "-e", "icmp.code", "-e", "icmp.ident", "-e", "icmp.seq",
+                    "-e", "icmpv6.type", "-e", "icmpv6.code",
+                    "-e", "tls.handshake.type", "-e", "tls.handshake.extensions_server_name",
+                    "-e", "data.data", "-e", "tcp.payload", "-e", "udp.payload",
+                    "-e", "tcp.reassembled.data", "-e", "http.file_data",
+                ]
+            elif spec.tool_id == "tshark_usb_hid":
+                argv = [
+                    executable, "-n", "-r", str(input_path), "-c", "50000",
+                    "-Y", "usb.capdata || usbhid.data", "-T", "fields",
+                    "-E", "separator=/t", "-e", "usb.src", "-e", "usb.capdata", "-e", "usbhid.data",
+                ]
+            elif spec.tool_id in {
+                "tshark_http_objects", "tshark_smb_objects", "tshark_tftp_objects", "tshark_imf_objects",
+            }:
+                protocol = {
+                    "tshark_http_objects": "http",
+                    "tshark_smb_objects": "smb",
+                    "tshark_tftp_objects": "tftp",
+                    "tshark_imf_objects": "imf",
+                }[spec.tool_id]
+                extracted_dir = temp_dir / f"tshark-{protocol}-objects"
+                extracted_dir.mkdir()
+                argv = [executable, "-n", "-r", str(input_path), "-q", "--export-objects", f"{protocol},{extracted_dir}"]
+            elif spec.tool_id == "pcapfix":
+                suffix = ".pcapng" if input_path.suffix.casefold() == ".pcapng" else ".pcap"
+                extracted_path = temp_dir / f"pcapfix_repaired{suffix}"
+                argv = [
+                    executable, "--deep-scan", "--outfile", str(extracted_path), str(input_path),
+                ]
+            elif spec.tool_id == "sqlite3":
+                argv = [executable, "-readonly", "-safe", str(input_path), ".dump"]
+            elif spec.tool_id == "oleid":
+                argv = [executable, str(input_path)]
+            elif spec.tool_id == "olevba":
+                argv = [executable, "--decode"]
+                if password is not None:
+                    argv.extend(["-p", password])
+                argv.append(str(input_path))
+            elif spec.tool_id == "oleobj":
+                extracted_dir = temp_dir / "oleobj-output"
+                extracted_dir.mkdir()
+                argv = [executable, "-d", str(extracted_dir), str(input_path)]
+            elif spec.tool_id == "rtfobj":
+                extracted_dir = temp_dir / "rtfobj-output"
+                extracted_dir.mkdir()
+                argv = [executable, "-s", "all", "-d", str(extracted_dir), str(input_path)]
+            elif spec.tool_id == "mmls":
+                argv = [executable, str(input_path)]
+            elif spec.tool_id == "fsstat":
+                disk_offsets = self._raw_partition_offsets(input_path)
+                argv = [executable, *(["-o", str(disk_offsets[0])] if disk_offsets else []), str(input_path)]
+            elif spec.tool_id == "fls":
+                disk_offsets = self._raw_partition_offsets(input_path)
+                argv = [executable, "-r", "-p", *(["-o", str(disk_offsets[0])] if disk_offsets else []), str(input_path)]
+            elif spec.tool_id == "tsk_recover":
+                disk_offsets = self._raw_partition_offsets(input_path)
+                extracted_dir = temp_dir / "tsk-recover-output"
+                extracted_dir.mkdir()
+                target = extracted_dir / (f"partition-{disk_offsets[0]}" if disk_offsets else "filesystem")
+                target.mkdir()
+                argv = [executable, "-e", *(["-o", str(disk_offsets[0])] if disk_offsets else []), str(input_path), str(target)]
+            elif spec.tool_id == "ewfinfo":
+                argv = [executable, str(input_path)]
+            elif spec.tool_id == "reglookup":
+                argv = [executable, str(input_path)]
+            elif spec.tool_id == "evtx_dump":
+                argv = [executable, str(input_path)]
+            elif spec.tool_id == "lspst":
+                argv = [executable, "-l", str(input_path)]
+            elif spec.tool_id == "readpst":
+                extracted_dir = temp_dir / "readpst-output"
+                extracted_dir.mkdir()
+                argv = [executable, "-D", "-e", "-j", "1", "-q", "-o", str(extracted_dir), str(input_path)]
+            elif spec.tool_id == "volatility3_banners":
+                argv = [executable, "--offline", "-f", str(input_path), "banners.Banners"]
+            elif spec.tool_id == "volatility3_windows":
+                argv = [executable, "--offline", "-f", str(input_path), "windows.pslist.PsList"]
             elif spec.tool_id == "tesseract":
                 argv = [executable, str(input_path), "stdout", "-l", ocr_language, "--psm", "6"]
             elif spec.tool_id == "zbarimg":
@@ -576,6 +755,8 @@ class ExternalToolRunner:
                 argv = [executable, "-q", "-a", "DTMF", "-a", "AFSK1200", "-a", "AFSK2400", "-t", "wav", str(input_path)]
             elif spec.tool_id == "minimodem":
                 argv = [executable, "--rx", "1200", "-f", str(input_path)]
+            elif spec.tool_id == "minimodem_300":
+                argv = [executable, "--rx", "300", "-f", str(input_path)]
             else:
                 return self._not_run(spec, "skipped", "No fixed invocation is registered.", executable=resolution.display)
 
@@ -583,6 +764,41 @@ class ExternalToolRunner:
             start = time.monotonic()
             launch_argv = self._launch_argv(resolution, argv[1:])
             execution = self._execute(launch_argv, cwd=execution_cwd, stdin_data=stdin_data)
+            if spec.tool_id in {"fsstat", "fls", "tsk_recover"} and len(disk_offsets) > 1:
+                successful = int(execution["status"] == "completed")
+                deadline = start + self.timeout
+                for offset in disk_offsets[1:8]:
+                    remaining_seconds = int(deadline - time.monotonic())
+                    if remaining_seconds < 1 or cancel_requested(self.is_cancelled):
+                        break
+                    if spec.tool_id == "fsstat":
+                        extra_argv = [executable, "-o", str(offset), str(input_path)]
+                    elif spec.tool_id == "fls":
+                        extra_argv = [executable, "-r", "-p", "-o", str(offset), str(input_path)]
+                    else:
+                        assert extracted_dir is not None
+                        target = extracted_dir / f"partition-{offset}"
+                        target.mkdir()
+                        extra_argv = [executable, "-e", "-o", str(offset), str(input_path), str(target)]
+                    extra = self._execute(
+                        self._launch_argv(resolution, extra_argv[1:]),
+                        cwd=execution_cwd,
+                        timeout=remaining_seconds,
+                    )
+                    successful += int(extra["status"] == "completed")
+                    heading = f"\n\n[Partition sector offset {offset}]\n"
+                    for stream in ("stdout", "stderr"):
+                        combined = execution[stream] + heading + extra[stream]
+                        if len(combined.encode("utf-8", "replace")) > self.output_limit:
+                            execution["output_truncated"] = True
+                        execution[stream] = display_text(combined, self.output_limit)
+                    execution["output_truncated"] = bool(execution["output_truncated"] or extra["output_truncated"])
+                    if extra["status"] == "cancelled":
+                        execution["status"] = "cancelled"
+                        break
+                if successful and execution["status"] not in {"cancelled", "timed_out"}:
+                    execution["status"] = "completed"
+                    execution["return_code"] = 0
             if spec.tool_id == "foremost":
                 foremost_inputs_scanned = 1
                 foremost_depth_reached = 1 if execution["status"] == "completed" else 0
@@ -638,6 +854,14 @@ class ExternalToolRunner:
             duration_ms = int((time.monotonic() - start) * 1000)
             stdout = self._sanitize(execution["stdout"], input_path, temp_dir, password)
             stderr = self._sanitize(execution["stderr"], input_path, temp_dir, password)
+            if spec.tool_id == "tshark_usb_hid" and stdout:
+                decoded_hid = self._decode_usb_hid(stdout)
+                if decoded_hid:
+                    stdout = display_text(stdout + "\n\n[Decoded USB HID keystrokes]\n" + decoded_hid, self.output_limit)
+            elif spec.tool_id == "tshark_fields" and stdout:
+                decoded_payloads = self._decode_tshark_payloads(stdout)
+                if decoded_payloads:
+                    stdout = display_text(stdout + "\n\n[Decoded packet payload text]\n" + decoded_payloads, self.output_limit)
             public_argv = self._redacted_argv(spec.tool_id, argv, password, input_path, temp_dir)
             if resolution.source == "wsl":
                 public_argv = ["wsl.exe", "--", resolution.executable, *public_argv[1:]]
@@ -680,7 +904,9 @@ class ExternalToolRunner:
                     if spec.tool_id == "foremost"
                     else ({
                         "passphrase_strategy": "supplied" if password is not None else "automatic_empty",
-                    } if spec.tool_id == "steghide" else {})
+                    } if spec.tool_id == "steghide" else ({
+                        "partition_offsets": disk_offsets[:8],
+                    } if spec.tool_id in {"fsstat", "fls", "tsk_recover"} else {}))
                 ),
                 "extracted": [],
             }
@@ -711,6 +937,8 @@ class ExternalToolRunner:
                             "gifsicle_repair": ("gifsicle_repaired", "rewrite a GIF with Gifsicle's tolerant parser"),
                             "zipfix": ("zipfix_repaired", "repair a ZIP with Info-ZIP -F"),
                             "zipfix_deep": ("zipfix_deep_repaired", "scan and repair a ZIP with Info-ZIP -FF"),
+                            "pcapfix": ("pcapfix_repaired", "repair a damaged PCAP/PCAPNG with pcapfix"),
+                            "pdftotext": ("pdftotext_text", "extract PDF page text with Poppler"),
                             "jpseek": ("jpseek_payload", "extract a JPHide payload with JPSeek"),
                             "ffmpeg_spectrogram": ("ffmpeg_spectrogram", "render a full-band FFmpeg spectrogram"),
                             "ffmpeg_pcm": ("ffmpeg_audacity_review", "convert decoded audio to Audacity-compatible 16-bit PCM WAV"),
@@ -802,13 +1030,151 @@ class ExternalToolRunner:
         return retained
 
     @staticmethod
+    def _raw_partition_offsets(path: Path) -> list[int]:
+        """Return bounded MBR/GPT filesystem starts without mounting the image."""
+
+        try:
+            with path.open("rb") as handle:
+                head = handle.read(1024 * 1024)
+        except OSError:
+            return []
+        offsets: list[int] = []
+        if len(head) >= 512 and head[510:512] == b"\x55\xaa":
+            for index in range(4):
+                entry = head[446 + index * 16:462 + index * 16]
+                if len(entry) < 16 or entry[0] not in {0, 0x80} or entry[4] in {0, 0xEE}:
+                    continue
+                start = int.from_bytes(entry[8:12], "little")
+                sectors = int.from_bytes(entry[12:16], "little")
+                if start and sectors:
+                    offsets.append(start)
+        if len(head) >= 1024 and head[512:520] == b"EFI PART":
+            entry_lba = int.from_bytes(head[584:592], "little")
+            entry_count = min(int.from_bytes(head[592:596], "little"), 128)
+            entry_size = int.from_bytes(head[596:600], "little")
+            start_at = entry_lba * 512
+            if 128 <= entry_size <= 4096 and start_at < len(head):
+                for index in range(entry_count):
+                    entry = head[start_at + index * entry_size:start_at + (index + 1) * entry_size]
+                    if len(entry) < 48 or entry[:16] == b"\x00" * 16:
+                        continue
+                    first_lba = int.from_bytes(entry[32:40], "little")
+                    last_lba = int.from_bytes(entry[40:48], "little")
+                    if first_lba and last_lba >= first_lba:
+                        offsets.append(first_lba)
+        return sorted(dict.fromkeys(offsets))[:8]
+
+    @staticmethod
+    def _decode_tshark_payloads(output: str) -> str:
+        """Decode bounded hex-valued TShark fields into candidate text."""
+
+        recovered: list[str] = []
+        seen: set[bytes] = set()
+        total = 0
+        for line in output.splitlines()[1:20_001]:
+            for field in re.split(r"[|\t]", line):
+                normalized = re.sub(r"[:,\s]", "", field)
+                if len(normalized) < 8 or len(normalized) % 2 or not re.fullmatch(r"[0-9A-Fa-f]+", normalized):
+                    continue
+                try:
+                    payload = bytes.fromhex(normalized)[:256 * 1024]
+                except ValueError:
+                    continue
+                if payload in seen:
+                    continue
+                seen.add(payload)
+                printable = sum(byte in b"\t\r\n" or 32 <= byte <= 126 for byte in payload)
+                if not payload or printable / len(payload) < 0.55:
+                    continue
+                text_value = payload.decode("utf-8", "replace")
+                recovered.append(display_text(text_value, 64 * 1024))
+                total += len(text_value)
+                if total >= 1024 * 1024 or len(recovered) >= 200:
+                    return "\n".join(recovered)
+        return "\n".join(recovered)
+
+    @staticmethod
+    def _decode_usb_hid(output: str) -> str:
+        """Decode conventional 8-byte boot-keyboard reports from TShark fields."""
+
+        unshifted = {
+            **{code: chr(ord("a") + code - 4) for code in range(4, 30)},
+            **{code: value for code, value in zip(range(30, 40), "1234567890", strict=True)},
+            40: "\n", 42: "\b", 43: "\t", 44: " ", 45: "-", 46: "=",
+            47: "[", 48: "]", 49: "\\", 51: ";", 52: "'", 53: "`",
+            54: ",", 55: ".", 56: "/",
+        }
+        shifted = {
+            **{code: value.upper() for code, value in unshifted.items() if 4 <= code <= 29},
+            **{code: value for code, value in zip(range(30, 40), "!@#$%^&*()", strict=True)},
+            40: "\n", 42: "\b", 43: "\t", 44: " ", 45: "_", 46: "+",
+            47: "{", 48: "}", 49: "|", 51: ":", 52: '"', 53: "~",
+            54: "<", 55: ">", 56: "?",
+        }
+        states: dict[str, set[int]] = {}
+        texts: dict[str, list[str]] = {}
+        valid_counts: dict[str, int] = {}
+        for line in output.splitlines()[:50_000]:
+            fields = re.split(r"[|\t]", line)
+            source = fields[0].strip() if fields else "unknown"
+            candidates = fields[1:] if len(fields) > 1 else fields
+            raw = next((value for value in candidates if value.strip()), "")
+            normalized = re.sub(r"[:\s]", "", raw)
+            if len(normalized) != 16 or not re.fullmatch(r"[0-9A-Fa-f]{16}", normalized):
+                continue
+            report = bytes.fromhex(normalized)
+            if report[1] != 0 or any(code > 0xE7 for code in report[2:]):
+                continue
+            valid_counts[source] = valid_counts.get(source, 0) + 1
+            current = {code for code in report[2:] if code}
+            previous = states.get(source, set())
+            mapping = shifted if report[0] & 0x22 else unshifted
+            target = texts.setdefault(source, [])
+            for code in report[2:]:
+                if not code or code in previous:
+                    continue
+                value = mapping.get(code)
+                if value == "\b":
+                    if target:
+                        target.pop()
+                elif value:
+                    target.append(value)
+            states[source] = current
+        decoded: list[str] = []
+        for source, values in sorted(texts.items()):
+            rendered = "".join(values).strip()
+            if valid_counts.get(source, 0) >= 3 and len(rendered) >= 3:
+                decoded.append(f"[{source or 'unknown device'}]\n{display_text(rendered, 64 * 1024)}")
+        return "\n\n".join(decoded)
+
+    @staticmethod
     def _launch_argv(resolution: ResolvedTool, arguments: list[str]) -> list[str]:
         if resolution.source == "native":
             return [str(resolution.launcher), *arguments]
         if resolution.source == "ruby":
             return [str(resolution.launcher), resolution.executable, *arguments]
-        converted = [_windows_path_to_wsl(value) for value in arguments]
+        converted = [ExternalToolRunner._wsl_argument(value) for value in arguments]
         return [str(resolution.launcher), "--", resolution.executable, *converted]
+
+    @staticmethod
+    def _wsl_argument(value: str) -> str:
+        """Translate fixed CLI options that embed a Windows output path."""
+
+        direct = _windows_path_to_wsl(value)
+        if direct != value:
+            return direct
+        for prefix in ("-o", "--out="):
+            if value.startswith(prefix):
+                suffix = value[len(prefix):]
+                converted = _windows_path_to_wsl(suffix)
+                if converted != suffix:
+                    return prefix + converted
+        head, separator, suffix = value.rpartition(",")
+        if separator:
+            converted = _windows_path_to_wsl(suffix)
+            if converted != suffix:
+                return head + separator + converted
+        return value
 
     @staticmethod
     def _normalize_outcome(
@@ -984,6 +1350,8 @@ class ExternalToolRunner:
             if value in {"-p", "-k"}:
                 redacted.append(value)
                 hide_next = True
+            elif password is not None and value == f"-p{password}":
+                redacted.append("-p<redacted>")
             elif password is not None and value == password:
                 redacted.append("<redacted>")
             elif value == str(input_path):

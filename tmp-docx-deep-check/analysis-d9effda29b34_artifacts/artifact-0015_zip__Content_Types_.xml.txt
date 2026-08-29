@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<flag>ICC{94290dd387d4aa735d1c72a6555eca15c3ade529}</flag>

@@ -1,0 +1,1 @@
+vs grfg ! -q ${ybpx_qve} ; gura :

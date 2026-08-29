@@ -10,8 +10,9 @@ import io
 import lzma
 import re
 import urllib.parse
+import unicodedata
 import zlib
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -165,7 +166,7 @@ class CandidateCollector:
         elif prefix.lower() in {"flag", "ctf", "picoctf", "htb", "thm", "ductf"}:
             score += 18
             reasons.append("uses a common CTF prefix")
-        deterministic = {"raw-bytes", "metadata", "png-text", "jpeg-comment", "svg-text", "barcode", "archive-member"}
+        deterministic = {"raw-bytes", "metadata", "png-text", "jpeg-comment", "svg-text", "whitespace-steg", "unicode-normalization", "barcode", "archive-member"}
         if method.split(":", 1)[0] in deterministic:
             score += 10
             reasons.append("came from a deterministic extraction")
@@ -194,7 +195,12 @@ def inspect_bytes(data: bytes, *, max_strings: int) -> dict[str, Any]:
     utf16_records = list(iter_utf16_strings(data, minimum=4, limit=min(remaining, max_strings // 2)))
     remaining = max(0, max_strings - len(ascii_records) - len(utf16_records))
     svg_records = _svg_text_records(data, limit=min(remaining, 2_000))
-    records = sorted(ascii_records + utf16_records + svg_records, key=lambda item: (item["offset"], item["encoding"]))
+    whitespace_records = _whitespace_steg_records(data, limit=min(max_strings, 128))
+    unicode_records = _unicode_confusable_records(data, limit=min(max_strings, 128))
+    records = sorted(
+        ascii_records + utf16_records + svg_records + whitespace_records + unicode_records,
+        key=lambda item: (item["offset"], item["encoding"]),
+    )[:max_strings]
     byte_counts = [0] * 256
     for byte in data:
         byte_counts[byte] += 1
@@ -205,6 +211,147 @@ def inspect_bytes(data: bytes, *, max_strings: int) -> dict[str, Any]:
         "strings": records,
         "strings_truncated": len(records) >= max_strings,
     }
+
+
+def _unicode_confusable_records(data: bytes, *, limit: int) -> list[dict[str, Any]]:
+    """Expose bounded Unicode NFKC/confusable normalization for text CTFs.
+
+    Full-width Latin, mathematical alphabets, and visually similar code
+    points are frequently mixed into otherwise ordinary flag text. This is a
+    presentation-only normalization: source bytes remain immutable and no
+    invisible/control characters are executed.
+    """
+
+    if limit <= 0 or not data:
+        return []
+    try:
+        text = data[: 4 * 1024 * 1024].decode("utf-8")
+    except UnicodeDecodeError:
+        return []
+    if not any(ord(character) > 127 for character in text):
+        return []
+    normalized = unicodedata.normalize("NFKC", text)
+    confusables = {
+        "а": "a", "е": "e", "і": "i", "о": "o", "р": "p", "с": "c", "х": "x", "у": "y",
+        "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H", "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O", "Ρ": "P", "Τ": "T", "Χ": "X", "Υ": "Y",
+        "α": "a", "β": "b", "ε": "e", "ι": "i", "κ": "k", "ν": "v", "ο": "o", "ρ": "p", "τ": "t", "χ": "x", "υ": "y",
+    }
+    normalized = "".join(confusables.get(character, character) for character in normalized)
+    if normalized == text:
+        return []
+    printable = sum(1 for character in normalized if character in "\t\r\n" or 32 <= ord(character) <= 126 or ord(character) >= 160)
+    if printable / max(1, len(normalized)) < 0.78:
+        return []
+    candidate = display_text(normalized, 2_000_000)
+    flag_like = bool(_GENERIC_FLAG.search(candidate) or _BROAD_FLAG.search(candidate))
+    if not flag_like and len(candidate.strip()) < 12:
+        return []
+    return [{
+        "source": "unicode-confusables",
+        "offset": 0,
+        "encoding": "unicode-normalization",
+        "text": candidate,
+        "confidence_hint": 12 if flag_like else 5,
+        "transform_chain": ["UTF-8 decode", "Unicode NFKC normalization", "common Cyrillic/Greek confusable mapping"],
+    }]
+
+
+def _whitespace_steg_records(data: bytes, *, limit: int) -> list[dict[str, Any]]:
+    """Recover bounded two-symbol whitespace bitstreams from text files.
+
+    CTFs frequently replace ordinary spaces with a visually identical Unicode
+    space (or use tabs/space pairs) and encode one bit per character.  The
+    decoder only considers streams with two well-populated whitespace classes,
+    tries both polarity/bit-order conventions, and emits printable or
+    flag-shaped results.  It never treats arbitrary binary bytes as text.
+    """
+
+    if limit <= 0 or not isinstance(data, (bytes, bytearray)) or not data:
+        return []
+    # Keep the temporary character/bit lists bounded well below the per-job
+    # artifact budget; a whitespace channel rarely needs more than 1 MiB.
+    sample = bytes(data[: 4 * 1024 * 1024])
+    try:
+        text = sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return []
+
+    stream_specs: list[tuple[str, str, str, list[str]]] = []
+    counts = Counter(character for character in text if character.isspace() and character not in "\r\n")
+    ordinary_space = counts.get(" ", 0)
+    if ordinary_space >= 8:
+        # Unicode whitespace substitutions are the common “whitepages” form.
+        for character, count in counts.most_common(8):
+            if character == " " or ord(character) <= 127 or count < 8:
+                continue
+            stream_specs.append(("unicode-whitespace", "U+0020", f"U+{ord(character):04X}", [" ", character]))
+
+    # SNOW-style payloads normally use only spaces and tabs at line ends.
+    trailing: list[str] = []
+    for line in text.splitlines():
+        match = re.search(r"[ \t]+$", line)
+        if match:
+            trailing.append(match.group(0))
+    trailing_text = "".join(trailing)
+    trailing_counts = Counter(trailing_text)
+    if trailing_counts.get(" ", 0) >= 8 and trailing_counts.get("\t", 0) >= 8:
+        stream_specs.append(("line-trailing", "U+0020", "U+0009", [" ", "\t"]))
+
+    # Zero-width binary channels do not satisfy str.isspace().
+    zero_width = ["\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"]
+    zero_counts = Counter(character for character in text if character in zero_width)
+    present_zero = [character for character, count in zero_counts.most_common(4) if count >= 8]
+    if len(present_zero) >= 2:
+        stream_specs.append(("zero-width", f"U+{ord(present_zero[0]):04X}", f"U+{ord(present_zero[1]):04X}", present_zero[:2]))
+
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for family, first_name, second_name, symbols in stream_specs:
+        stream = "".join(character for character in text if character in symbols)
+        if family == "line-trailing":
+            stream = trailing_text
+        stream = stream[: 1 * 1024 * 1024]
+        if len(stream) < 64:
+            continue
+        symbol_counts = Counter(stream)
+        if any(symbol_counts.get(symbol, 0) < 8 for symbol in symbols):
+            continue
+        for inverted in (False, True):
+            for lsb_first in (False, True):
+                bits = [1 if character == symbols[1] else 0 for character in stream]
+                if inverted:
+                    bits = [1 - bit for bit in bits]
+                decoded = bytearray()
+                for cursor in range(0, len(bits) - 7, 8):
+                    group = bits[cursor:cursor + 8]
+                    if lsb_first:
+                        group.reverse()
+                    decoded.append(sum(bit << (7 - index) for index, bit in enumerate(group)))
+                if not decoded:
+                    continue
+                candidate = bytes(decoded).decode("utf-8", "replace").strip("\x00 \t\r\n")
+                if not candidate or candidate in seen:
+                    continue
+                printable = sum(1 for character in candidate if character in "\t\r\n" or 32 <= ord(character) <= 126) / len(candidate)
+                flag_like = bool(_GENERIC_FLAG.search(candidate) or _BROAD_FLAG.search(candidate))
+                if not flag_like and (len(candidate) < 12 or printable < 0.78):
+                    continue
+                seen.add(candidate)
+                records.append({
+                    "source": "whitespace-bitstream",
+                    "offset": 0,
+                    "encoding": "whitespace-bits",
+                    "text": display_text(candidate, 2_000_000),
+                    "confidence_hint": 14 if flag_like else 6,
+                    "transform_chain": [
+                        f"extract {family} symbols {first_name}/{second_name}",
+                        "invert bit mapping" if inverted else "preserve bit mapping",
+                        "pack LSB-first" if lsb_first else "pack MSB-first",
+                    ],
+                })
+                if len(records) >= limit:
+                    return records
+    return records
 
 
 def _svg_text_records(data: bytes, *, limit: int) -> list[dict[str, Any]]:
@@ -309,7 +456,29 @@ class BoundedDecoder:
         seen: set[str] = set()
         results: list[DecodedNode] = []
 
-        for seed_index, seed in enumerate(seeds):
+        seed_list = list(seeds)
+        # Binary and event-log string scanners commonly split one logical
+        # value at line or record boundaries.  Rejoin adjacent hex lines from
+        # the same artifact before exploring transforms, while retaining each
+        # original seed for provenance and avoiding arbitrary concatenation.
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for seed in seed_list:
+            artifact_id = seed.get("artifact_id") or seed.get("source_artifact_id")
+            if artifact_id:
+                grouped.setdefault(str(artifact_id), []).append(seed)
+        for artifact_id, records in grouped.items():
+            if len(records) < 2:
+                continue
+            ordered = sorted(records, key=lambda item: int(item.get("offset") or 0))
+            combined = "\n".join(str(item.get("text", "")) for item in ordered if item.get("text"))
+            compact = re.sub(r"\s+", "", combined)
+            if len(compact) >= 24 and len(compact) % 2 == 0 and re.fullmatch(r"[0-9A-Fa-f]+", compact):
+                seed_list.append({
+                    "text": combined, "offset": ordered[0].get("offset"),
+                    "artifact_id": artifact_id, "source": "rejoined-string-records",
+                })
+
+        for seed_index, seed in enumerate(seed_list):
             if len(queue) >= self.max_nodes:
                 break
             text = str(seed.get("text", "")).strip()

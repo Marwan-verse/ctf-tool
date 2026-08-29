@@ -1,0 +1,1 @@
+grfg ! -s ${fg1} && grfg -s ${s}; gura

@@ -37,6 +37,7 @@ WSL_APT_PACKAGES: dict[str, tuple[str, ...]] = {
     "binwalk": ("binwalk",),
     "foremost": ("foremost",),
     "7z": ("7zip",),
+    "7z_extract": ("7zip",),
     "tiffinfo": ("libtiff-tools",),
     "tiffdump": ("libtiff-tools",),
     "webpinfo": ("webp",),
@@ -45,6 +46,35 @@ WSL_APT_PACKAGES: dict[str, tuple[str, ...]] = {
     "gifsicle_repair": ("gifsicle",),
     "zipfix": ("zip",),
     "zipfix_deep": ("zip",),
+    "pdfinfo": ("poppler-utils",),
+    "pdftotext": ("poppler-utils",),
+    "pdfimages": ("poppler-utils",),
+    "pdfdetach_list": ("poppler-utils",),
+    "pdfdetach": ("poppler-utils",),
+    "qpdf": ("qpdf",),
+    "stegsnow": ("stegsnow",),
+    "capinfos": ("wireshark-common",),
+    "tshark": ("tshark",),
+    "tshark_fields": ("tshark",),
+    "tshark_usb_hid": ("tshark",),
+    "tshark_http_objects": ("tshark",),
+    "tshark_smb_objects": ("tshark",),
+    "tshark_tftp_objects": ("tshark",),
+    "tshark_imf_objects": ("tshark",),
+    "pcapfix": ("pcapfix",),
+    "sqlite3": ("sqlite3",),
+    "oleid": ("oletools",),
+    "olevba": ("oletools",),
+    "oleobj": ("oletools",),
+    "rtfobj": ("oletools",),
+    "mmls": ("sleuthkit",),
+    "fsstat": ("sleuthkit",),
+    "fls": ("sleuthkit",),
+    "tsk_recover": ("sleuthkit",),
+    "ewfinfo": ("ewf-tools",),
+    "reglookup": ("reglookup",),
+    "lspst": ("pst-utils",),
+    "readpst": ("pst-utils",),
     "tesseract": ("tesseract-ocr",),
     "zbarimg": ("zbar-tools",),
     "ffprobe": ("ffmpeg",),
@@ -55,6 +85,7 @@ WSL_APT_PACKAGES: dict[str, tuple[str, ...]] = {
     "mediainfo": ("mediainfo",),
     "multimon_ng": ("multimon-ng",),
     "minimodem": ("minimodem",),
+    "minimodem_300": ("minimodem",),
 }
 
 # These identifiers are fixed package-manager coordinates. No package name or
@@ -74,17 +105,30 @@ WINGET_PACKAGE_IDS: dict[str, str] = {
     "sox_stats": "ChrisBagwell.SoX",
     "sox_spectrogram": "ChrisBagwell.SoX",
     "mediainfo": "MediaArea.MediaInfo",
+    "capinfos": "WiresharkFoundation.Wireshark",
+    "tshark": "WiresharkFoundation.Wireshark",
+    "tshark_fields": "WiresharkFoundation.Wireshark",
+    "tshark_usb_hid": "WiresharkFoundation.Wireshark",
+    "tshark_http_objects": "WiresharkFoundation.Wireshark",
+    "tshark_smb_objects": "WiresharkFoundation.Wireshark",
+    "tshark_tftp_objects": "WiresharkFoundation.Wireshark",
+    "tshark_imf_objects": "WiresharkFoundation.Wireshark",
 }
 
 SPECIAL_WSL_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "zsteg": ("ruby", "ruby-dev", "build-essential"),
     "jsteg": ("golang-go",),
     "jpseek": ("git", "build-essential", "autoconf"),
+    "volatility3_banners": ("python3", "python3-venv"),
+    "volatility3_windows": ("python3", "python3-venv"),
+    "evtx_dump": ("python3", "python3-venv"),
 }
 
 JSTEG_MODULE = "lukechampine.com/jsteg/cmd/jsteg@v1.1.0"
 ZSTEG_VERSION = "0.2.14"
 JPSEEK_COMMIT = "33a11e1bad146f5e9c0d3fe6475812a1cedb9b7e"
+VOLATILITY3_VERSION = "2.28.0"
+PYTHON_EVTX_VERSION = "0.8.1"
 JPSEEK_BUILD_SCRIPT = rf"""
 set -eu
 build_dir="$(mktemp -d /tmp/forenscope-jphs.XXXXXX)"
@@ -104,6 +148,31 @@ sed -i 's/^jphide: \(.*\)$/jphide: \1 $(JPEG_OBJS)/' Makefile
 sed -i 's/^jpseek: \(.*\)$/jpseek: \1 $(JPEG_OBJS)/' Makefile
 make -s all
 install -m 0755 jpseek /usr/local/bin/jpseek
+""".strip()
+VOLATILITY3_INSTALL_SCRIPT = rf"""
+set -eu
+install_root=/opt/forenscope-volatility3
+python3 -m venv "$install_root"
+"$install_root/bin/python" -m pip install --disable-pip-version-check --no-input "volatility3=={VOLATILITY3_VERSION}"
+ln -sfn "$install_root/bin/vol" /usr/local/bin/vol
+""".strip()
+PYTHON_EVTX_INSTALL_SCRIPT = rf"""
+set -eu
+install_root=/opt/forenscope-python-evtx
+python3 -m venv "$install_root"
+"$install_root/bin/python" -m pip install --disable-pip-version-check --no-input "python-evtx=={PYTHON_EVTX_VERSION}"
+wrapper="$install_root/bin/evtx_dump.py"
+printf '%s\n' \
+    '#!/opt/forenscope-python-evtx/bin/python' \
+    'import sys' \
+    'from Evtx.Evtx import Evtx' \
+    'if len(sys.argv) != 2:' \
+    '    raise SystemExit("usage: evtx_dump.py FILE.evtx")' \
+    'with Evtx(sys.argv[1]) as event_log:' \
+    '    for record in event_log.records():' \
+    '        print(record.xml())' > "$wrapper"
+chmod 0755 "$wrapper"
+ln -sfn "$wrapper" /usr/local/bin/evtx_dump.py
 """.strip()
 
 INSTALLABLE_TOOL_IDS = frozenset(
@@ -359,6 +428,19 @@ def install_tools(tool_ids: list[str]) -> dict[str, Any]:
             result = _run_wsl_script(wsl, JPSEEK_BUILD_SCRIPT, timeout=900)
             command_results["jpseek"].append(result)
             channels["jpseek"] = "Kali WSL / pinned source build"
+        volatility_targets = [
+            tool_id for tool_id in ("volatility3_banners", "volatility3_windows")
+            if tool_id in missing
+        ]
+        if volatility_targets:
+            result = _run_wsl_script(wsl, VOLATILITY3_INSTALL_SCRIPT, timeout=900)
+            for tool_id in volatility_targets:
+                command_results[tool_id].append(result)
+                channels[tool_id] = "Kali WSL / pinned PyPI environment"
+        if "evtx_dump" in missing:
+            result = _run_wsl_script(wsl, PYTHON_EVTX_INSTALL_SCRIPT, timeout=900)
+            command_results["evtx_dump"].append(result)
+            channels["evtx_dump"] = "Kali WSL / pinned PyPI environment"
 
     # Prefer WSL for its maintained forensic packages. Use a silent native
     # install only for tools still unavailable and mapped to a fixed ID.

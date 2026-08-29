@@ -116,6 +116,55 @@ def test_password_and_private_paths_are_redacted_from_audit_command(tmp_path: Pa
     assert "<input>/--hostile image.jpg" in public
 
 
+def test_wsl_embedded_output_paths_are_translated_without_a_shell() -> None:
+    resolution = ResolvedTool(source="wsl", launcher=Path("C:/Windows/System32/wsl.exe"), executable="/usr/bin/7z")
+
+    argv = ExternalToolRunner._launch_argv(  # noqa: SLF001 - process-boundary contract
+        resolution,
+        ["e", "-oC:\\case output", "http,C:\\http output", "C:\\input\\capture.pcap"],
+    )
+
+    assert argv == [
+        "C:\\Windows\\System32\\wsl.exe", "--", "/usr/bin/7z", "e",
+        "-o/mnt/c/case output", "http,/mnt/c/http output", "/mnt/c/input/capture.pcap",
+    ]
+
+
+def test_tshark_field_adapters_avoid_shell_metacharacter_separator(monkeypatch, tmp_path: Path) -> None:
+    capture = tmp_path / "capture.pcap"
+    capture.write_bytes(b"\xd4\xc3\xb2\xa1" + b"\x00" * 20)
+    invocations: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "app.analyzers.external.resolve_tool",
+        lambda executable, **_kwargs: ResolvedTool(
+            source="native", launcher=Path(sys.executable), executable=executable
+        ),
+    )
+    runner = ExternalToolRunner(timeout=1)
+
+    def fake_execute(argv, *, cwd, timeout=None, stdin_data=None):
+        invocations.append(list(argv))
+        return {
+            "status": "completed", "return_code": 0, "stdout": "", "stderr": "",
+            "output_truncated": False,
+        }
+
+    monkeypatch.setattr(runner, "_execute", fake_execute)
+    runner.run_all(
+        capture,
+        kind="pcap",
+        profile="deep",
+        password=None,
+        work_dir=tmp_path,
+        selected_tools={"tshark_fields", "tshark_usb_hid"},
+    )
+
+    assert len(invocations) == 2
+    assert all("separator=/t" in argv for argv in invocations)
+    assert all(not any("|" in argument for argument in argv) for argv in invocations)
+
+
 def test_zsteg_mode_uses_explicit_all_or_lsb_switch(monkeypatch, clean_png: Path, tmp_path: Path) -> None:
     monkeypatch.setattr(shutil, "which", lambda name: sys.executable if name == "zsteg" else None)
     runner = ExternalToolRunner(timeout=1)

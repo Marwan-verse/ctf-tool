@@ -56,7 +56,7 @@ class AnalysisOptions(BaseModel):
     audio_spectrogram_fft: Literal[256, 512, 1024, 2048, 4096] = 2048
     audio_channel_mode: Literal["mix", "left", "right", "difference"] = "mix"
     audio_lsb_bits: int = Field(default=2, ge=1, le=8)
-    max_recursion_depth: int = Field(default=3, ge=1, le=4)
+    max_recursion_depth: int = Field(default=3, ge=1, le=12)
     max_artifacts: int = Field(default=100, ge=25, le=500)
     tool_timeout_seconds: int = Field(default=60, ge=5, le=180)
     external_output_kib: int = Field(default=1024, ge=64, le=2048)
@@ -65,7 +65,7 @@ class AnalysisOptions(BaseModel):
     color_remap_variants: int = Field(default=8, ge=0, le=8)
     zsteg_mode: Literal["all", "lsb"] = "all"
     ocr_language: str = Field(default="eng", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_+\-]+$")
-    selected_external_tools: list[str] | None = Field(default=None, max_length=64)
+    selected_external_tools: list[str] | None = Field(default=None, max_length=128)
 
     @classmethod
     def for_profile(cls, profile: ScanProfile | str) -> "AnalysisOptions":
@@ -186,7 +186,7 @@ class ToolInstallRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    tool_ids: list[str] = Field(min_length=1, max_length=64)
+    tool_ids: list[str] = Field(min_length=1, max_length=128)
     confirmed: bool
 
     @field_validator("tool_ids")

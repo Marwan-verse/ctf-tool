@@ -3,9 +3,9 @@
 The image engine cannot prove that arbitrary high-entropy bytes are encrypted,
 so this module reports signals as *possible ciphertext*. Recovery is strictly
 bounded: it uses a user-supplied passphrase for repeating-key XOR and the
-OpenSSL salted AES-256-CBC envelope, plus a small single-byte XOR search that
-only accepts flag-shaped/plaintext-looking output. No unbounded key guessing or
-general-purpose password cracking is performed.
+OpenSSL salted AES-256-CBC or legacy 3DES-CBC envelope, plus a small single-byte
+XOR search that only accepts flag-shaped/plaintext-looking output. No
+unbounded key guessing or general-purpose password cracking is performed.
 """
 
 from __future__ import annotations
@@ -134,6 +134,10 @@ def _openssl_aes_decrypt(data: bytes, passphrase: bytes) -> tuple[bytes | None, 
         return None, "not_an_openssl_envelope"
     try:
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        try:
+            from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
+        except ImportError:
+            TripleDES = algorithms.TripleDES
     except ImportError:
         return None, "cryptography_dependency_missing"
     salt = data[8:16]
@@ -156,6 +160,38 @@ def _openssl_aes_decrypt(data: bytes, passphrase: bytes) -> tuple[bytes | None, 
             continue
         padding = plaintext[-1]
         if padding < 1 or padding > 16 or plaintext[-padding:] != bytes([padding]) * padding:
+            continue
+        return plaintext[:-padding], None
+    return None, last_reason
+
+
+def _openssl_des3_decrypt(data: bytes, passphrase: bytes) -> tuple[bytes | None, str | None]:
+    """Try the legacy OpenSSL ``des-ede3-cbc`` salted envelope used by CTFs."""
+
+    if not data.startswith(b"Salted__") or len(data) <= 16:
+        return None, "not_an_openssl_envelope"
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    except ImportError:
+        return None, "cryptography_dependency_missing"
+    salt = data[8:16]
+    ciphertext = data[16:]
+    if not ciphertext or len(ciphertext) % 8:
+        return None, "invalid_block_length"
+    last_reason = "invalid_padding"
+    for digest_name in ("sha256", "md5"):
+        key, iv = _evp_bytes_to_key(passphrase, salt, key_size=24, iv_size=8, digest_name=digest_name)
+        try:
+            decryptor = Cipher(TripleDES(key), modes.CBC(iv)).decryptor()
+            plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+        except Exception:
+            last_reason = "cipher_error"
+            continue
+        if not plaintext:
+            last_reason = "empty_plaintext"
+            continue
+        padding = plaintext[-1]
+        if padding < 1 or padding > 8 or plaintext[-padding:] != bytes([padding]) * padding:
             continue
         return plaintext[:-padding], None
     return None, last_reason
@@ -239,21 +275,29 @@ def analyze_encrypted_payloads(
                     if attempts >= max_attempts:
                         break
                     if is_salted:
-                        attempts += 1
-                        plaintext, reason = _openssl_aes_decrypt(blob, key)
-                        if reason == "cryptography_dependency_missing":
-                            dependency_missing = True
-                        if plaintext is not None and _looks_plaintext(plaintext):
-                            decryptions.append({
-                                "artifact_id": artifact_id,
-                                "label": label,
-                                "encoding": encoding,
-                                "algorithm": "openssl-aes-256-cbc",
-                                "data": plaintext,
-                                "size": len(plaintext),
-                                "flag_like": _flag_like(plaintext),
-                            })
-                            successful = True
+                        for algorithm_name, decryptor in (
+                            ("openssl-aes-256-cbc", _openssl_aes_decrypt),
+                            ("openssl-des-ede3-cbc", _openssl_des3_decrypt),
+                        ):
+                            if attempts >= max_attempts:
+                                break
+                            attempts += 1
+                            plaintext, reason = decryptor(blob, key)
+                            if reason == "cryptography_dependency_missing":
+                                dependency_missing = True
+                            if plaintext is not None and _looks_plaintext(plaintext):
+                                decryptions.append({
+                                    "artifact_id": artifact_id,
+                                    "label": label,
+                                    "encoding": encoding,
+                                    "algorithm": algorithm_name,
+                                    "data": plaintext,
+                                    "size": len(plaintext),
+                                    "flag_like": _flag_like(plaintext),
+                                })
+                                successful = True
+                                break
+                        if successful:
                             break
                     else:
                         attempts += 1

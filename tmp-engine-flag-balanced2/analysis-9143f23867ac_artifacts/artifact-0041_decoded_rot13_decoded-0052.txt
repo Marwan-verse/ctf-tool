@@ -1,0 +1,1 @@
+ryvs gbhpu -nz ${fg3} ${s} >/qri/ahyy 2>&1 && \

@@ -1,0 +1,1 @@
+\device\harddiskvolume3\program files (x86)\microsoft\edge\application\msedge.exe%593192.168.27.15949831204.79.197.237443

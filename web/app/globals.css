@@ -168,6 +168,9 @@ button.nav-item:disabled { opacity: 1; }
 .file-name { max-width: 90%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-facts { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin: 13px 0 24px; }
 .file-facts span { padding: 5px 8px; border-radius: 999px; color: #67776d; background: #f0f4f1; font-size: 8px; }
+.file-facts .file-type-fact { color: #285f40; background: #e7f5ea; font-weight: 750; }
+.file-facts .file-type-fact.scanning { color: #76601d; background: #fff4d6; }
+.file-detection-note { margin: -14px 0 21px; color: #829087; font-size: 8px; }
 .file-actions { display: flex; gap: 8px; }.file-actions .choose-button { display: flex; align-items: center; gap: 24px; }.file-actions .choose-button span { color: var(--lime); font-size: 14px; }
 .replace-button { padding: 11px 15px; border: 1px solid #d8e1db; border-radius: 10px; color: #496052; background: #fff; font-size: 11px; font-weight: 650; cursor: pointer; }
 .error-banner { display: grid; grid-template-columns: 24px 1fr 22px; align-items: center; gap: 9px; margin-top: 12px; padding: 10px 12px; border: 1px solid #fecdd3; border-radius: 11px; color: #9f1239; background: #fff1f2; }
@@ -178,6 +181,16 @@ button.nav-item:disabled { opacity: 1; }
 .password-hint code { padding: 1px 3px; border-radius: 3px; color: #456452; background: #eef4ef; font-family: var(--font-geist-mono); font-size: 6px; }
 .password-input:focus, .input-shell:focus-within { border-color: #659278; box-shadow: 0 0 0 3px rgba(31,106,72,.08); }
 .engine-offline { background: #45242d; }
+
+/* Universal file entry: the server still chooses the specialist pipeline,
+   while the home screen presents one centered content-first drop zone. */
+.screen-setup .topbar { position: relative; display: block; max-width: 980px; text-align: center; }
+.screen-setup .topbar > div:first-child { display: grid; justify-items: center; }
+.screen-setup .top-actions { position: absolute; top: 0; right: 0; }
+.screen-setup .content-grid { display: block; max-width: 980px; }
+.screen-setup .primary-column { max-width: 900px; margin: 0 auto; }
+.screen-setup .upload-card { min-height: 430px; }
+.screen-setup .inspector-column { max-width: 900px; margin: 22px auto 0; }
 
 /* Live scan */
 .screen-running, .screen-results { max-width: none; }
@@ -319,7 +332,8 @@ html[data-theme="dark"],html[data-theme="dark"] body{background:#0d1410}
 .theme-dark :is(input,select,textarea){color:#e4ede7;border-color:#3a4c41;background-color:#0e1711}.theme-dark :is(input,textarea)::placeholder{color:#718078}.theme-dark input[type="range"]{accent-color:#7dd5a1}.theme-dark input[type="checkbox"]{accent-color:#58ad7c}
 .theme-dark :is(.method-details code,.method-details pre,.tool-command code,.tool-output pre,.raw-details pre,.hex-byte-cell){color:#c8d7ce;border-color:#35483c;background:#0c130e}
 .theme-dark :is(.artifact-inspector dd,.result-search input,.audio-stat-grid strong,.audio-subheading h3,.audio-signal-cards strong,.audio-export-grid>a,.hex-stat-row strong,.hex-row code,.hex-row-offset,.hex-live-heading h3,.hex-integrity-summary,.hex-reference-table strong,.hex-reference-table code,.hex-context-heading strong,.visual-fullscreen-dialog header h2,.visual-transform-toolbar output,.repair-web-sources strong){color:#d9e7de}
-.theme-dark :is(.setting-toggle small,.budget-settings small,.external-tool-grid small,.tool-result-card small,.audio-stat-grid small,.audio-visual-grid small,.audio-signal-cards small,.audio-frequency-list small,.audio-export-grid small,.hex-muted,.hex-reference-table small,.hex-reference-table p,.hex-reference-note,.hex-repair-intro,.artifact-inspector dt){color:#8fa096}
+.theme-dark :is(.setting-toggle small,.budget-settings small,.external-tool-grid small,.tool-result-card small,.audio-stat-grid small,.audio-visual-grid small,.audio-signal-cards small,.audio-frequency-list small,.audio-export-grid small,.hex-muted,.hex-reference-table small,.hex-reference-table p,.hex-reference-note,.hex-repair-intro,.artifact-inspector dt,.file-detection-note){color:#8fa096}
+.theme-dark .file-facts .file-type-fact{color:#b5e3c5;background:#1b3927}.theme-dark .file-facts .file-type-fact.scanning{color:#ead79b;background:#3b321d}
 .theme-dark :is(.upload-card,.scan-stage-card){background:radial-gradient(circle at 50% 25%,rgba(125,213,161,.08),transparent 38%),#172019}.theme-dark .upload-zone{border-color:#496052;background:#111a14}.theme-dark .upload-zone.dragging{border-color:#7dd5a1;background:#172a1e}.theme-dark .input-shell{box-shadow:none}.theme-dark .file-facts span,.theme-dark .file-pill{color:#bdd0c3;background:#1d3023}
 .theme-dark :is(.profile-card.selected,.artifact-row.selected,.tool-artifacts button,.tool-image-grid button){border-color:#4c745b;background:#183124}.theme-dark .profile-card:hover{border-color:#526b5b}.theme-dark .profile-card p,.theme-dark .finding-list p,.theme-dark .candidate-main p{color:#91a198}
 .theme-dark :is(.no-candidate-hero,.audio-signal-cards article.warning,.hex-repair-card){color:#eadbbd;border-color:#695832;background:#292316}.theme-dark .no-candidate-hero>span{color:#f0c870;background:#463a20}.theme-dark .no-candidate-hero p,.theme-dark .hex-repair-intro,.theme-dark .hex-repair-list article>p,.theme-dark .hex-repair-list article>small{color:#c3b696}.theme-dark .hex-repair-list article{border-color:#615536;background:#211e16}.theme-dark .hex-repair-heading strong{color:#ead9a9}.theme-dark .hex-repair-meta span{color:#d8c58c;background:#342c18}.theme-dark .hex-repair-list article>button{color:#f1d996;border-color:#766331;background:#2c2517}

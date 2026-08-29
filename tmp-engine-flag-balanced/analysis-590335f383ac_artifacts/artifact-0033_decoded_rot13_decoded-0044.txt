@@ -1,0 +1,1 @@
+vs   gbhpu -nz -g ${fg1} ${s} >/qri/ahyy 2>&1 && \

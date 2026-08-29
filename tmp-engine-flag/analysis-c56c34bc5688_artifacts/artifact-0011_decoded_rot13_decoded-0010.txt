@@ -1,0 +1,1 @@
+s=`${ZQ5FHZ} --irefvba | rterc '^zq5fhz .*(pber|grkg)hgvyf'`
