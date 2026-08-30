@@ -46,6 +46,7 @@ from .hexedit import (
 from .hexview import inspect_file
 from .jobs import JobManager
 from .reporting import (
+    artifact_download_details,
     artifact_public_record,
     build_export_payload,
     input_artifact_record,
@@ -703,7 +704,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _get_job_or_404(storage, identifier)
         artifact = _get_artifact_or_404(storage, identifier, str(artifact_id))
         path = _artifact_path(_settings(request), identifier, artifact)
-        media_type = str(artifact.get("media_type") or "application/octet-stream")
+        download_name, detected_media_type = await anyio.to_thread.run_sync(
+            artifact_download_details, path, str(artifact.get("name") or path.name)
+        )
+        media_type = detected_media_type
         if inline:
             sniffed_type, previewable = await anyio.to_thread.run_sync(sniff_media_type, path)
             if not artifact.get("previewable") or not previewable:
@@ -717,7 +721,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             media_type=media_type,
             filename=None,
             headers={
-                "Content-Disposition": safe_content_disposition(str(artifact["name"]), inline=inline),
+                "Content-Disposition": safe_content_disposition(download_name, inline=inline),
                 "X-Artifact-SHA256": str(artifact["sha256"]),
                 "Content-Security-Policy": "default-src 'none'; sandbox; frame-ancestors 'none'",
             },

@@ -102,6 +102,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("tshark_credentials", "tshark", "TShark cleartext credential recovery", "network-decoding", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
     ToolSpec("tshark_rtp", "tshark", "TShark RTP stream and loss statistics", "network-media", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
     ToolSpec("tshark_authentication", "tshark", "TShark NTLM/Kerberos authentication dissections", "network-auth", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("tshark_http2_ranges", "tshark", "TShark HTTP/2 Content-Range file reassembly", "embedded-data", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
     ToolSpec("tshark_usb_hid", "tshark", "TShark USB HID keystroke recovery", "network-decoding", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
     ToolSpec("tshark_http_objects", "tshark", "TShark HTTP object extraction", "embedded-data", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
     ToolSpec("tshark_ftp_objects", "tshark", "TShark FTP-DATA object extraction", "embedded-data", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
@@ -444,7 +445,7 @@ class ExternalToolRunner:
                 "foremost", "jpseek", "openstego", "outguess", "steghide", "stegseek",
                 "ffmpeg_spectrogram", "ffmpeg_pcm", "sox_spectrogram", "pdfimages", "pdfdetach",
                 "7z_extract", "tshark_http_objects", "tshark_ftp_objects", "tshark_smb_objects", "tshark_tftp_objects",
-                "tshark_imf_objects", "tshark_dicom_objects", "tcpflow", "hcxpcapngtool",
+                "tshark_imf_objects", "tshark_dicom_objects", "tshark_http2_ranges", "tcpflow", "hcxpcapngtool",
                 "pcapfix", "oleobj", "rtfobj", "tsk_recover",
                 "readpst",
             }:
@@ -693,6 +694,18 @@ class ExternalToolRunner:
                     executable, "-n", "-r", str(input_path), "-c", "5000", "-T", "json",
                     "--json-compact", "--no-duplicate-keys", "-j", "ntlmssp kerberos ldap http smb smb2",
                 ]
+            elif spec.tool_id == "tshark_http2_ranges":
+                # A known CTF pattern splits a response into one/two byte
+                # HTTP/2 DATA frames and uses Content-Range as the ordering
+                # oracle. TShark's dissector exposes both fields after TLS
+                # secrets have been injected or supplied to Wireshark.
+                argv = [
+                    executable, "-2", "-n", "-r", str(input_path), "-c", "100000",
+                    "-Y", "http2.headers.range && http2.data.data", "-T", "fields",
+                    "-E", "separator=/t", "-E", "occurrence=f",
+                    "-e", "frame.number", "-e", "http2.streamid",
+                    "-e", "http2.headers.range", "-e", "http2.data.data",
+                ]
             elif spec.tool_id == "tshark_usb_hid":
                 argv = [
                     executable, "-n", "-r", str(input_path), "-c", "50000",
@@ -908,6 +921,7 @@ class ExternalToolRunner:
             stdout = self._sanitize(execution["stdout"], input_path, temp_dir, password)
             stderr = self._sanitize(execution["stderr"], input_path, temp_dir, password)
             mouse_drawings: list[tuple[str, bytes, int]] = []
+            http2_range_files: list[tuple[str, bytes, int]] = []
             if spec.tool_id == "tshark_usb_hid" and stdout:
                 decoded_hid = self._decode_usb_hid(stdout)
                 if decoded_hid:
@@ -915,6 +929,10 @@ class ExternalToolRunner:
                 mouse_drawings = self._decode_usb_mouse_svg(stdout)
                 if mouse_drawings:
                     stdout = display_text(stdout + f"\n\n[USB mouse drawings] {len(mouse_drawings)} SVG artifact(s) recovered.", self.output_limit)
+            elif spec.tool_id == "tshark_http2_ranges" and stdout:
+                http2_range_files = self._decode_http2_range_artifacts(stdout)
+                if http2_range_files:
+                    stdout = display_text(stdout + f"\n\n[HTTP/2 Content-Range recovery] {len(http2_range_files)} complete file artifact(s) recovered.", self.output_limit)
             elif spec.tool_id == "tshark_fields" and stdout:
                 decoded_payloads = self._decode_tshark_payloads(stdout)
                 if decoded_payloads:
@@ -972,6 +990,12 @@ class ExternalToolRunner:
                     "label": label, "data": drawing, "producer": "tshark_usb_hid",
                     "transformation": f"Accumulate {movement_count} USB HID relative mouse reports into SVG paths",
                     "offset": None, "kind": "svg",
+                })
+            for label, recovered, fragment_count in http2_range_files:
+                method["extracted"].append({
+                    "label": label, "data": recovered, "producer": "tshark_http2_ranges",
+                    "transformation": f"Place {fragment_count} HTTP/2 DATA fragment(s) at Content-Range byte offsets",
+                    "offset": None, "kind": sniff_kind(recovered, label),
                 })
             if spec.tool_id in {"exiftool", "ffprobe", "mediainfo"} and stdout:
                 try:
@@ -1156,6 +1180,52 @@ class ExternalToolRunner:
                 if total >= 1024 * 1024 or len(recovered) >= 200:
                     return "\n".join(recovered)
         return "\n".join(recovered)
+
+    @staticmethod
+    def _decode_http2_range_artifacts(output: str) -> list[tuple[str, bytes, int]]:
+        """Reassemble complete HTTP/2 objects from TShark's range/data fields."""
+
+        # Key by HTTP/2 stream and declared object size. This prevents a
+        # challenge that interleaves multiple downloads from combining them.
+        groups: dict[tuple[str, int], tuple[bytearray, bytearray, int]] = {}
+        range_re = re.compile(r"bytes\s*=\s*(\d+)\s*-\s*(\d+)\s*/\s*(\d+)", re.IGNORECASE)
+        for line in output.splitlines()[:100_000]:
+            fields = re.split(r"[|\t]", line)
+            if len(fields) < 4:
+                continue
+            stream_id = fields[1].strip() or "unknown"
+            matched = range_re.search(fields[2])
+            encoded = re.sub(r"[:,\s]", "", fields[3])
+            if not matched or len(encoded) % 2 or not re.fullmatch(r"[0-9A-Fa-f]+", encoded):
+                continue
+            start, end, total = (int(value) for value in matched.groups())
+            if total <= 0 or total > 64 * 1024 * 1024 or start < 0 or end < start or end >= total:
+                continue
+            try:
+                value = bytes.fromhex(encoded)
+            except ValueError:
+                continue
+            if len(value) != end - start + 1:
+                continue
+            key = (stream_id, total)
+            if key not in groups:
+                groups[key] = (bytearray(total), bytearray(total), 0)
+            target, present, fragments = groups[key]
+            # First observed bytes win on a duplicate conflicting fragment so
+            # a later retransmission cannot mutate a complete artifact.
+            for index, byte in enumerate(value, start):
+                if not present[index]:
+                    target[index] = byte
+                    present[index] = 1
+            groups[key] = (target, present, fragments + 1)
+
+        artifacts: list[tuple[str, bytes, int]] = []
+        for (stream_id, total), (value, present, fragments) in sorted(groups.items()):
+            if not all(present):
+                continue
+            label = f"http2_stream_{safe_label(stream_id) or 'unknown'}_range_{total}.bin"
+            artifacts.append((label, bytes(value), fragments))
+        return artifacts[:32]
 
     @staticmethod
     def _decode_usb_hid(output: str) -> str:

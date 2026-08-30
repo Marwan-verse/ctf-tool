@@ -97,7 +97,10 @@ _PCAP_CELL_RE = re.compile(rb"\bCELL(?:ID)?\s*[:=]\s*(\d{3,12})", re.IGNORECASE)
 _PCAP_MAGIC_PREFIXES = _PCAP_FLAG_PREFIXES + (
     b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF89a", b"GIF87a", b"BM",
     b"PK\x03\x04", b"%PDF-", b"BZh", b"\x1f\x8b", b"Salted__", b"RIFF",
+    b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d", b"\x0a\x0d\x0d\x0a",
 )
+_PCAP_CLASSIC_MAGICS = (b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d")
+_PCAPNG_MAGIC = b"\x0a\x0d\x0d\x0a"
 
 _PCAP_IP_PROTOCOL_NAMES = {
     1: "ICMP", 2: "IGMP", 6: "TCP", 17: "UDP", 41: "IPv6",
@@ -239,9 +242,48 @@ def _pcap_frame_payload(frame: bytes, linktype: int) -> tuple[int, bytes]:
     return 0, frame
 
 
+def _pcap_ethernet_layout(frame: bytes) -> tuple[int, int] | None:
+    """Return Ethernet payload offset and final EtherType, VLAN-aware."""
+
+    if len(frame) < 14:
+        return None
+    offset = 14
+    ether_type = int.from_bytes(frame[12:14], "big")
+    while ether_type in {0x8100, 0x88A8, 0x9100} and len(frame) >= offset + 4:
+        ether_type = int.from_bytes(frame[offset + 2:offset + 4], "big")
+        offset += 4
+    return offset, ether_type
+
+
 def _pcap_special_frame(frame: bytes, linktype: int) -> dict[str, Any] | None:
     """Decode non-IP capture formats that are common in hardware/ICS CTFs."""
 
+    if linktype == 1:
+        ethernet = _pcap_ethernet_layout(frame)
+        if ethernet is not None:
+            offset, ether_type = ethernet
+            # ARP encodes host and target addresses outside IP. This is a
+            # useful CTF hiding place and should still be visible in traffic
+            # tables instead of being reduced to opaque Ethernet bytes.
+            if ether_type == 0x0806 and len(frame) >= offset + 8:
+                hardware_type, protocol_type = struct.unpack_from("!HH", frame, offset)
+                hardware_length, protocol_length, operation = struct.unpack_from("!BBH", frame, offset + 4)
+                end = offset + 8 + 2 * (hardware_length + protocol_length)
+                if (
+                    hardware_type == 1 and protocol_type == 0x0800
+                    and hardware_length == 6 and protocol_length == 4 and len(frame) >= end
+                ):
+                    sender_mac = ":".join(f"{value:02x}" for value in frame[offset + 8:offset + 14])
+                    sender_ip = str(ipaddress.IPv4Address(frame[offset + 14:offset + 18]))
+                    target_mac = ":".join(f"{value:02x}" for value in frame[offset + 18:offset + 24])
+                    target_ip = str(ipaddress.IPv4Address(frame[offset + 24:offset + 28]))
+                    return {
+                        "source": sender_ip, "destination": target_ip, "protocol": None,
+                        "special_protocol": "ARP", "source_port": None, "destination_port": None,
+                        "sequence": None, "payload": frame[offset:end], "payload_offset": offset,
+                        "network": False, "arp_operation": operation, "arp_sender_mac": sender_mac,
+                        "arp_target_mac": target_mac, "arp_sender_ip": sender_ip, "arp_target_ip": target_ip,
+                    }
     if linktype == 227 and len(frame) >= 8:  # LINKTYPE_CAN_SOCKETCAN
         raw_id = int.from_bytes(frame[:4], "big")
         length = min(int(frame[4]), 64, max(0, len(frame) - 8))
@@ -262,13 +304,13 @@ def _pcap_special_frame(frame: bytes, linktype: int) -> dict[str, Any] | None:
 
 
 def _pcap_capture_packet(frame: bytes, linktype: int) -> dict[str, Any]:
+    special = _pcap_special_frame(frame, linktype)
+    if special is not None:
+        return special
     packet = _pcap_packet_network(frame, linktype)
     if packet is not None:
         packet["network"] = True
         return packet
-    special = _pcap_special_frame(frame, linktype)
-    if special is not None:
-        return special
     payload_offset, frame_payload = _pcap_frame_payload(frame, linktype)
     return {
         "source": None, "destination": None, "protocol": None,
@@ -682,30 +724,34 @@ def _pcap_flag_values(data: bytes) -> set[str]:
     # high-entropy binary data, so avoid running two regex passes over them.
     if b"{" not in data or b"}" not in data:
         return set()
-    prefix_names = tuple(prefix[:-1].lower() for prefix in _PCAP_FLAG_PREFIXES)
+    # Avoid brace-by-brace scans over entropy. A valid capture token starts
+    # with one of the normal CTF prefixes, so detect that short literal first.
+    prefix_variants = tuple(dict.fromkeys(
+        candidate for prefix in _PCAP_FLAG_PREFIXES for candidate in (prefix, prefix.lower())
+    ))
 
     def scan(buffer: bytes) -> set[str]:
         found: set[str] = set()
-        cursor = 0
-        while True:
-            brace = buffer.find(b"{", cursor)
-            if brace < 0:
-                break
-            cursor = brace + 1
-            prefix = next((name for name in prefix_names if buffer[max(0, brace - len(name)):brace].lower() == name), None)
-            if prefix is None:
-                continue
-            start = brace - len(prefix)
-            if start > 0 and (chr(buffer[start - 1]).isalnum() or buffer[start - 1] == 95):
-                continue
-            end = buffer.find(b"}", brace + 3, min(len(buffer), brace + 242))
-            if end < 0:
-                continue
-            token = buffer[start:end + 1]
-            if b"\r" not in token and b"\n" not in token and token.count(b"{") == 1:
-                found.add(token.decode("latin-1", "ignore"))
+        for prefix in prefix_variants:
+            cursor = 0
+            while True:
+                start = buffer.find(prefix, cursor)
+                if start < 0:
+                    break
+                cursor = start + 1
+                if start > 0 and ((65 <= buffer[start - 1] <= 90) or (97 <= buffer[start - 1] <= 122) or (48 <= buffer[start - 1] <= 57) or buffer[start - 1] == 95):
+                    continue
+                brace = start + len(prefix) - 1
+                end = buffer.find(b"}", brace + 3, min(len(buffer), brace + 242))
+                if end < 0:
+                    continue
+                token = buffer[start:end + 1]
+                if b"\r" not in token and b"\n" not in token and token.count(b"{") == 1:
+                    found.add(token.decode("latin-1", "ignore"))
         return found
 
+    if not any(prefix in data for prefix in prefix_variants):
+        return set()
     values = scan(data)
     # Only normalize streams that look like human-readable or NUL-interleaved
     # text. Random binary contains whitespace frequently and made an unbounded
@@ -1249,6 +1295,144 @@ def _pcap_modbus_payloads(payload: bytes) -> list[dict[str, Any]]:
     return messages
 
 
+def _pcap_dhcp_message(payload: bytes) -> dict[str, Any] | None:
+    """Parse the clue-bearing BOOTP/DHCP fields without interpreting leases."""
+
+    if len(payload) < 240 or payload[236:240] != b"\x63\x82\x53\x63":
+        return None
+    message_types = {
+        1: "Discover", 2: "Offer", 3: "Request", 4: "Decline", 5: "ACK",
+        6: "NAK", 7: "Release", 8: "Inform",
+    }
+    values: dict[int, list[bytes]] = defaultdict(list)
+    cursor = 240
+    for _ in range(256):
+        if cursor >= len(payload):
+            break
+        code = payload[cursor]
+        cursor += 1
+        if code == 255:
+            break
+        if code == 0:
+            continue
+        if cursor >= len(payload):
+            break
+        length = payload[cursor]
+        cursor += 1
+        if cursor + length > len(payload):
+            break
+        values[code].append(payload[cursor:cursor + length])
+        cursor += length
+
+    def text_option(code: int) -> str | None:
+        raw = next(iter(values.get(code, [])), b"")
+        return raw.decode("utf-8", "replace").strip("\x00") or None
+
+    def address_option(code: int) -> str | None:
+        raw = next(iter(values.get(code, [])), b"")
+        return str(ipaddress.IPv4Address(raw[:4])) if len(raw) >= 4 else None
+
+    client = payload[28:44].split(b"\x00", 1)[0]
+    client_mac = ":".join(f"{value:02x}" for value in client) if client else None
+    message_code = next(iter(values.get(53, [])), b"\x00")[:1]
+    return {
+        "message_type": message_types.get(message_code[0] if message_code else 0, "BOOTP"),
+        "message_code": message_code[0] if message_code else None,
+        "transaction_id": f"0x{int.from_bytes(payload[4:8], 'big'):08x}",
+        "client_mac": client_mac,
+        "client_ip": str(ipaddress.IPv4Address(payload[12:16])),
+        "your_ip": str(ipaddress.IPv4Address(payload[16:20])),
+        "server_ip": str(ipaddress.IPv4Address(payload[20:24])),
+        "hostname": text_option(12), "domain": text_option(15),
+        "vendor_class": text_option(60), "user_class": text_option(77),
+        "bootfile": text_option(67), "requested_ip": address_option(50),
+        "server_identifier": address_option(54),
+        "option_values": {str(code): [value.hex() for value in entries] for code, entries in values.items()},
+    }
+
+
+def _pcap_coap_message(payload: bytes) -> dict[str, Any] | None:
+    """Decode compact CoAP option paths and data from a bounded UDP datagram."""
+
+    if len(payload) < 4 or payload[0] >> 6 != 1 or payload[0] & 0x0F > 8:
+        return None
+    token_length = payload[0] & 0x0F
+    if 4 + token_length > len(payload):
+        return None
+    cursor = 4 + token_length
+    option_number = 0
+    path: list[str] = []
+    query: list[str] = []
+    content_format: int | None = None
+
+    def extended(nibble: int, position: int) -> tuple[int, int] | None:
+        if nibble < 13:
+            return nibble, position
+        if nibble == 13 and position < len(payload):
+            return 13 + payload[position], position + 1
+        if nibble == 14 and position + 2 <= len(payload):
+            return 269 + int.from_bytes(payload[position:position + 2], "big"), position + 2
+        return None
+
+    for _ in range(128):
+        if cursor >= len(payload) or payload[cursor] == 0xFF:
+            break
+        initial = payload[cursor]
+        cursor += 1
+        delta = extended(initial >> 4, cursor)
+        if delta is None:
+            return None
+        delta_value, cursor = delta
+        value_length = extended(initial & 0x0F, cursor)
+        if value_length is None:
+            return None
+        length, cursor = value_length
+        if cursor + length > len(payload):
+            return None
+        option_number += delta_value
+        value = payload[cursor:cursor + length]
+        cursor += length
+        if option_number == 11:
+            path.append(value.decode("utf-8", "replace"))
+        elif option_number == 15:
+            query.append(value.decode("utf-8", "replace"))
+        elif option_number == 12 and len(value) <= 2:
+            content_format = int.from_bytes(value, "big") if value else 0
+    body = payload[cursor + 1:] if cursor < len(payload) and payload[cursor] == 0xFF else b""
+    code = payload[1]
+    return {
+        "type": ("Confirmable", "Non-confirmable", "Acknowledgement", "Reset")[payload[0] >> 4 & 0x03],
+        "code": f"{code >> 5}.{code & 0x1F:02d}", "message_id": int.from_bytes(payload[2:4], "big"),
+        "token": payload[4:4 + token_length].hex(), "path": "/" + "/".join(path),
+        "query": "&".join(query), "content_format": content_format, "payload": body,
+    }
+
+
+def _pcap_http2_frames(payload: bytes) -> list[dict[str, Any]]:
+    """Return safely framed HTTP/2 DATA payloads from a contiguous cleartext span."""
+
+    preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+    cursor = len(preface) if payload.startswith(preface) else 0
+    frames: list[dict[str, Any]] = []
+    names = {0: "DATA", 1: "HEADERS", 2: "PRIORITY", 3: "RST_STREAM", 4: "SETTINGS", 5: "PUSH_PROMISE", 6: "PING", 7: "GOAWAY", 8: "WINDOW_UPDATE", 9: "CONTINUATION"}
+    for _ in range(16_384):
+        if cursor + 9 > len(payload):
+            break
+        length = int.from_bytes(payload[cursor:cursor + 3], "big")
+        frame_type, flags = payload[cursor + 3], payload[cursor + 4]
+        stream_id = int.from_bytes(payload[cursor + 5:cursor + 9], "big") & 0x7FFFFFFF
+        if length > 16 * 1024 * 1024 or cursor + 9 + length > len(payload) or frame_type > 9:
+            break
+        body = payload[cursor + 9:cursor + 9 + length]
+        cursor += 9 + length
+        if frame_type == 0 and flags & 0x08:
+            if not body or body[0] >= len(body):
+                continue
+            body = body[1:len(body) - body[0]]
+        frames.append({"type": frame_type, "name": names.get(frame_type, f"TYPE-{frame_type}"), "flags": flags, "stream_id": stream_id, "payload": body})
+    return frames
+
+
 def _pcap_rtp_packet(payload: bytes) -> dict[str, Any] | None:
     if len(payload) < 12 or payload[0] >> 6 != 2:
         return None
@@ -1363,6 +1547,15 @@ def _pcap_packet_description(packet: dict[str, Any]) -> dict[str, Any]:
         })
         return result
 
+    if packet.get("special_protocol") == "ARP":
+        operation = int(packet.get("arp_operation") or 0)
+        sender_ip = str(packet.get("arp_sender_ip") or packet.get("source") or "?")
+        target_ip = str(packet.get("arp_target_ip") or packet.get("destination") or "?")
+        sender_mac = str(packet.get("arp_sender_mac") or "?")
+        info = f"Who has {target_ip}? Tell {sender_ip}" if operation == 1 else f"{sender_ip} is at {sender_mac}"
+        result.update({"protocol": "ARP", "transport": "ARP", "info": info})
+        return result
+
     dns = None
     if protocol_number in {6, 17} and (source_port == 53 or destination_port == 53):
         dns = _pcap_dns_message(payload, tcp=protocol_number == 6)
@@ -1415,6 +1608,27 @@ def _pcap_packet_description(packet: dict[str, Any]) -> dict[str, Any]:
             result["info"] = names.get(opcode, f"Opcode {opcode}")
         return result
 
+    if protocol_number == 17 and (source_port in {67, 68} or destination_port in {67, 68}):
+        dhcp = _pcap_dhcp_message(payload)
+        if dhcp:
+            result.update({
+                "protocol": "DHCP", "dhcp": dhcp,
+                "info": f"{dhcp['message_type']} xid={dhcp['transaction_id']}"
+                + (f" Host={dhcp['hostname']}" if dhcp.get("hostname") else "")
+                + (f" Requested={dhcp['requested_ip']}" if dhcp.get("requested_ip") else ""),
+            })
+            return result
+
+    if protocol_number == 17 and (source_port in {5683, 5684} or destination_port in {5683, 5684}):
+        coap = _pcap_coap_message(payload)
+        if coap:
+            suffix = f"?{coap['query']}" if coap.get("query") else ""
+            result.update({
+                "protocol": "CoAP", "coap": coap,
+                "info": f"{coap['type']} {coap['code']} {coap['path']}{suffix} Len={len(bytes(coap['payload']))}",
+            })
+            return result
+
     ports = {source_port, destination_port}
     if protocol_number == 6 and 1883 in ports:
         mqtt = _pcap_mqtt_messages(payload)
@@ -1432,6 +1646,15 @@ def _pcap_packet_description(packet: dict[str, Any]) -> dict[str, Any]:
             result.update({
                 "protocol": "MODBUS", "modbus": modbus,
                 "info": f"Transaction {item['transaction_id']} Unit {item['unit_id']} Function {item['function'] & 0x7F}" + (" Exception" if item["exception"] else ""),
+            })
+            return result
+    if protocol_number == 6 and ports & {80, 443, 8080, 8443}:
+        http2 = _pcap_http2_frames(payload)
+        if http2 and (payload.startswith(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") or any(item["name"] == "DATA" for item in http2)):
+            data = next((item for item in http2 if item["name"] == "DATA"), http2[0])
+            result.update({
+                "protocol": "HTTP2", "http2": http2,
+                "info": f"{data['name']} Stream={data['stream_id']} Len={len(bytes(data['payload']))}",
             })
             return result
     if protocol_number == 17:
@@ -1844,6 +2067,9 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
     tcp_flows: defaultdict[tuple[Any, ...], list[tuple[int | None, int, bytes]]] = defaultdict(list)
     udp_flows: defaultdict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
     dns_entries: list[dict[str, Any]] = []
+    arp_records: list[dict[str, Any]] = []
+    dhcp_messages: list[dict[str, Any]] = []
+    coap_messages: list[dict[str, Any]] = []
     payload_bytes = 0
     decoded_recoveries = 0
 
@@ -1866,6 +2092,7 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
                 b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"BM",
                 b"RIFF", b"PK\x03\x04", b"PK\x05\x06", b"%PDF-", b"BZh", b"\x1f\x8b",
                 b"fLaC", b"OggS", b"MThd", b"SQLite format 3\x00", b"Salted__",
+                *_PCAP_CLASSIC_MAGICS, _PCAPNG_MAGIC,
             )
         )
         flags = _pcap_flag_values(value)
@@ -1873,7 +2100,8 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
         # sniff_kind performs several format probes. A candidate without a
         # known prefix cannot be promoted as a file here, so skip those probes.
         kind = sniff_kind(value, source) if strong_signature else "binary"
-        meaningful_file = len(value) >= 16 and strong_signature and (kind not in {"binary", "text"} or value.startswith(b"Salted__"))
+        minimum_capture_length = 28 if value.startswith(_PCAPNG_MAGIC) else 24 if value.startswith(_PCAP_CLASSIC_MAGICS) else 16
+        meaningful_file = len(value) >= minimum_capture_length and strong_signature and (kind not in {"binary", "text"} or value.startswith(b"Salted__"))
         if not flags and not meaningful_file and not force_artifact:
             return False
         new_flags = flags - promoted_flags
@@ -1891,7 +2119,7 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
                 promoted_file_signatures.add(signature_key)
             result["extracted"].append({
                 "label": safe_label(f"pcap_{source}_recovered"), "data": value,
-                "kind": "text" if flags else kind,
+                "kind": kind if meaningful_file else "text",
                 "producer": "pcap-network-forensics", "transformation": transform or "packet stream reconstruction",
                 "reason": "A flag-shaped value or recognized file signature validated the bounded recovery.",
             })
@@ -1909,8 +2137,13 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
         )
         variants = _pcap_decode_variants(value) if decode_eligible else [("direct", value)]
         variants.extend(_pcap_magic_byte_variants(value))
+        direct_signature = any(value.startswith(prefix) for prefix in _PCAP_MAGIC_PREFIXES)
         for index, (transform, decoded) in enumerate(variants):
-            if index == 0 and not include_direct:
+            # Direct packet streams are normally covered elsewhere; retain
+            # one here when the stream itself begins with a known file/capture
+            # signature so nested PCAPs and raw objects are not beaten by a
+            # later trim/decode variant with the same signature.
+            if index == 0 and not include_direct and not direct_signature:
                 continue
             if register_candidate(decoded, source, offset, transform):
                 found += 1
@@ -1941,6 +2174,14 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
         source = packet.get("source")
         destination = packet.get("destination")
         protocol = packet.get("protocol")
+        if packet.get("special_protocol") == "ARP":
+            arp_records.append(packet)
+            arp_clue = (
+                f"ARP operation={packet.get('arp_operation')} sender={packet.get('arp_sender_ip')} "
+                f"sender_mac={packet.get('arp_sender_mac')} target={packet.get('arp_target_ip')} "
+                f"target_mac={packet.get('arp_target_mac')}"
+            )
+            add_text(arp_clue, "pcap-arp", packet.get("frame_offset"), 6)
         if source is not None and destination is not None and protocol == 6:
             flow_key = (source, packet.get("source_port"), destination, packet.get("destination_port"), protocol)
             tcp_flows[flow_key].append((packet.get("sequence"), int(packet.get("number", 0)), payload))
@@ -1951,6 +2192,29 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
             parsed_dns = _pcap_dns_message(payload, tcp=protocol == 6)
             if parsed_dns:
                 dns_entries.append({"packet": packet, "parsed": parsed_dns})
+        if protocol == 17 and {packet.get("source_port"), packet.get("destination_port")} & {67, 68}:
+            dhcp = _pcap_dhcp_message(payload)
+            if dhcp:
+                dhcp_messages.append({"packet": packet.get("number"), **dhcp})
+                clue_values = [
+                    str(value) for key, value in dhcp.items()
+                    if key in {"hostname", "domain", "vendor_class", "user_class", "bootfile"} and value
+                ]
+                for clue in clue_values:
+                    encoded = clue.encode("utf-8", "replace")
+                    add_text(clue, "pcap-dhcp-option", packet.get("frame_offset"), 8)
+                    direct_flag_hits.update(_pcap_flag_values(encoded))
+                    try_variants(encoded, "dhcp-option", packet.get("frame_offset"), include_direct=True)
+        if protocol == 17 and {packet.get("source_port"), packet.get("destination_port")} & {5683, 5684}:
+            coap = _pcap_coap_message(payload)
+            if coap:
+                coap_messages.append({"packet": packet.get("number"), **{key: value for key, value in coap.items() if key != "payload"}})
+                body = bytes(coap.get("payload") or b"")
+                if body:
+                    direct_flag_hits.update(_pcap_flag_values(body))
+                    if _pcap_printable(body):
+                        add_text(body.decode("utf-8", "replace"), "pcap-coap-payload", packet.get("frame_offset"), 9, ["CoAP option/data decoding"])
+                    try_variants(body, "coap-payload", packet.get("frame_offset"), include_direct=True)
         message = _pcap_http_message(payload)
         if message:
             message.update({
@@ -1982,9 +2246,9 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
     for flow, fragments in tcp_flows.items():
         if len(fragments) < 2:
             payload = bytes(fragments[0][2]) if fragments and fragments[0][2] else b""
-            tcp_spans_by_flow[flow] = [payload] if payload else []
-            continue
-        spans, overlaps, gaps = _pcap_reassemble_tcp(fragments)
+            spans, overlaps, gaps = ([payload] if payload else []), 0, 0
+        else:
+            spans, overlaps, gaps = _pcap_reassemble_tcp(fragments)
         tcp_spans_by_flow[flow] = spans
         tcp_overlap_bytes += overlaps
         tcp_gap_spans += gaps
@@ -1997,9 +2261,42 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
                 add_text(assembled.decode("latin-1", "ignore"), "pcap-tcp-stream", None, 9, ["TCP sequence reassembly", f"span {span_index + 1}"])
             try_variants(assembled, "tcp-stream", None)
             message = _pcap_http_message(assembled)
-            if message:
+            # A one-packet HTTP message was already collected during packet
+            # iteration; only add the stream view when it actually reassembled
+            # multiple segments, otherwise POST bodies would be duplicated in
+            # correlated exfiltration recoveries.
+            if message and len(fragments) > 1:
                 message.update({"packet": fragments[0][1], "source": flow[0], "destination": flow[2], "source_port": flow[1], "destination_port": flow[3], "reassembled": True})
                 http_messages.append(message)
+
+    # Native HTTP/2 recovery complements the external TShark dissector for
+    # cleartext/h2c challenges. Once a connection presents the HTTP/2 preface,
+    # DATA frames from either direction are grouped by stream and fed through
+    # the ordinary bounded file/flag recovery pipeline.
+    http2_connections: set[tuple[str, str]] = set()
+    for flow, spans in tcp_spans_by_flow.items():
+        if {flow[1], flow[3]} & {80, 443, 8080, 8443} and any(span.startswith(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") for span in spans):
+            http2_connections.add(tuple(sorted((str(flow[0]), str(flow[2])))))
+    http2_streams: defaultdict[tuple[tuple[str, str], int], list[bytes]] = defaultdict(list)
+    http2_frames = 0
+    for flow, spans in tcp_spans_by_flow.items():
+        connection = tuple(sorted((str(flow[0]), str(flow[2]))))
+        if connection not in http2_connections:
+            continue
+        for span in spans:
+            for frame in _pcap_http2_frames(span):
+                http2_frames += 1
+                if frame["name"] == "DATA" and frame["payload"]:
+                    http2_streams[(connection, int(frame["stream_id"]))].append(bytes(frame["payload"]))
+    http2_exports = 0
+    for (connection, stream_id), parts in http2_streams.items():
+        assembled = b"".join(parts)
+        if not assembled or len(assembled) > 64 * 1024 * 1024:
+            continue
+        direct_flag_hits.update(_pcap_flag_values(assembled))
+        if _pcap_printable(assembled):
+            add_text(assembled.decode("latin-1", "ignore"), "pcap-http2-data", None, 9, [f"HTTP/2 stream {stream_id} DATA reassembly"])
+        http2_exports += try_variants(assembled, f"http2-stream-{stream_id}", None, include_direct=True)
 
     # Application formats that routinely appear in PCAP CTFs. They are parsed
     # from contiguous TCP spans rather than trusting packet boundaries.
@@ -2613,6 +2910,9 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
         "ip_fragment_reassemblies": len(rebuilt_fragments), "incomplete_ip_fragment_sets": incomplete_fragments,
         "udp_source_port_recoveries": len(port_recoveries), "dns_queries_or_records": len(dns_entries),
         "dns_recoveries": dns_recoveries, "tftp_objects": len(tftp_objects),
+        "arp_records": len(arp_records), "dhcp_messages": dhcp_messages[:1_024],
+        "coap_messages": coap_messages[:1_024], "http2_frames": http2_frames,
+        "http2_data_streams": len(http2_streams), "http2_recoveries": http2_exports,
         "mqtt_publishes": mqtt_publishes, "mqtt_topics": sorted(mqtt_topics)[:1_024],
         "websocket_messages": websocket_messages, "modbus_messages": modbus_messages,
         "cleartext_credentials": cleartext_credentials, "bittorrent_dht_info_hashes": dht_info_hashes,
@@ -2638,6 +2938,12 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
         result["findings"].append(_finding("info", "network-object", "TFTP object reconstructed", "RRQ/WRQ and DATA blocks were reassembled into child artifacts for recursive analysis.", objects=[{key: value for key, value in item.items() if key != "data"} for item in tftp_objects]))
     if cleartext_credentials:
         result["findings"].append(_finding("warning", "network-credentials", "Cleartext authentication commands recovered", "FTP/Telnet/mail authentication commands were observed in a reassembled TCP stream.", count=len(cleartext_credentials)))
+    if dhcp_messages:
+        result["findings"].append(_finding("info", "network-dhcp", "DHCP option evidence decoded", "BOOTP/DHCP hostname, domain, vendor, user-class, boot-file, and server options were decoded and tested as CTF clue channels.", messages=len(dhcp_messages)))
+    if coap_messages:
+        result["findings"].append(_finding("info", "network-coap", "CoAP paths and payloads decoded", "CoAP URI path/query options and payload markers were parsed from UDP and tested through the normal recovery transforms.", messages=len(coap_messages)))
+    if http2_streams:
+        result["findings"].append(_finding("info", "network-http2", "HTTP/2 DATA streams reconstructed", "Cleartext HTTP/2 DATA frames were grouped by stream and inspected as candidate files or encoded CTF payloads.", streams=len(http2_streams), frames=http2_frames))
     if dht_info_hashes:
         result["findings"].append(_finding("info", "network-bittorrent", "BitTorrent DHT info-hash recovered", "A DHT bencoded info_hash was extracted; it can identify the requested torrent even when the file itself is not present.", info_hashes=[item["info_hash"] for item in dht_info_hashes[:32]]))
     if can_frames:
@@ -2729,6 +3035,7 @@ def parse_pcapng(data: bytes, profile: str = "balanced") -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     comments: list[tuple[str, int]] = []
     secrets: list[bytes] = []
+    name_resolution: list[tuple[str, str, int]] = []
 
     def options(raw: bytes, start: int, end: int) -> tuple[dict[int, list[bytes]], list[str]]:
         parsed: defaultdict[int, list[bytes]] = defaultdict(list)
@@ -2804,7 +3111,14 @@ def parse_pcapng(data: bytes, profile: str = "balanced") -> dict[str, Any]:
             parsed, block_comments = options(data, body_start + 8, body_end)
             tsresol = parsed.get(9, [b"\x06"])[0][0] if parsed.get(9) and parsed[9][0] else 6
             tsoffset = int.from_bytes(parsed.get(14, [b"\x00" * 8])[0][:8], byteorder="little" if endian == "<" else "big", signed=True) if parsed.get(14) else 0
-            interfaces.append({"linktype": linktype, "snaplen": snaplen, "tsresol": tsresol, "tsoffset": tsoffset})
+            def interface_text(code: int) -> str | None:
+                value = next(iter(parsed.get(code, [])), b"")
+                return value.decode("utf-8", "replace").strip("\x00") or None
+            interfaces.append({
+                "linktype": linktype, "snaplen": snaplen, "tsresol": tsresol, "tsoffset": tsoffset,
+                "name": interface_text(2), "description": interface_text(3),
+                "os": interface_text(12), "hardware": interface_text(13),
+            })
             interfaces_seen += 1
         elif block_type == 6:  # Enhanced Packet Block
             enhanced_packets += 1
@@ -2850,6 +3164,32 @@ def parse_pcapng(data: bytes, profile: str = "balanced") -> dict[str, Any]:
                 if secret:
                     secrets.append(secret)
                     block_comments.append(secret.decode("utf-8", "replace"))
+        elif block_type == 4:  # Name Resolution Block
+            cursor = body_start
+            for _ in range(8_192):
+                if cursor + 4 > body_end:
+                    break
+                record_type, record_length = struct.unpack_from(f"{endian}HH", data, cursor)
+                cursor += 4
+                if record_type == 0:
+                    break
+                if cursor + record_length > body_end:
+                    break
+                value = data[cursor:cursor + record_length]
+                cursor += (record_length + 3) & ~3
+                if record_type not in {1, 2}:
+                    continue
+                address_length = 4 if record_type == 1 else 16
+                if len(value) <= address_length:
+                    continue
+                try:
+                    address = str(ipaddress.ip_address(value[:address_length]))
+                except ValueError:
+                    continue
+                for raw_name in value[address_length:].split(b"\x00"):
+                    name = raw_name.decode("utf-8", "replace").strip()
+                    if name:
+                        name_resolution.append((address, name, offset))
         elif block_type in {0x00000BAD, 0x40000BAD}:  # custom data blocks
             custom = data[body_start:body_end]
             if custom:
@@ -2874,19 +3214,27 @@ def parse_pcapng(data: bytes, profile: str = "balanced") -> dict[str, Any]:
         "transport_protocols": dict(Counter(str(item.get("protocol")) for item in records if item.get("protocol") is not None)),
         "network_flows": len({(item.get("source"), item.get("source_port"), item.get("destination"), item.get("destination_port"), item.get("protocol")) for item in records if item.get("network") and item.get("payload")}),
         "decryption_secret_blocks": len(secrets),
+        "interface_details": interfaces,
+        "name_resolution_records": [
+            {"address": address, "name": name} for address, name, _offset in name_resolution[:4_096]
+        ],
     })
     for comment, comment_offset in comments:
         result["text_records"].append({"source": "pcapng-comment-or-secret", "offset": comment_offset, "text": comment, "confidence_hint": 9})
     for secret in secrets:
         result["extracted"].append({"label": "pcapng_decryption_secrets", "data": secret, "kind": "text", "producer": "pcapng-dsb", "transformation": "Extract Decryption Secrets Block payload", "reason": "PCAPNG stores TLS/other protocol secrets in a dedicated block."})
+    for address, name, name_offset in name_resolution:
+        result["text_records"].append({"source": "pcapng-name-resolution", "offset": name_offset, "text": f"{address}\t{name}", "confidence_hint": 8})
     if malformed:
         result["findings"].append(_finding("warning", "structure", "Malformed PCAPNG block", "Block length or mirrored trailer validation failed; packet iteration stopped safely.", offset=offset))
     analyzed = _analyze_capture_records(result, records, profile)
     secret_flags: set[str] = set()
     for secret in secrets:
         secret_flags.update(_pcap_flag_values(secret))
+    for _address, name, _name_offset in name_resolution:
+        secret_flags.update(_pcap_flag_values(name.encode("utf-8", "replace")))
     if secret_flags:
-        analyzed["findings"].append(_finding("info", "network-payload", "Flag-like text recovered from PCAPNG secrets", "A bounded Decryption Secrets Block contains a CTF-style flag-shaped value.", flags=sorted(secret_flags)))
+        analyzed["findings"].append(_finding("info", "network-payload", "Flag-like text recovered from PCAPNG metadata", "A bounded Decryption Secrets Block or Name Resolution Block contains a CTF-style flag-shaped value.", flags=sorted(secret_flags)))
     return analyzed
 
 

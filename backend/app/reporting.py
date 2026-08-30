@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
+from .analyzers.common import extension_for, mime_for, sniff_kind
 from .security import normalize_display_filename, require_regular_file, resolve_under
 
 
@@ -200,6 +201,42 @@ def sniff_media_type(path: Path) -> tuple[str, bool]:
     if guessed in {"text/html", "image/svg+xml", "application/xhtml+xml"}:
         return guessed, False
     return guessed or "application/octet-stream", False
+
+
+def artifact_download_details(path: Path, display_name: str | None = None) -> tuple[str, str]:
+    """Return a safe recovered filename and MIME type derived from its bytes.
+
+    Artifacts are stored with an internal id-prefixed name. The human label is
+    deliberately independent of that path, so response headers and case-export
+    members must restore the extension from the recovered bytes rather than
+    trusting a possibly misleading original upload name.
+    """
+
+    fallback = path.name or "artifact.bin"
+    cleaned = normalize_display_filename(display_name, fallback=fallback)
+    try:
+        with path.open("rb") as handle:
+            sample = handle.read(128 * 1024)
+    except OSError:
+        return cleaned, mime_for(sniff_kind(b"", cleaned), cleaned)
+    detected = sniff_kind(sample, cleaned)
+    extension = extension_for(detected)
+    if detected == "binary":
+        # Preserve a meaningful supplied name when no content signature can
+        # prove a format. Derived binary artifacts normally already use .bin.
+        filename = cleaned if Path(cleaned).suffix else f"{cleaned}.bin"
+    elif Path(cleaned).suffix.casefold() == extension.casefold():
+        filename = cleaned
+    else:
+        stem = Path(cleaned).stem or "artifact"
+        filename = normalize_display_filename(f"{stem}{extension}", fallback=f"artifact{extension}")
+    return filename, mime_for(detected, filename)
+
+
+def artifact_download_filename(path: Path, display_name: str | None = None) -> str:
+    """Return only the content-derived filename for a recovered artifact."""
+
+    return artifact_download_details(path, display_name)[0]
 
 
 def deterministic_artifact_id(job_id: str, relative_path: str) -> str:
@@ -513,7 +550,7 @@ def write_report_zip(
             except (KeyError, OSError, ValueError):
                 continue
             artifact_id = str(artifact.get("id") or deterministic_artifact_id(str(artifact["job_id"]), relative_path))
-            safe_name = normalize_display_filename(str(artifact.get("name") or source.name), fallback="artifact.bin")
+            safe_name = artifact_download_filename(source, str(artifact.get("name") or source.name))
             archive_name = f"artifacts/{artifact_id}/{safe_name}"
             archive.write(source, archive_name)
             manifest_entries.append(

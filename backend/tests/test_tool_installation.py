@@ -101,6 +101,7 @@ def test_extended_forensics_tools_are_allowlisted_to_fixed_packages() -> None:
         "tshark_credentials": "tshark",
         "tshark_rtp": "tshark",
         "tshark_authentication": "tshark",
+        "tshark_http2_ranges": "tshark",
         "tshark_ftp_objects": "tshark",
         "tshark_tftp_objects": "tshark",
         "tshark_imf_objects": "tshark",
@@ -128,6 +129,7 @@ def test_extended_forensics_tools_are_allowlisted_to_fixed_packages() -> None:
     assert "python-evtx==0.8.1" in tool_installation.PYTHON_EVTX_INSTALL_SCRIPT
     assert tool_installation.WINGET_PACKAGE_IDS["tshark"] == "WiresharkFoundation.Wireshark"
     assert tool_installation.WINGET_PACKAGE_IDS["tshark_packet_details"] == "WiresharkFoundation.Wireshark"
+    assert tool_installation.WINGET_PACKAGE_IDS["tshark_http2_ranges"] == "WiresharkFoundation.Wireshark"
 
 
 def test_shared_winget_audio_package_is_installed_once(monkeypatch: pytest.MonkeyPatch) -> None:

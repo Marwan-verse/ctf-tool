@@ -4,7 +4,7 @@ import json
 import zipfile
 from pathlib import Path
 
-from app.reporting import normalize_report, render_html_report, report_csp, sniff_media_type, write_report_zip
+from app.reporting import artifact_download_details, artifact_download_filename, normalize_report, render_html_report, report_csp, sniff_media_type, write_report_zip
 
 
 def test_normalized_report_redacts_passwords_and_private_paths(tmp_path: Path) -> None:
@@ -75,6 +75,22 @@ def test_wav_artifacts_are_verified_safe_inline_audio(tmp_path: Path) -> None:
     recovered.write_bytes(b"RIFF" + (4).to_bytes(4, "little") + b"WAVE")
 
     assert sniff_media_type(recovered) == ("audio/wav", True)
+
+
+def test_recovered_download_names_follow_content_signatures(tmp_path: Path) -> None:
+    png = tmp_path / "internal-artifact.bin"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    pcap = tmp_path / "internal-capture.bin"
+    pcap.write_bytes(b"\xd4\xc3\xb2\xa1" + b"\x00" * 20)
+    wav = tmp_path / "internal-audio.bin"
+    wav.write_bytes(b"RIFF\x04\x00\x00\x00WAVE")
+
+    assert artifact_download_filename(png, "corrupted-photo.dat") == "corrupted-photo.png"
+    assert artifact_download_filename(pcap, "packet-recovery.txt") == "packet-recovery.pcap"
+    assert artifact_download_filename(wav, "channel-export.raw") == "channel-export.wav"
+    assert artifact_download_details(png, "corrupted-photo.dat") == ("corrupted-photo.png", "image/png")
+    assert artifact_download_details(pcap, "packet-recovery.txt") == ("packet-recovery.pcap", "application/vnd.tcpdump.pcap")
+    assert artifact_download_details(wav, "channel-export.raw") == ("channel-export.wav", "audio/wav")
 
 
 def test_zip_export_uses_generated_paths_and_skips_escape(tmp_path: Path) -> None:

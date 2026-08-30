@@ -302,6 +302,66 @@ def test_rtp_dtmf_and_bittorrent_dht_are_surfaced() -> None:
     assert result["properties"]["bittorrent_dht_info_hashes"][0]["info_hash"] == info_hash.hex()
 
 
+def test_arp_dhcp_coap_and_http2_ctf_channels_are_decoded() -> None:
+    ethernet_arp = (
+        b"\xff" * 6 + bytes.fromhex("001122334455") + b"\x08\x06"
+        + struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1)
+        + bytes.fromhex("001122334455") + bytes([10, 0, 0, 1])
+        + b"\x00" * 6 + bytes([10, 0, 0, 2])
+    )
+    dhcp = bytearray(240)
+    dhcp[4:8] = b"\x12\x34\x56\x78"
+    dhcp[28:34] = bytes.fromhex("001122334455")
+    dhcp[236:240] = b"\x63\x82\x53\x63"
+    hostname = b"picoCTF{dhcp_fixture}"
+    dhcp.extend(b"\x35\x01\x01\x0c" + bytes([len(hostname)]) + hostname + b"\xff")
+    coap = b"\x40\x45\x12\x34\xb4flag\xffpicoCTF{coap_fixture}"
+    http2_body = b"picoCTF{http2_fixture}"
+    http2 = (
+        b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+        + len(http2_body).to_bytes(3, "big") + b"\x00\x01\x00\x00\x00\x01" + http2_body
+    )
+    # Ethernet ARP and raw-IP traffic require separate capture link types.
+    arp_result = analyze_format("pcap", _raw_pcap([ethernet_arp], linktype=1))
+    result = analyze_format("pcap", _raw_pcap([
+        _raw_ipv4_packet("10.0.0.1", "10.0.0.2", 17, bytes(dhcp), source_port=68, destination_port=67),
+        _raw_ipv4_packet("10.0.0.1", "10.0.0.2", 17, coap, source_port=5683, destination_port=5683),
+        _raw_ipv4_packet("10.0.0.1", "10.0.0.2", 6, http2, source_port=40000, destination_port=80),
+    ]), profile="deep")
+
+    assert arp_result["properties"]["arp_records"] == 1
+    assert result["properties"]["dhcp_messages"][0]["hostname"] == "picoCTF{dhcp_fixture}"
+    assert result["properties"]["coap_messages"][0]["path"] == "/flag"
+    assert result["properties"]["http2_data_streams"] == 1
+    rendered = str(result)
+    assert "picoCTF{dhcp_fixture}" in rendered
+    assert "picoCTF{coap_fixture}" in rendered
+    assert "picoCTF{http2_fixture}" in rendered
+
+
+def test_pcapng_name_resolution_metadata_is_retained_and_scanned() -> None:
+    section = _pcapng_block(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1))
+    interface = _pcapng_block(1, struct.pack("<HHI", 228, 0, 65535))
+    name = b"picoCTF{nrb_fixture}\x00"
+    resolution = struct.pack("<HH", 1, 4 + len(name)) + bytes([203, 0, 113, 9]) + name + b"\x00\x00\x00\x00"
+    result = analyze_format("pcapng", section + interface + _pcapng_block(4, resolution))
+
+    assert result["properties"]["name_resolution_records"] == [{"address": "203.0.113.9", "name": "picoCTF{nrb_fixture}"}]
+    assert any("picoCTF{nrb_fixture}" in finding["details"]["flags"] for finding in result["findings"] if finding["title"] == "Flag-like text recovered from PCAPNG metadata")
+
+
+def test_pcap_embedded_in_tcp_stream_is_promoted_for_recursive_analysis() -> None:
+    embedded = _raw_pcap([
+        _raw_ipv4_packet("192.0.2.1", "192.0.2.2", 6, b"picoCTF{nested_capture_fixture}"),
+    ])
+    outer = _raw_pcap([
+        _raw_ipv4_packet("10.0.0.1", "10.0.0.2", 6, embedded, source_port=4444, destination_port=4445),
+    ])
+    result = analyze_format("pcap", outer, profile="deep")
+
+    assert any(item["kind"] == "pcap" and item["data"] == embedded for item in result["extracted"])
+
+
 def test_lz4_uncompressed_frame_is_bounded() -> None:
     payload = b"flag{lz4_frame_fixture}"
     frame = b"\x04\x22\x4d\x18\x60\x40\x00" + struct.pack("<I", 0x80000000 | len(payload)) + payload + b"\x00\x00\x00\x00"

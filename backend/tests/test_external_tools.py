@@ -175,6 +175,17 @@ def test_tshark_usb_mouse_reports_render_an_svg_artifact() -> None:
     assert drawings[0][1].startswith(b"<svg")
 
 
+def test_tshark_http2_content_range_decoder_reassembles_out_of_order_file() -> None:
+    output = "\n".join((
+        "12\t3\tbytes=4-6/7\t435446",
+        "11\t3\tbytes=0-3/7\t504b0304",
+    ))
+
+    recovered = ExternalToolRunner._decode_http2_range_artifacts(output)  # noqa: SLF001 - bounded decoder contract
+
+    assert recovered == [("http2_stream_3_range_7.bin", b"PK\x03\x04CTF", 2)]
+
+
 def test_tshark_traffic_workspace_adapters_use_fixed_bounded_arguments(monkeypatch, tmp_path: Path) -> None:
     capture = tmp_path / "capture.pcapng"
     capture.write_bytes(b"\x0a\x0d\x0d\x0a" + b"\x00" * 24)
@@ -198,7 +209,7 @@ def test_tshark_traffic_workspace_adapters_use_fixed_bounded_arguments(monkeypat
     monkeypatch.setattr(runner, "_execute", fake_execute)
     selected = {
         "tshark_packet_details", "tshark_statistics", "tshark_expert",
-        "tshark_credentials", "tshark_rtp", "tshark_authentication", "tshark_ftp_objects",
+        "tshark_credentials", "tshark_rtp", "tshark_authentication", "tshark_http2_ranges", "tshark_ftp_objects",
     }
     runner.run_all(
         capture,
@@ -220,6 +231,7 @@ def test_tshark_traffic_workspace_adapters_use_fixed_bounded_arguments(monkeypat
     assert any("credentials" in argv for argv in main_calls)
     assert any("rtp,streams" in argv for argv in main_calls)
     assert any("ntlmssp kerberos ldap http smb smb2" in argv for argv in main_calls)
+    assert any("http2.headers.range && http2.data.data" in argv for argv in main_calls)
     assert any("ftp-data," in argument for argv in main_calls for argument in argv)
 
 

@@ -144,6 +144,38 @@ def test_hex_api_live_preview_and_save_preserve_original(tmp_path: Path) -> None
         client.__exit__(None, None, None)
 
 
+def test_artifact_download_uses_recovered_content_extension(tmp_path: Path) -> None:
+    client, job_id, _source_id, source_path, _original = _make_api_fixture(tmp_path)
+    try:
+        output = source_path.parents[1] / "output"
+        recovered = output / "recovered-internal.bin"
+        payload = tiny_png()
+        recovered.write_bytes(payload)
+        artifact_id = str(uuid4())
+        client.app.state.storage.upsert_artifact({
+            "id": artifact_id,
+            "job_id": job_id,
+            "parent_id": None,
+            "name": "decoded-payload.txt",
+            "kind": "derived",
+            "relative_path": "output/recovered-internal.bin",
+            "media_type": "application/octet-stream",
+            "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "previewable": False,
+            "metadata": {},
+        })
+
+        response = client.get(f"/api/jobs/{job_id}/artifacts/{artifact_id}/download")
+
+        assert response.status_code == 200
+        assert 'filename="decoded-payload.png"' in response.headers["content-disposition"]
+        assert response.headers["content-type"].startswith("image/png")
+        assert response.content == payload
+    finally:
+        client.__exit__(None, None, None)
+
+
 def test_hex_api_rejects_stale_hash_and_duplicate_offsets(tmp_path: Path) -> None:
     client, job_id, artifact_id, _source_path, original = _make_api_fixture(tmp_path)
     try:
