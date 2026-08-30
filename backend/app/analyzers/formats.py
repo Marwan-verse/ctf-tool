@@ -83,13 +83,35 @@ def _finding(severity: str, category: str, title: str, description: str, **detai
     }
 
 
-_PCAP_FLAG_PREFIXES = (b"picoCTF{", b"flag{", b"CTF{", b"HTB{", b"THM{", b"DUCTF{", b"ICC{")
-_PCAP_FLAG_RE = re.compile(rb"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_-]{1,31}\{[^\r\n{}]{2,240}\}")
+_PCAP_FLAG_PREFIXES = (
+    b"picoCTF{", b"flag{", b"CTF{", b"HTB{", b"THM{", b"DUCTF{", b"ICC{",
+    b"BH{", b"N0PS{", b"APRK{", b"RaziCTF{", b"UTCTF{", b"HuntressCTF{",
+    b"buckeye{", b"irisctf{",
+)
+_PCAP_FLAG_RE = re.compile(
+    rb"(?<![A-Za-z0-9_])(?:picoCTF|flag|CTF|HTB|THM|DUCTF|ICC)\{[^\r\n{}]{2,240}\}",
+    re.IGNORECASE,
+)
 _PCAP_IMSI_RE = re.compile(rb"\bIMSI\s*[:=]\s*(\d{8,20})", re.IGNORECASE)
 _PCAP_CELL_RE = re.compile(rb"\bCELL(?:ID)?\s*[:=]\s*(\d{3,12})", re.IGNORECASE)
 _PCAP_MAGIC_PREFIXES = _PCAP_FLAG_PREFIXES + (
     b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF89a", b"GIF87a", b"BM",
     b"PK\x03\x04", b"%PDF-", b"BZh", b"\x1f\x8b", b"Salted__", b"RIFF",
+)
+
+_PCAP_IP_PROTOCOL_NAMES = {
+    1: "ICMP", 2: "IGMP", 6: "TCP", 17: "UDP", 41: "IPv6",
+    47: "GRE", 50: "ESP", 51: "AH", 58: "ICMPv6", 89: "OSPF",
+}
+_PCAP_DNS_TYPE_NAMES = {
+    1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX",
+    16: "TXT", 28: "AAAA", 33: "SRV", 41: "OPT", 43: "DS",
+    46: "RRSIG", 47: "NSEC", 48: "DNSKEY", 65: "HTTPS", 255: "ANY",
+}
+_PCAP_TCP_FLAG_ORDER = (
+    (0x002, "SYN"), (0x010, "ACK"), (0x008, "PSH"), (0x001, "FIN"),
+    (0x004, "RST"), (0x020, "URG"), (0x040, "ECE"), (0x080, "CWR"),
+    (0x100, "NS"),
 )
 
 
@@ -99,6 +121,7 @@ def _pcap_transport_fields(protocol: int, segment: bytes) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "source_port": None, "destination_port": None, "sequence": None,
         "acknowledgement": None, "tcp_flags": None, "tcp_window": None,
+        "tcp_urgent_pointer": None, "transport_checksum": None,
         "icmp_type": None, "icmp_code": None, "icmp_id": None, "icmp_sequence": None,
         "payload": segment, "transport_header_length": 0,
     }
@@ -114,6 +137,8 @@ def _pcap_transport_fields(protocol: int, segment: bytes) -> dict[str, Any]:
             "sequence": sequence, "acknowledgement": acknowledgement,
             "tcp_flags": ((segment[12] & 0x01) << 8) | segment[13],
             "tcp_window": int.from_bytes(segment[14:16], "big"),
+            "transport_checksum": int.from_bytes(segment[16:18], "big"),
+            "tcp_urgent_pointer": int.from_bytes(segment[18:20], "big"),
             "payload": segment[header_length:], "transport_header_length": header_length,
         })
     elif protocol == 17:
@@ -124,12 +149,13 @@ def _pcap_transport_fields(protocol: int, segment: bytes) -> dict[str, Any]:
         fields.update({
             "source_port": source_port, "destination_port": destination_port,
             "payload": segment[8:udp_end], "transport_header_length": 8,
-            "udp_length": udp_length,
+            "udp_length": udp_length, "transport_checksum": int.from_bytes(segment[6:8], "big"),
         })
     elif protocol in {1, 58}:  # ICMP / ICMPv6
         if len(segment) < 4:
             return fields
         fields["icmp_type"], fields["icmp_code"] = segment[0], segment[1]
+        fields["transport_checksum"] = int.from_bytes(segment[2:4], "big")
         header_length = 8 if len(segment) >= 8 else 4
         if len(segment) >= 8:
             fields["icmp_id"] = int.from_bytes(segment[4:6], "big")
@@ -213,6 +239,44 @@ def _pcap_frame_payload(frame: bytes, linktype: int) -> tuple[int, bytes]:
     return 0, frame
 
 
+def _pcap_special_frame(frame: bytes, linktype: int) -> dict[str, Any] | None:
+    """Decode non-IP capture formats that are common in hardware/ICS CTFs."""
+
+    if linktype == 227 and len(frame) >= 8:  # LINKTYPE_CAN_SOCKETCAN
+        raw_id = int.from_bytes(frame[:4], "big")
+        length = min(int(frame[4]), 64, max(0, len(frame) - 8))
+        can_id = raw_id & 0x1FFFFFFF
+        extended = bool(raw_id & 0x80000000)
+        payload = frame[8:8 + length]
+        width = 8 if extended else 3
+        return {
+            "source": f"CAN 0x{can_id:0{width}X}", "destination": "CAN bus",
+            "protocol": None, "special_protocol": "CAN", "source_port": None,
+            "destination_port": None, "sequence": None, "payload": payload,
+            "payload_offset": 8, "network": False, "can_id": can_id,
+            "can_extended": extended, "can_rtr": bool(raw_id & 0x40000000),
+            "can_error": bool(raw_id & 0x20000000), "can_dlc": length,
+            "can_fd": length > 8,
+        }
+    return None
+
+
+def _pcap_capture_packet(frame: bytes, linktype: int) -> dict[str, Any]:
+    packet = _pcap_packet_network(frame, linktype)
+    if packet is not None:
+        packet["network"] = True
+        return packet
+    special = _pcap_special_frame(frame, linktype)
+    if special is not None:
+        return special
+    payload_offset, frame_payload = _pcap_frame_payload(frame, linktype)
+    return {
+        "source": None, "destination": None, "protocol": None,
+        "source_port": None, "destination_port": None, "sequence": None,
+        "payload": frame_payload, "payload_offset": payload_offset, "network": False,
+    }
+
+
 def _pcap_packet_network(frame: bytes, linktype: int) -> dict[str, Any] | None:
     """Return bounded IPv4/IPv6 transport details for common capture link types."""
 
@@ -240,7 +304,11 @@ def _pcap_packet_network(frame: bytes, linktype: int) -> dict[str, Any] | None:
         return {
             "ip_version": 4, "source": source, "destination": destination, "protocol": protocol,
             "ttl": frame[ip_offset + 8], "traffic_class": frame[ip_offset + 1],
+            "ip_checksum": int.from_bytes(frame[ip_offset + 10:ip_offset + 12], "big"),
             "ip_id": int.from_bytes(frame[ip_offset + 4:ip_offset + 6], "big"),
+            "ip_flags": (fragment_field >> 13) & 0x07,
+            "ip_reserved": bool(fragment_field & 0x8000),
+            "dont_fragment": bool(fragment_field & 0x4000),
             "fragment_offset": fragment_offset, "more_fragments": more_fragments,
             "ip_payload": ip_payload if (fragment_offset or more_fragments) else b"", "network_offset": ip_offset,
             "payload_offset": transport_offset + int(transport["transport_header_length"]),
@@ -286,7 +354,9 @@ def _pcap_packet_network(frame: bytes, linktype: int) -> dict[str, Any] | None:
     return {
         "ip_version": 6, "source": source, "destination": destination, "protocol": next_header,
         "ttl": frame[ip_offset + 7], "traffic_class": (first_word >> 20) & 0xFF,
+        "ip_checksum": None,
         "flow_label": first_word & 0xFFFFF, "ip_id": fragment_id,
+        "ip_flags": None, "ip_reserved": None, "dont_fragment": None,
         "fragment_offset": fragment_offset, "more_fragments": more_fragments,
         "ip_payload": ip_payload if (fragment_offset or more_fragments) else b"", "network_offset": ip_offset,
         "payload_offset": cursor + int(transport["transport_header_length"]),
@@ -346,10 +416,165 @@ def _pcap_http_message(payload: bytes) -> dict[str, Any] | None:
             body = bytes(decoded)
     request_method = match.group(1).decode("ascii", "ignore")
     request_target = match.group(2).decode("latin-1", "ignore")
+    first_line_end = payload.find(b"\n", match.start())
+    first_line = payload[match.start():first_line_end if first_line_end >= 0 else header_end].rstrip(b"\r").decode("latin-1", "ignore")
+    response = request_method.startswith("HTTP/")
+    status_code = int(request_target) if response and request_target.isdigit() else None
+    reason = ""
+    if response:
+        parts = first_line.split(" ", 2)
+        reason = parts[2] if len(parts) > 2 else ""
+    content_disposition = header_map.get("content-disposition", "")
+    filename_match = re.search(r"filename\*?=(?:UTF-8''|\")?([^\";]+)", content_disposition, re.IGNORECASE)
     return {
         "method": request_method, "target": request_target,
+        "first_line": first_line, "response": response, "status_code": status_code,
+        "reason": reason, "version": request_method if response else (first_line.rsplit(" ", 1)[-1] if " " in first_line else ""),
+        "host": header_map.get("host", ""), "content_type": header_map.get("content-type", ""),
+        "filename": filename_match.group(1).strip() if filename_match else "",
         "headers": header_map, "body": body,
     }
+
+
+def _pcap_tls_version(value: int) -> str:
+    return {
+        0x0300: "SSL 3.0", 0x0301: "TLS 1.0", 0x0302: "TLS 1.1",
+        0x0303: "TLS 1.2", 0x0304: "TLS 1.3",
+    }.get(value, f"0x{value:04x}")
+
+
+def _pcap_tls_extensions(body: bytes, offset: int, *, client: bool) -> dict[str, Any]:
+    """Parse display-safe ClientHello/ServerHello extension summaries."""
+
+    if offset + 2 > len(body):
+        return {}
+    declared = int.from_bytes(body[offset:offset + 2], "big")
+    cursor = offset + 2
+    end = min(len(body), cursor + declared)
+    server_names: list[str] = []
+    alpn: list[str] = []
+    supported_versions: list[str] = []
+    extension_types: list[int] = []
+    for _ in range(256):
+        if cursor + 4 > end:
+            break
+        extension_type = int.from_bytes(body[cursor:cursor + 2], "big")
+        length = int.from_bytes(body[cursor + 2:cursor + 4], "big")
+        cursor += 4
+        if cursor + length > end:
+            break
+        value = body[cursor:cursor + length]
+        cursor += length
+        extension_types.append(extension_type)
+        if extension_type == 0 and len(value) >= 5:  # server_name
+            name_cursor = 2
+            while name_cursor + 3 <= len(value):
+                name_type = value[name_cursor]
+                name_length = int.from_bytes(value[name_cursor + 1:name_cursor + 3], "big")
+                name_cursor += 3
+                if name_cursor + name_length > len(value):
+                    break
+                if name_type == 0:
+                    raw_name = value[name_cursor:name_cursor + name_length]
+                    try:
+                        server_names.append(raw_name.decode("idna"))
+                    except UnicodeError:
+                        server_names.append(raw_name.decode("ascii", "replace"))
+                name_cursor += name_length
+        elif extension_type == 16 and len(value) >= 3:  # ALPN
+            alpn_cursor = 2
+            while alpn_cursor < len(value):
+                item_length = value[alpn_cursor]
+                alpn_cursor += 1
+                if alpn_cursor + item_length > len(value):
+                    break
+                alpn.append(value[alpn_cursor:alpn_cursor + item_length].decode("ascii", "replace"))
+                alpn_cursor += item_length
+        elif extension_type == 43 and value:  # supported_versions
+            version_bytes = value
+            if client and len(value) >= 1:
+                version_bytes = value[1:1 + value[0]]
+            for index in range(0, len(version_bytes) - 1, 2):
+                supported_versions.append(_pcap_tls_version(int.from_bytes(version_bytes[index:index + 2], "big")))
+    result: dict[str, Any] = {"extension_types": extension_types[:128]}
+    if server_names:
+        result["server_names"] = server_names[:16]
+    if alpn:
+        result["alpn"] = alpn[:32]
+    if supported_versions:
+        result["supported_versions"] = supported_versions[:16]
+    return result
+
+
+def _pcap_tls_handshake(handshake_type: int, body: bytes) -> dict[str, Any]:
+    names = {
+        0: "Hello Request", 1: "Client Hello", 2: "Server Hello", 4: "New Session Ticket",
+        8: "Encrypted Extensions", 11: "Certificate", 12: "Server Key Exchange",
+        13: "Certificate Request", 14: "Server Hello Done", 15: "Certificate Verify",
+        16: "Client Key Exchange", 20: "Finished", 24: "Key Update",
+    }
+    item: dict[str, Any] = {"type": handshake_type, "name": names.get(handshake_type, f"Handshake {handshake_type}"), "length": len(body)}
+    if handshake_type == 1 and len(body) >= 35:
+        item["legacy_version"] = _pcap_tls_version(int.from_bytes(body[:2], "big"))
+        cursor = 34
+        session_length = body[cursor]
+        cursor += 1 + session_length
+        if cursor + 2 <= len(body):
+            cipher_length = int.from_bytes(body[cursor:cursor + 2], "big")
+            item["cipher_suite_count"] = cipher_length // 2
+            cursor += 2 + cipher_length
+        if cursor < len(body):
+            compression_length = body[cursor]
+            cursor += 1 + compression_length
+        item.update(_pcap_tls_extensions(body, cursor, client=True))
+    elif handshake_type == 2 and len(body) >= 38:
+        item["legacy_version"] = _pcap_tls_version(int.from_bytes(body[:2], "big"))
+        cursor = 34
+        session_length = body[cursor]
+        cursor += 1 + session_length
+        if cursor + 3 <= len(body):
+            item["cipher_suite"] = f"0x{int.from_bytes(body[cursor:cursor + 2], 'big'):04x}"
+            cursor += 3
+        item.update(_pcap_tls_extensions(body, cursor, client=False))
+    elif handshake_type == 11 and len(body) >= 3:
+        item["certificate_list_bytes"] = int.from_bytes(body[:3], "big")
+    return item
+
+
+def _pcap_tls_records(payload: bytes) -> list[dict[str, Any]]:
+    """Return bounded TLS record and handshake metadata without decrypting data."""
+
+    records: list[dict[str, Any]] = []
+    cursor = 0
+    for _ in range(128):
+        if cursor + 5 > len(payload):
+            break
+        content_type = payload[cursor]
+        version = int.from_bytes(payload[cursor + 1:cursor + 3], "big")
+        length = int.from_bytes(payload[cursor + 3:cursor + 5], "big")
+        if content_type not in {20, 21, 22, 23, 24} or version >> 8 != 3 or cursor + 5 + length > len(payload):
+            break
+        body = payload[cursor + 5:cursor + 5 + length]
+        item: dict[str, Any] = {
+            "content_type": content_type,
+            "content_name": {20: "Change Cipher Spec", 21: "Alert", 22: "Handshake", 23: "Application Data", 24: "Heartbeat"}.get(content_type, "TLS"),
+            "version": _pcap_tls_version(version), "length": length, "handshakes": [],
+        }
+        if content_type == 22:
+            handshake_cursor = 0
+            for _handshake in range(64):
+                if handshake_cursor + 4 > len(body):
+                    break
+                handshake_type = body[handshake_cursor]
+                handshake_length = int.from_bytes(body[handshake_cursor + 1:handshake_cursor + 4], "big")
+                handshake_cursor += 4
+                if handshake_cursor + handshake_length > len(body):
+                    break
+                item["handshakes"].append(_pcap_tls_handshake(handshake_type, body[handshake_cursor:handshake_cursor + handshake_length]))
+                handshake_cursor += handshake_length
+        records.append(item)
+        cursor += 5 + length
+    return records
 
 
 def _pcap_xor_recover(ciphertext: bytes, imsis: Iterable[str]) -> list[dict[str, Any]]:
@@ -390,25 +615,111 @@ def _pcap_timestamp_key(packet: dict[str, Any]) -> tuple[int, int, int]:
     return int(packet.get("number", 0)), 0, int(packet.get("number", 0))
 
 
+def _pcap_timestamp_nanoseconds(packet: dict[str, Any]) -> int | None:
+    timestamp_ns = packet.get("timestamp_ns")
+    if isinstance(timestamp_ns, int):
+        return timestamp_ns
+    value = packet.get("timestamp_key")
+    if not isinstance(value, tuple) or len(value) < 2:
+        return None
+    multiplier = 1 if packet.get("timestamp_resolution") == "nanoseconds" else 1_000
+    return int(value[0]) * 1_000_000_000 + int(value[1]) * multiplier
+
+
+def _pcap_pack_bits(bits: list[int], *, most_significant_first: bool) -> bytes:
+    packed = bytearray()
+    for start in range(0, len(bits) - 7, 8):
+        value = 0
+        for index, bit in enumerate(bits[start:start + 8]):
+            shift = 7 - index if most_significant_first else index
+            value |= (int(bit) & 1) << shift
+        packed.append(value)
+    return bytes(packed)
+
+
+def _pcap_bit_plane_variants(value: bytes) -> list[tuple[str, bytes]]:
+    """Pack varying scalar bit lanes in common CTF bit/direction conventions."""
+
+    if len(value) < 16:
+        return []
+    variants: list[tuple[str, bytes]] = []
+    seen: set[bytes] = set()
+    for bit_index in range(8):
+        bits = [(byte >> bit_index) & 1 for byte in value]
+        if not any(bits) or all(bits):
+            continue
+        for reversed_order in (False, True):
+            ordered = list(reversed(bits)) if reversed_order else bits
+            for inverted in (False, True):
+                candidate_bits = [bit ^ int(inverted) for bit in ordered]
+                for most_significant_first in (True, False):
+                    packed = _pcap_pack_bits(candidate_bits, most_significant_first=most_significant_first)
+                    if not packed or packed in seen:
+                        continue
+                    seen.add(packed)
+                    variants.append((
+                        f"bit {bit_index}, {'reversed, ' if reversed_order else ''}{'inverted, ' if inverted else ''}{'MSB' if most_significant_first else 'LSB'} packing",
+                        packed,
+                    ))
+    return variants
+
+
 def _pcap_printable(data: bytes, ratio: float = 0.55) -> bool:
     if not data:
         return False
-    printable = sum(value in {9, 10, 13} or 32 <= value < 127 for value in data)
-    return printable >= max(4, int(len(data) * ratio))
+    # A representative bounded sample is enough for deciding whether to try
+    # text decoders; scanning multi-megabyte streams repeatedly is not.
+    sample = data
+    if len(data) > 65_536:
+        middle = max(0, len(data) // 2 - 8_192)
+        sample = data[:16_384] + data[middle:middle + 16_384] + data[-16_384:]
+    printable = sum(value in {9, 10, 13} or 32 <= value < 127 for value in sample)
+    return printable >= max(4, int(len(sample) * ratio))
 
 
 def _pcap_flag_values(data: bytes) -> set[str]:
-    allowed = tuple(prefix.decode("ascii", "ignore").casefold() for prefix in _PCAP_FLAG_PREFIXES)
-    values = {
-        value for value in (match.group(0).decode("latin-1", "ignore") for match in _PCAP_FLAG_RE.finditer(data))
-        if value.casefold().startswith(allowed)
-    }
-    if b"{" in data and b"}" in data:
+    # Every accepted CTF token is brace-delimited. Most packet-field lanes are
+    # high-entropy binary data, so avoid running two regex passes over them.
+    if b"{" not in data or b"}" not in data:
+        return set()
+    prefix_names = tuple(prefix[:-1].lower() for prefix in _PCAP_FLAG_PREFIXES)
+
+    def scan(buffer: bytes) -> set[str]:
+        found: set[str] = set()
+        cursor = 0
+        while True:
+            brace = buffer.find(b"{", cursor)
+            if brace < 0:
+                break
+            cursor = brace + 1
+            prefix = next((name for name in prefix_names if buffer[max(0, brace - len(name)):brace].lower() == name), None)
+            if prefix is None:
+                continue
+            start = brace - len(prefix)
+            if start > 0 and (chr(buffer[start - 1]).isalnum() or buffer[start - 1] == 95):
+                continue
+            end = buffer.find(b"}", brace + 3, min(len(buffer), brace + 242))
+            if end < 0:
+                continue
+            token = buffer[start:end + 1]
+            if b"\r" not in token and b"\n" not in token and token.count(b"{") == 1:
+                found.add(token.decode("latin-1", "ignore"))
+        return found
+
+    values = scan(data)
+    # Only normalize streams that look like human-readable or NUL-interleaved
+    # text. Random binary contains whitespace frequently and made an unbounded
+    # normalization pass both expensive and noisy.
+    sample = data if len(data) <= 65_536 else data[:32_768] + data[-32_768:]
+    non_null = sample.replace(b"\x00", b"")
+    null_interleaved = (
+        len(non_null) >= 4
+        and len(non_null) < len(sample) * 0.8
+        and _pcap_printable(non_null, 0.8)
+    )
+    if (_pcap_printable(sample, 0.7) or null_interleaved) and any(separator in data for separator in (b"\x00", b"\x09", b"\x0a", b"\x0d", b" ")):
         compact = re.sub(rb"[\x00\x09\x0a\x0d ]+", b"", data)
-        values.update(
-            value for value in (match.group(0).decode("latin-1", "ignore") for match in _PCAP_FLAG_RE.finditer(compact))
-            if value.casefold().startswith(allowed)
-        )
+        values.update(scan(compact))
     return values
 
 
@@ -506,12 +817,30 @@ def _pcap_dns_message(payload: bytes, *, tcp: bool = False) -> dict[str, Any] | 
         payload = payload[2:2 + declared]
     if len(payload) < 12:
         return None
-    question_count, answer_count, authority_count, additional_count = struct.unpack_from("!HHHH", payload, 4)
+    transaction_id, flags, question_count, answer_count, authority_count, additional_count = struct.unpack_from("!HHHHHH", payload, 0)
     if sum((question_count, answer_count, authority_count, additional_count)) > 4096:
         return None
     cursor = 12
     questions: list[str] = []
+    question_details: list[dict[str, Any]] = []
     answers: list[dict[str, Any]] = []
+
+    def result_value() -> dict[str, Any]:
+        return {
+            "transaction_id": transaction_id,
+            "flags": flags,
+            "response": bool(flags & 0x8000),
+            "opcode": (flags >> 11) & 0x0F,
+            "authoritative": bool(flags & 0x0400),
+            "truncated": bool(flags & 0x0200),
+            "recursion_desired": bool(flags & 0x0100),
+            "recursion_available": bool(flags & 0x0080),
+            "response_code": flags & 0x000F,
+            "questions": questions,
+            "question_details": question_details,
+            "answers": answers,
+        }
+
     for _ in range(question_count):
         parsed = _pcap_dns_name(payload, cursor)
         if parsed is None:
@@ -521,20 +850,22 @@ def _pcap_dns_message(payload: bytes, *, tcp: bool = False) -> dict[str, Any] | 
             return None
         query_type, query_class = struct.unpack_from("!HH", payload, cursor)
         cursor += 4
-        questions.append(".".join(labels))
-        answers.append({"section": "question", "name": ".".join(labels), "type": query_type, "class": query_class})
+        name = ".".join(labels)
+        questions.append(name)
+        question_details.append({"name": name, "type": query_type, "class": query_class})
+        answers.append({"section": "question", "name": name, "type": query_type, "class": query_class})
     for section, count in (("answer", answer_count), ("authority", authority_count), ("additional", additional_count)):
         for _ in range(count):
             parsed = _pcap_dns_name(payload, cursor)
             if parsed is None:
-                return {"questions": questions, "answers": answers}
+                return result_value()
             labels, cursor = parsed
             if cursor + 10 > len(payload):
-                return {"questions": questions, "answers": answers}
+                return result_value()
             record_type, record_class, ttl, data_length = struct.unpack_from("!HHIH", payload, cursor)
             cursor += 10
             if cursor + data_length > len(payload):
-                return {"questions": questions, "answers": answers}
+                return result_value()
             rdata_offset = cursor
             rdata = payload[cursor:cursor + data_length]
             cursor += data_length
@@ -566,7 +897,7 @@ def _pcap_dns_message(payload: bytes, *, tcp: bool = False) -> dict[str, Any] | 
             elif record_type == 28 and len(rdata) == 16:
                 record["text"] = str(ipaddress.IPv6Address(rdata))
             answers.append(record)
-    return {"questions": questions, "answers": answers}
+    return result_value()
 
 
 def _pcap_decode_variants(value: bytes) -> list[tuple[str, bytes]]:
@@ -772,6 +1103,732 @@ def _pcap_tftp_objects(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return objects
 
 
+def _pcap_mqtt_messages(payload: bytes) -> list[dict[str, Any]]:
+    """Parse bounded MQTT control packets and expose PUBLISH topic payloads."""
+
+    messages: list[dict[str, Any]] = []
+    cursor = 0
+    names = {
+        1: "CONNECT", 2: "CONNACK", 3: "PUBLISH", 4: "PUBACK", 5: "PUBREC",
+        6: "PUBREL", 7: "PUBCOMP", 8: "SUBSCRIBE", 9: "SUBACK",
+        10: "UNSUBSCRIBE", 11: "UNSUBACK", 12: "PINGREQ", 13: "PINGRESP", 14: "DISCONNECT",
+    }
+    for _ in range(4096):
+        if cursor + 2 > len(payload):
+            break
+        first = payload[cursor]
+        packet_type = first >> 4
+        if packet_type not in names:
+            break
+        length = 0
+        multiplier = 1
+        length_cursor = cursor + 1
+        for _length_byte in range(4):
+            if length_cursor >= len(payload):
+                return messages
+            encoded = payload[length_cursor]
+            length_cursor += 1
+            length += (encoded & 0x7F) * multiplier
+            if not encoded & 0x80:
+                break
+            multiplier *= 128
+        else:
+            break
+        end = length_cursor + length
+        if length > 16 * 1024 * 1024 or end > len(payload):
+            break
+        body = payload[length_cursor:end]
+        item: dict[str, Any] = {"type": packet_type, "name": names[packet_type], "flags": first & 0x0F, "length": length}
+        if packet_type == 3 and len(body) >= 2:
+            topic_length = int.from_bytes(body[:2], "big")
+            if 2 + topic_length <= len(body):
+                position = 2 + topic_length
+                qos = (first >> 1) & 0x03
+                if qos and position + 2 <= len(body):
+                    item["packet_id"] = int.from_bytes(body[position:position + 2], "big")
+                    position += 2
+                item.update({
+                    "topic": body[2:2 + topic_length].decode("utf-8", "replace"),
+                    "qos": qos, "retain": bool(first & 1), "payload": body[position:],
+                })
+        messages.append(item)
+        cursor = end
+    return messages
+
+
+def _pcap_websocket_frames(payload: bytes) -> list[dict[str, Any]]:
+    """Decode RFC 6455 data frames, including client masking and fragments."""
+
+    cursor = 0
+    header_end = payload.find(b"\r\n\r\n")
+    if header_end >= 0 and b"upgrade: websocket" in payload[:header_end].lower():
+        cursor = header_end + 4
+    frames: list[dict[str, Any]] = []
+    fragmented = bytearray()
+    fragmented_opcode: int | None = None
+    for _ in range(4096):
+        if cursor + 2 > len(payload):
+            break
+        first, second = payload[cursor], payload[cursor + 1]
+        opcode = first & 0x0F
+        if first & 0x70 or opcode not in {0, 1, 2, 8, 9, 10}:
+            break
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        cursor += 2
+        if length == 126:
+            if cursor + 2 > len(payload):
+                break
+            length = int.from_bytes(payload[cursor:cursor + 2], "big")
+            cursor += 2
+        elif length == 127:
+            if cursor + 8 > len(payload):
+                break
+            length = int.from_bytes(payload[cursor:cursor + 8], "big")
+            cursor += 8
+        if length > 16 * 1024 * 1024:
+            break
+        mask = b""
+        if masked:
+            if cursor + 4 > len(payload):
+                break
+            mask = payload[cursor:cursor + 4]
+            cursor += 4
+        if cursor + length > len(payload):
+            break
+        value = payload[cursor:cursor + length]
+        cursor += length
+        if masked:
+            value = bytes(byte ^ mask[index % 4] for index, byte in enumerate(value))
+        final = bool(first & 0x80)
+        if opcode in {1, 2} and not final:
+            fragmented_opcode = opcode
+            fragmented = bytearray(value)
+            continue
+        if opcode == 0 and fragmented_opcode is not None:
+            fragmented.extend(value)
+            if not final:
+                continue
+            opcode, value = fragmented_opcode, bytes(fragmented)
+            fragmented_opcode, fragmented = None, bytearray()
+        frames.append({
+            "opcode": opcode, "name": {1: "text", 2: "binary", 8: "close", 9: "ping", 10: "pong"}.get(opcode, "continuation"),
+            "final": final, "masked": masked, "payload": value,
+        })
+    return frames
+
+
+def _pcap_modbus_payloads(payload: bytes) -> list[dict[str, Any]]:
+    """Extract register/data bytes from bounded Modbus/TCP ADUs."""
+
+    messages: list[dict[str, Any]] = []
+    cursor = 0
+    for _ in range(4096):
+        if cursor + 8 > len(payload):
+            break
+        transaction = int.from_bytes(payload[cursor:cursor + 2], "big")
+        protocol = int.from_bytes(payload[cursor + 2:cursor + 4], "big")
+        length = int.from_bytes(payload[cursor + 4:cursor + 6], "big")
+        if protocol != 0 or length < 2 or length > 260 or cursor + 6 + length > len(payload):
+            break
+        unit = payload[cursor + 6]
+        pdu = payload[cursor + 7:cursor + 6 + length]
+        function = pdu[0]
+        data = b""
+        if function in {1, 2, 3, 4} and len(pdu) >= 2 and pdu[1] <= len(pdu) - 2:
+            data = pdu[2:2 + pdu[1]]
+        elif function in {15, 16, 23} and len(pdu) >= 6 and pdu[5] <= len(pdu) - 6:
+            data = pdu[6:6 + pdu[5]]
+        elif function in {5, 6} and len(pdu) >= 5:
+            data = pdu[3:5]
+        messages.append({
+            "transaction_id": transaction, "unit_id": unit, "function": function,
+            "exception": bool(function & 0x80), "data": data, "pdu": pdu,
+        })
+        cursor += 6 + length
+    return messages
+
+
+def _pcap_rtp_packet(payload: bytes) -> dict[str, Any] | None:
+    if len(payload) < 12 or payload[0] >> 6 != 2:
+        return None
+    csrc_count = payload[0] & 0x0F
+    cursor = 12 + csrc_count * 4
+    if cursor > len(payload):
+        return None
+    if payload[0] & 0x10:
+        if cursor + 4 > len(payload):
+            return None
+        extension_words = int.from_bytes(payload[cursor + 2:cursor + 4], "big")
+        cursor += 4 + extension_words * 4
+        if cursor > len(payload):
+            return None
+    end = len(payload)
+    if payload[0] & 0x20:
+        padding = payload[-1]
+        if not padding or padding > end - cursor:
+            return None
+        end -= padding
+    return {
+        "payload_type": payload[1] & 0x7F, "marker": bool(payload[1] & 0x80),
+        "sequence": int.from_bytes(payload[2:4], "big"),
+        "timestamp": int.from_bytes(payload[4:8], "big"),
+        "ssrc": int.from_bytes(payload[8:12], "big"), "payload": payload[cursor:end],
+    }
+
+
+def _pcap_g711_sample(value: int, *, alaw: bool) -> int:
+    if alaw:
+        value ^= 0x55
+        magnitude = (value & 0x0F) << 4
+        segment = (value & 0x70) >> 4
+        magnitude += 8 if segment == 0 else 0x108
+        if segment > 1:
+            magnitude <<= segment - 1
+        return magnitude if value & 0x80 else -magnitude
+    value = (~value) & 0xFF
+    magnitude = ((value & 0x0F) << 3) + 0x84
+    magnitude <<= (value & 0x70) >> 4
+    magnitude -= 0x84
+    return -magnitude if value & 0x80 else magnitude
+
+
+def _pcap_pcm_wav(samples: Iterable[int], sample_rate: int = 8000) -> bytes:
+    pcm = b"".join(struct.pack("<h", max(-32768, min(32767, int(sample)))) for sample in samples)
+    return (
+        b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt "
+        + struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16)
+        + b"data" + struct.pack("<I", len(pcm)) + pcm
+    )
+
+
+def _pcap_tcp_flag_names(value: Any) -> list[str]:
+    if not isinstance(value, int):
+        return []
+    return [name for bit, name in _PCAP_TCP_FLAG_ORDER if value & bit]
+
+
+def _pcap_timestamp_seconds(packet: dict[str, Any]) -> float | None:
+    timestamp_ns = packet.get("timestamp_ns")
+    if isinstance(timestamp_ns, int):
+        return timestamp_ns / 1_000_000_000
+    value = packet.get("timestamp_key")
+    if not isinstance(value, tuple) or len(value) < 2:
+        return None
+    resolution = packet.get("timestamp_resolution")
+    divisor = 1_000_000_000 if resolution == "nanoseconds" else 1_000_000
+    return int(value[0]) + int(value[1]) / divisor
+
+
+def _pcap_payload_previews(payload: bytes, limit: int = 96) -> tuple[str, str, bool]:
+    value = payload[:limit]
+    text_value = "".join(chr(byte) if byte in {9, 10, 13} or 32 <= byte < 127 else "." for byte in value)
+    return text_value, value.hex(), len(payload) > limit
+
+
+def _pcap_link_name(linktype: Any) -> str:
+    return {
+        0: "Null/Loopback", 1: "Ethernet", 9: "PPP", 50: "PPP HDLC",
+        101: "Raw IP", 108: "Loopback", 113: "Linux SLL", 228: "Raw IPv4",
+        189: "USB Linux", 195: "IEEE 802.15.4", 201: "Bluetooth HCI",
+        220: "USB Linux mmap", 227: "SocketCAN", 229: "Raw IPv6",
+        230: "IEEE 802.15.4 (no FCS)", 251: "Bluetooth LE", 276: "Linux SLL2",
+    }.get(linktype, f"LinkType {linktype}" if isinstance(linktype, int) else "Link Layer")
+
+
+def _pcap_packet_description(packet: dict[str, Any]) -> dict[str, Any]:
+    """Build a display-oriented protocol label and Info-column summary."""
+
+    payload = bytes(packet.get("payload") or b"")
+    protocol_number = packet.get("protocol")
+    transport = _PCAP_IP_PROTOCOL_NAMES.get(protocol_number, f"IP/{protocol_number}" if protocol_number is not None else "Data")
+    source_port = packet.get("source_port")
+    destination_port = packet.get("destination_port")
+    flags = _pcap_tcp_flag_names(packet.get("tcp_flags"))
+    result: dict[str, Any] = {"protocol": transport, "transport": transport, "flags": flags}
+
+    if packet.get("special_protocol") == "CAN":
+        can_id = int(packet.get("can_id") or 0)
+        width = 8 if packet.get("can_extended") else 3
+        qualifiers = [
+            name for enabled, name in (
+                (packet.get("can_extended"), "EFF"), (packet.get("can_rtr"), "RTR"),
+                (packet.get("can_error"), "ERR"), (packet.get("can_fd"), "FD"),
+            ) if enabled
+        ]
+        suffix = f" [{', '.join(qualifiers)}]" if qualifiers else ""
+        result.update({
+            "protocol": "CAN", "transport": "CAN",
+            "info": f"0x{can_id:0{width}X}{suffix} DLC={packet.get('can_dlc', len(payload))} Data={payload.hex(' ')}",
+        })
+        return result
+
+    dns = None
+    if protocol_number in {6, 17} and (source_port == 53 or destination_port == 53):
+        dns = _pcap_dns_message(payload, tcp=protocol_number == 6)
+    if dns:
+        result["protocol"] = "DNS"
+        result["dns"] = dns
+        question = (dns.get("question_details") or [{}])[0]
+        name = str(question.get("name") or "")
+        type_name = _PCAP_DNS_TYPE_NAMES.get(question.get("type"), str(question.get("type") or ""))
+        if dns.get("response"):
+            answer_text = [str(item.get("text")) for item in dns.get("answers", []) if item.get("section") != "question" and item.get("text")]
+            result["info"] = f"Standard query response 0x{dns['transaction_id']:04x} {type_name} {name}" + (f" {', '.join(answer_text[:3])}" if answer_text else "")
+        else:
+            result["info"] = f"Standard query 0x{dns['transaction_id']:04x} {type_name} {name}".rstrip()
+        return result
+
+    http = _pcap_http_message(payload)
+    if http:
+        result["protocol"] = "HTTP"
+        result["http"] = http
+        if http.get("response"):
+            result["info"] = f"{http.get('version') or 'HTTP'} {http.get('status_code') or http.get('target')} {http.get('reason') or ''}".rstrip()
+        else:
+            host = f" ({http['host']})" if http.get("host") else ""
+            result["info"] = f"{http.get('method')} {http.get('target')}{host}"
+        return result
+
+    tls = _pcap_tls_records(payload)
+    if tls:
+        result["protocol"] = "TLS"
+        result["tls"] = tls
+        handshakes = [handshake for record in tls for handshake in record.get("handshakes", [])]
+        names = [str(item.get("name")) for item in handshakes if item.get("name")]
+        server_names = [name for item in handshakes for name in item.get("server_names", [])]
+        result["info"] = ", ".join(names[:4]) or ", ".join(str(item.get("content_name")) for item in tls[:4])
+        if server_names:
+            result["info"] += f" SNI={server_names[0]}"
+        return result
+
+    if protocol_number == 17 and (source_port == 69 or destination_port == 69) and len(payload) >= 2:
+        opcode = int.from_bytes(payload[:2], "big")
+        names = {1: "Read Request", 2: "Write Request", 3: "Data", 4: "Acknowledgement", 5: "Error", 6: "Option Acknowledgement"}
+        result["protocol"] = "TFTP"
+        if opcode in {1, 2}:
+            filename = payload[2:].split(b"\x00", 1)[0].decode("utf-8", "replace")
+            result["info"] = f"{names[opcode]}, File: {filename}"
+        elif opcode in {3, 4} and len(payload) >= 4:
+            result["info"] = f"{names[opcode]}, Block: {int.from_bytes(payload[2:4], 'big')}"
+        else:
+            result["info"] = names.get(opcode, f"Opcode {opcode}")
+        return result
+
+    ports = {source_port, destination_port}
+    if protocol_number == 6 and 1883 in ports:
+        mqtt = _pcap_mqtt_messages(payload)
+        if mqtt:
+            publish = next((item for item in mqtt if item.get("name") == "PUBLISH"), mqtt[0])
+            result.update({
+                "protocol": "MQTT", "mqtt": mqtt,
+                "info": f"{publish.get('name')}" + (f" Topic={publish.get('topic')} Len={len(bytes(publish.get('payload') or b''))}" if publish.get("topic") else ""),
+            })
+            return result
+    if protocol_number == 6 and 502 in ports:
+        modbus = _pcap_modbus_payloads(payload)
+        if modbus:
+            item = modbus[0]
+            result.update({
+                "protocol": "MODBUS", "modbus": modbus,
+                "info": f"Transaction {item['transaction_id']} Unit {item['unit_id']} Function {item['function'] & 0x7F}" + (" Exception" if item["exception"] else ""),
+            })
+            return result
+    if protocol_number == 17:
+        rtp = _pcap_rtp_packet(payload)
+        if rtp and all(isinstance(port, int) and port >= 1024 for port in ports):
+            result.update({
+                "protocol": "RTP", "rtp": rtp,
+                "info": f"PT={rtp['payload_type']} SSRC=0x{rtp['ssrc']:08X} Seq={rtp['sequence']} Time={rtp['timestamp']} Len={len(rtp['payload'])}",
+            })
+            return result
+
+    service = None
+    if payload:
+        if protocol_number == 6:
+            if 22 in ports and payload.startswith(b"SSH-"):
+                service = "SSH"
+            elif ports & {20, 21}:
+                service = "FTP"
+            elif ports & {25, 465, 587}:
+                service = "SMTP"
+            elif 110 in ports:
+                service = "POP"
+            elif ports & {143, 993}:
+                service = "IMAP"
+            elif 445 in ports:
+                service = "SMB"
+            elif 443 in ports:
+                service = "TLS"
+        elif protocol_number == 17:
+            if ports & {67, 68}:
+                service = "DHCP"
+            elif 123 in ports:
+                service = "NTP"
+            elif ports & {161, 162}:
+                service = "SNMP"
+            elif 443 in ports:
+                service = "QUIC"
+    if service:
+        result["protocol"] = service
+
+    if protocol_number == 6:
+        flag_text = f" [{', '.join(flags)}]" if flags else ""
+        result["info"] = (
+            f"{source_port} → {destination_port}{flag_text} Seq={packet.get('sequence') or 0} "
+            f"Ack={packet.get('acknowledgement') or 0} Win={packet.get('tcp_window') or 0} Len={len(payload)}"
+        )
+    elif protocol_number == 17:
+        result["info"] = f"{source_port} → {destination_port} Len={len(payload)}"
+    elif protocol_number in {1, 58}:
+        type_name = {
+            (1, 8): "Echo (ping) request", (1, 0): "Echo (ping) reply",
+            (58, 128): "Echo request", (58, 129): "Echo reply",
+        }.get((protocol_number, packet.get("icmp_type")), f"Type {packet.get('icmp_type')}")
+        result["info"] = f"{type_name}, id=0x{int(packet.get('icmp_id') or 0):04x}, seq={packet.get('icmp_sequence') or 0}, ttl={packet.get('ttl')}"
+    else:
+        result["info"] = f"{transport} payload ({len(payload)} bytes)"
+    return result
+
+
+def _pcap_traffic_inspection(
+    records: list[dict[str, Any]], profile: str, tftp_objects: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Produce a bounded, JSON-only traffic model for the capture workspace UI."""
+
+    limits = {
+        "packet_rows": 1_000 if profile == "quick" else 5_000 if profile == "balanced" else 15_000,
+        "endpoints": 1_024 if profile == "quick" else 4_096 if profile == "balanced" else 16_384,
+        "conversations": 1_024 if profile == "quick" else 4_096 if profile == "balanced" else 16_384,
+        "summaries": 500 if profile == "quick" else 2_000 if profile == "balanced" else 8_000,
+        "events": 1_000 if profile == "quick" else 4_000 if profile == "balanced" else 12_000,
+        "stream_preview_bytes": 2_048 if profile == "quick" else 8_192 if profile == "balanced" else 32_768,
+    }
+    packet_rows: list[dict[str, Any]] = []
+    protocol_stats: defaultdict[tuple[str, ...], dict[str, int]] = defaultdict(lambda: {"packets": 0, "bytes": 0})
+    endpoint_stats: dict[str, dict[str, Any]] = {}
+    endpoint_overflow = False
+    conversations: dict[tuple[Any, ...], dict[str, Any]] = {}
+    conversation_overflow = False
+    protocol_indexes: Counter[str] = Counter()
+    packet_stream_ids: dict[int, str] = {}
+    dns_summaries: list[dict[str, Any]] = []
+    http_summaries: list[dict[str, Any]] = []
+    tls_summaries: list[dict[str, Any]] = []
+    object_summaries: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    summary_counts: Counter[str] = Counter()
+    first_timestamp = next((value for value in (_pcap_timestamp_seconds(packet) for packet in records) if value is not None), None)
+
+    def add_event(event_type: str, packet: dict[str, Any], title: str, **details: Any) -> None:
+        summary_counts["events"] += 1
+        if len(events) >= limits["events"]:
+            return
+        events.append({
+            "id": f"event-{summary_counts['events']}", "type": event_type,
+            "packet": packet.get("number"), "timestamp_epoch": _pcap_timestamp_seconds(packet),
+            "title": title, "details": details,
+        })
+
+    def endpoint(address: Any, *, sent: bool, frame_length: int, port: Any, protocols: list[str]) -> None:
+        nonlocal endpoint_overflow
+        if address is None:
+            return
+        key = str(address)
+        if key not in endpoint_stats:
+            if len(endpoint_stats) >= limits["endpoints"]:
+                endpoint_overflow = True
+                return
+            endpoint_stats[key] = {
+                "address": key, "sent_packets": 0, "sent_bytes": 0,
+                "received_packets": 0, "received_bytes": 0,
+                "ports": set(), "protocols": Counter(),
+            }
+        item = endpoint_stats[key]
+        direction = "sent" if sent else "received"
+        item[f"{direction}_packets"] += 1
+        item[f"{direction}_bytes"] += frame_length
+        if isinstance(port, int):
+            item["ports"].add(port)
+        item["protocols"].update(protocols)
+
+    def conversation_for(packet: dict[str, Any]) -> dict[str, Any] | None:
+        nonlocal conversation_overflow
+        source, destination = packet.get("source"), packet.get("destination")
+        if source is None or destination is None:
+            return None
+        protocol = str(packet.get("special_protocol") or _PCAP_IP_PROTOCOL_NAMES.get(packet.get("protocol"), f"IP/{packet.get('protocol')}"))
+        source_port = packet.get("source_port") if isinstance(packet.get("source_port"), int) else None
+        destination_port = packet.get("destination_port") if isinstance(packet.get("destination_port"), int) else None
+        source_key = (str(source), source_port if source_port is not None else -1)
+        destination_key = (str(destination), destination_port if destination_port is not None else -1)
+        left, right = sorted((source_key, destination_key))
+        key = (protocol, left, right)
+        if key not in conversations:
+            if len(conversations) >= limits["conversations"]:
+                conversation_overflow = True
+                return None
+            protocol_indexes[protocol.lower()] += 1
+            conversations[key] = {
+                "id": f"{protocol.lower()}-{protocol_indexes[protocol.lower()] - 1}", "protocol": protocol,
+                "endpoint_a": {"address": left[0], "port": None if left[1] == -1 else left[1]},
+                "endpoint_b": {"address": right[0], "port": None if right[1] == -1 else right[1]},
+                "packets": 0, "bytes": 0, "payload_bytes": 0,
+                "a_to_b": {"packets": 0, "bytes": 0, "payload_bytes": 0},
+                "b_to_a": {"packets": 0, "bytes": 0, "payload_bytes": 0},
+                "first_packet": packet.get("number"), "last_packet": packet.get("number"),
+                "start_time": _pcap_timestamp_seconds(packet), "end_time": _pcap_timestamp_seconds(packet),
+                "_a_packets": [], "_b_packets": [], "_flags": set(), "_applications": Counter(),
+                "_packet_numbers": [],
+            }
+        item = conversations[key]
+        frame_length = int(packet.get("frame_length", 0))
+        payload_length = len(bytes(packet.get("payload") or b""))
+        a_to_b = source_key == left
+        direction = "a_to_b" if a_to_b else "b_to_a"
+        item["packets"] += 1
+        item["bytes"] += frame_length
+        item["payload_bytes"] += payload_length
+        item[direction]["packets"] += 1
+        item[direction]["bytes"] += frame_length
+        item[direction]["payload_bytes"] += payload_length
+        item["last_packet"] = packet.get("number")
+        timestamp = _pcap_timestamp_seconds(packet)
+        if timestamp is not None:
+            item["start_time"] = timestamp if item["start_time"] is None else min(item["start_time"], timestamp)
+            item["end_time"] = timestamp if item["end_time"] is None else max(item["end_time"], timestamp)
+        item["_flags"].update(_pcap_tcp_flag_names(packet.get("tcp_flags")))
+        item["_packet_numbers"].append(packet.get("number"))
+        item["_a_packets" if a_to_b else "_b_packets"].append(packet)
+        packet_stream_ids[id(packet)] = str(item["id"])
+        return item
+
+    def dns_summary(packet: dict[str, Any], parsed: dict[str, Any], stream_id: str | None, *, reassembled: bool = False) -> None:
+        summary_counts["dns"] += 1
+        if len(dns_summaries) >= limits["summaries"]:
+            return
+        questions = [
+            {"name": item.get("name", ""), "type": item.get("type"), "type_name": _PCAP_DNS_TYPE_NAMES.get(item.get("type"), str(item.get("type"))), "class": item.get("class")}
+            for item in parsed.get("question_details", [])[:32]
+        ]
+        answers = [
+            {"section": item.get("section"), "name": item.get("name"), "type": item.get("type"), "type_name": _PCAP_DNS_TYPE_NAMES.get(item.get("type"), str(item.get("type"))), "ttl": item.get("ttl"), "text": item.get("text", "")}
+            for item in parsed.get("answers", []) if item.get("section") != "question"
+        ][:64]
+        dns_summaries.append({
+            "packet": packet.get("number"), "stream_id": stream_id, "timestamp_epoch": _pcap_timestamp_seconds(packet),
+            "source": packet.get("source"), "destination": packet.get("destination"),
+            "transaction_id": parsed.get("transaction_id"), "response": bool(parsed.get("response")),
+            "response_code": parsed.get("response_code"), "questions": questions, "answers": answers,
+            "reassembled": reassembled,
+        })
+
+    def http_summary(packet: dict[str, Any], parsed: dict[str, Any], stream_id: str | None, *, reassembled: bool = False) -> None:
+        summary_counts["http"] += 1
+        if len(http_summaries) >= limits["summaries"]:
+            return
+        headers = {str(key)[:128]: str(value)[:512] for key, value in list(parsed.get("headers", {}).items())[:64]}
+        body = bytes(parsed.get("body") or b"")
+        item = {
+            "packet": packet.get("number"), "stream_id": stream_id, "timestamp_epoch": _pcap_timestamp_seconds(packet),
+            "source": packet.get("source"), "source_port": packet.get("source_port"),
+            "destination": packet.get("destination"), "destination_port": packet.get("destination_port"),
+            "first_line": str(parsed.get("first_line", ""))[:1_024], "request": not bool(parsed.get("response")),
+            "method": None if parsed.get("response") else parsed.get("method"), "target": None if parsed.get("response") else parsed.get("target"),
+            "status_code": parsed.get("status_code"), "reason": parsed.get("reason", ""), "host": parsed.get("host", ""),
+            "content_type": parsed.get("content_type", ""), "body_bytes": len(body), "headers": headers,
+            "reassembled": reassembled,
+        }
+        http_summaries.append(item)
+        if body and len(object_summaries) < limits["summaries"]:
+            filename = str(parsed.get("filename") or "")
+            object_summaries.append({
+                "source": "HTTP", "packet": packet.get("number"), "stream_id": stream_id,
+                "name": filename or f"http-body-{packet.get('number') or 0}", "content_type": parsed.get("content_type", ""),
+                "size": len(body), "detected_type": sniff_kind(body, filename), "reassembled": reassembled,
+            })
+
+    def tls_summary(packet: dict[str, Any], parsed: list[dict[str, Any]], stream_id: str | None, *, reassembled: bool = False) -> None:
+        for record in parsed:
+            summary_counts["tls"] += 1
+            if len(tls_summaries) >= limits["summaries"]:
+                return
+            handshakes = record.get("handshakes", [])[:32]
+            tls_summaries.append({
+                "packet": packet.get("number"), "stream_id": stream_id, "timestamp_epoch": _pcap_timestamp_seconds(packet),
+                "source": packet.get("source"), "destination": packet.get("destination"),
+                "content_type": record.get("content_type"), "content_name": record.get("content_name"),
+                "version": record.get("version"), "length": record.get("length"), "handshakes": handshakes,
+                "reassembled": reassembled,
+            })
+
+    for packet in records:
+        frame_length = int(packet.get("frame_length", 0))
+        payload = bytes(packet.get("payload") or b"")
+        description = _pcap_packet_description(packet)
+        conversation = conversation_for(packet)
+        stream_id = str(conversation["id"]) if conversation else None
+        if conversation:
+            conversation["_applications"][description["protocol"]] += 1
+        source, destination = packet.get("source"), packet.get("destination")
+        endpoint(source, sent=True, frame_length=frame_length, port=packet.get("source_port"), protocols=[description["transport"], description["protocol"]])
+        endpoint(destination, sent=False, frame_length=frame_length, port=packet.get("destination_port"), protocols=[description["transport"], description["protocol"]])
+
+        layers = ["Frame", _pcap_link_name(packet.get("linktype"))]
+        if packet.get("network"):
+            layers.append("IPv6" if packet.get("ip_version") == 6 else "IPv4")
+            layers.append(description["transport"])
+            if description["protocol"] != description["transport"]:
+                layers.append(description["protocol"])
+        else:
+            layers.append(str(packet.get("special_protocol") or "Data"))
+        for depth in range(1, len(layers) + 1):
+            stats = protocol_stats[tuple(layers[:depth])]
+            stats["packets"] += 1
+            stats["bytes"] += frame_length
+
+        timestamp = _pcap_timestamp_seconds(packet)
+        if len(packet_rows) < limits["packet_rows"]:
+            preview, hex_preview, preview_truncated = _pcap_payload_previews(payload)
+            packet_rows.append({
+                "number": packet.get("number"), "timestamp_epoch": timestamp,
+                "relative_time": timestamp - first_timestamp if timestamp is not None and first_timestamp is not None else None,
+                "source": source, "source_port": packet.get("source_port"),
+                "destination": destination, "destination_port": packet.get("destination_port"),
+                "protocol": description["protocol"], "transport": description["transport"], "layers": layers,
+                "length": frame_length, "payload_length": len(payload), "info": description.get("info", ""),
+                "flags": description["flags"], "stream_id": stream_id, "interface_id": packet.get("interface_id"),
+                "payload_preview": preview, "payload_hex_preview": hex_preview, "payload_preview_truncated": preview_truncated,
+            })
+
+        if description.get("dns"):
+            dns_summary(packet, description["dns"], stream_id)
+            add_event("dns-response" if description["dns"].get("response") else "dns-query", packet, description.get("info", "DNS"), stream_id=stream_id)
+        if description.get("http"):
+            http_summary(packet, description["http"], stream_id)
+            add_event("http-response" if description["http"].get("response") else "http-request", packet, description.get("info", "HTTP"), stream_id=stream_id)
+        if description.get("tls"):
+            tls_summary(packet, description["tls"], stream_id)
+            if any(record.get("handshakes") for record in description["tls"]):
+                add_event("tls-handshake", packet, description.get("info", "TLS handshake"), stream_id=stream_id)
+        if description["protocol"] == "TFTP":
+            add_event("tftp", packet, description.get("info", "TFTP"), stream_id=stream_id)
+        if description.get("mqtt"):
+            add_event("mqtt", packet, description.get("info", "MQTT"), stream_id=stream_id)
+        if description.get("modbus"):
+            add_event("modbus", packet, description.get("info", "Modbus/TCP"), stream_id=stream_id)
+        if description.get("rtp"):
+            add_event("rtp", packet, description.get("info", "RTP"), stream_id=stream_id)
+        if description["protocol"] == "CAN":
+            add_event("can", packet, description.get("info", "CAN frame"), can_id=packet.get("can_id"))
+        if packet.get("protocol") in {1, 58}:
+            add_event("icmp", packet, description.get("info", "ICMP"), stream_id=stream_id)
+        for flag in description["flags"]:
+            if flag in {"SYN", "FIN", "RST"}:
+                add_event(f"tcp-{flag.lower()}", packet, description.get("info", f"TCP {flag}"), stream_id=stream_id)
+
+    stream_summaries: dict[str, list[dict[str, Any]]] = {"tcp": [], "udp": []}
+    conversation_rows: list[dict[str, Any]] = []
+    seen_reassembled: set[tuple[Any, ...]] = set()
+    for item in sorted(conversations.values(), key=lambda value: (int(value.get("first_packet") or 0), str(value["id"]))):
+        start_time, end_time = item.get("start_time"), item.get("end_time")
+        row = {
+            "id": item["id"], "protocol": item["protocol"], "endpoint_a": item["endpoint_a"], "endpoint_b": item["endpoint_b"],
+            "packets": item["packets"], "bytes": item["bytes"], "payload_bytes": item["payload_bytes"],
+            "a_to_b": item["a_to_b"], "b_to_a": item["b_to_a"], "first_packet": item["first_packet"], "last_packet": item["last_packet"],
+            "start_time": start_time, "end_time": end_time,
+            "duration": max(0.0, end_time - start_time) if isinstance(start_time, (int, float)) and isinstance(end_time, (int, float)) else None,
+            "flags": _pcap_tcp_flag_names(sum(bit for bit, name in _PCAP_TCP_FLAG_ORDER if name in item["_flags"])),
+            "applications": dict(item["_applications"].most_common()), "packet_numbers": item["_packet_numbers"][:128],
+            "packet_numbers_truncated": len(item["_packet_numbers"]) > 128,
+        }
+        conversation_rows.append(row)
+        if item["protocol"] not in {"TCP", "UDP"}:
+            continue
+        direction_rows: list[dict[str, Any]] = []
+        for direction_name, packets in (("a_to_b", item["_a_packets"]), ("b_to_a", item["_b_packets"])):
+            ordered = sorted(packets, key=lambda packet: int(packet.get("number", 0)))
+            spans: list[bytes]
+            overlaps = gaps = 0
+            if item["protocol"] == "TCP":
+                spans, overlaps, gaps = _pcap_reassemble_tcp([
+                    (packet.get("sequence"), int(packet.get("number", 0)), bytes(packet.get("payload") or b""))
+                    for packet in ordered
+                ])
+            else:
+                spans = [b"".join(bytes(packet.get("payload") or b"") for packet in ordered)]
+            assembled = b"".join(spans)
+            preview_limit = int(limits["stream_preview_bytes"])
+            preview, hex_preview, truncated = _pcap_payload_previews(assembled, preview_limit)
+            direction_rows.append({
+                "direction": direction_name, "packets": len(ordered), "payload_bytes": len(assembled),
+                "span_count": len(spans), "overlap_events": overlaps, "gap_spans": gaps,
+                "preview": preview, "hex_preview": hex_preview, "preview_truncated": truncated,
+            })
+            if not ordered:
+                continue
+            representative = ordered[0]
+            for span in spans:
+                parsed_http = _pcap_http_message(span)
+                key = (item["id"], direction_name, parsed_http.get("first_line") if parsed_http else None)
+                if parsed_http and key not in seen_reassembled:
+                    seen_reassembled.add(key)
+                    http_summary(representative, parsed_http, str(item["id"]), reassembled=True)
+                parsed_tls = _pcap_tls_records(span)
+                if parsed_tls and (item["id"], direction_name, "tls") not in seen_reassembled:
+                    seen_reassembled.add((item["id"], direction_name, "tls"))
+                    tls_summary(representative, parsed_tls, str(item["id"]), reassembled=True)
+                if 53 in {item["endpoint_a"].get("port"), item["endpoint_b"].get("port")}:
+                    parsed_dns = _pcap_dns_message(span, tcp=item["protocol"] == "TCP")
+                    if parsed_dns and (item["id"], direction_name, "dns") not in seen_reassembled:
+                        seen_reassembled.add((item["id"], direction_name, "dns"))
+                        dns_summary(representative, parsed_dns, str(item["id"]), reassembled=True)
+        stream_summaries[item["protocol"].lower()].append({**row, "directions": direction_rows})
+
+    for object_info in tftp_objects[:limits["summaries"]]:
+        value = bytes(object_info.get("data") or b"")
+        filename = str(object_info.get("filename") or "tftp-object")
+        object_summaries.append({
+            "source": "TFTP", "packet": object_info.get("packet"), "stream_id": None,
+            "name": filename, "content_type": "", "size": len(value), "detected_type": sniff_kind(value, filename),
+            "complete": bool(object_info.get("complete")), "block_count": object_info.get("block_count"),
+        })
+
+    total_packets = len(records)
+    total_bytes = sum(int(packet.get("frame_length", 0)) for packet in records)
+    hierarchy = []
+    for path, stats in sorted(protocol_stats.items(), key=lambda item: (len(item[0]), item[0])):
+        hierarchy.append({
+            "path": "/".join(path), "parent": "/".join(path[:-1]) or None,
+            "protocol": path[-1], "depth": len(path) - 1, "packets": stats["packets"], "bytes": stats["bytes"],
+            "packet_percent": round(stats["packets"] * 100 / total_packets, 4) if total_packets else 0.0,
+            "byte_percent": round(stats["bytes"] * 100 / total_bytes, 4) if total_bytes else 0.0,
+        })
+    endpoints = []
+    for item in sorted(endpoint_stats.values(), key=lambda value: (-(value["sent_packets"] + value["received_packets"]), value["address"])):
+        endpoints.append({
+            "address": item["address"], "packets": item["sent_packets"] + item["received_packets"],
+            "bytes": item["sent_bytes"] + item["received_bytes"], "sent_packets": item["sent_packets"],
+            "sent_bytes": item["sent_bytes"], "received_packets": item["received_packets"], "received_bytes": item["received_bytes"],
+            "ports": sorted(item["ports"])[:256], "ports_truncated": len(item["ports"]) > 256,
+            "protocols": dict(item["protocols"].most_common()),
+        })
+    return {
+        "schema_version": 1, "packet_rows": packet_rows,
+        "packet_rows_truncated": total_packets > len(packet_rows), "protocol_hierarchy": hierarchy,
+        "endpoints": endpoints, "endpoints_truncated": endpoint_overflow,
+        "conversations": conversation_rows, "conversations_truncated": conversation_overflow,
+        "streams": stream_summaries, "dns": dns_summaries, "http": http_summaries, "tls": tls_summaries,
+        "objects": object_summaries[:limits["summaries"]], "events": events,
+        "truncated": {
+            "dns": summary_counts["dns"] > len(dns_summaries), "http": summary_counts["http"] > len(http_summaries),
+            "tls": summary_counts["tls"] > len(tls_summaries), "objects": len(object_summaries) > limits["summaries"],
+            "events": summary_counts["events"] > len(events),
+        },
+        "limits": limits,
+    }
+
+
 def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any]], profile: str) -> dict[str, Any]:
     """Shared packet-content analysis used by classic PCAP and PCAPNG."""
 
@@ -803,9 +1860,6 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
         nonlocal decoded_recoveries
         if not value or len(value) > 64 * 1024 * 1024:
             return False
-        flags = _pcap_flag_values(value)
-        direct_flag_hits.update(flags)
-        kind = sniff_kind(value, source)
         strong_signature = any(
             value.startswith(signature)
             for signature in (
@@ -814,6 +1868,11 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
                 b"fLaC", b"OggS", b"MThd", b"SQLite format 3\x00", b"Salted__",
             )
         )
+        flags = _pcap_flag_values(value)
+        direct_flag_hits.update(flags)
+        # sniff_kind performs several format probes. A candidate without a
+        # known prefix cannot be promoted as a file here, so skip those probes.
+        kind = sniff_kind(value, source) if strong_signature else "binary"
         meaningful_file = len(value) >= 16 and strong_signature and (kind not in {"binary", "text"} or value.startswith(b"Salted__"))
         if not flags and not meaningful_file and not force_artifact:
             return False
@@ -823,7 +1882,7 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
         signature_key = (kind, value[:16])
         if meaningful_file and not flags and signature_key in promoted_file_signatures and not force_artifact:
             return False
-        if _pcap_printable(value) or flags:
+        if flags:
             add_text(value.decode("latin-1", "ignore"), source, offset, 11 if flags else 7, [transform] if transform else None)
         if value not in recovered_seen and (flags or meaningful_file or force_artifact):
             recovered_seen.add(value)
@@ -832,7 +1891,7 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
                 promoted_file_signatures.add(signature_key)
             result["extracted"].append({
                 "label": safe_label(f"pcap_{source}_recovered"), "data": value,
-                "kind": "text" if flags or _pcap_printable(value) else kind,
+                "kind": "text" if flags else kind,
                 "producer": "pcap-network-forensics", "transformation": transform or "packet stream reconstruction",
                 "reason": "A flag-shaped value or recognized file signature validated the bounded recovery.",
             })
@@ -841,7 +1900,14 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
 
     def try_variants(value: bytes, source: str, offset: int | None, *, include_direct: bool = False) -> int:
         found = 0
-        variants = _pcap_decode_variants(value)
+        # Text encodings are overwhelmingly printable. Avoid the regex-heavy
+        # Base64/Base32/hex pipeline for ordinary binary header streams while
+        # retaining direct/magic-prefix recovery for them.
+        decode_eligible = (
+            len(value) <= 8 * 1024 * 1024
+            and (_pcap_printable(value, 0.72) or (b"{" in value and b"}" in value))
+        )
+        variants = _pcap_decode_variants(value) if decode_eligible else [("direct", value)]
         variants.extend(_pcap_magic_byte_variants(value))
         for index, (transform, decoded) in enumerate(variants):
             if index == 0 and not include_direct:
@@ -912,10 +1978,14 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
     tcp_reassemblies = 0
     tcp_overlap_bytes = 0
     tcp_gap_spans = 0
+    tcp_spans_by_flow: dict[tuple[Any, ...], list[bytes]] = {}
     for flow, fragments in tcp_flows.items():
         if len(fragments) < 2:
+            payload = bytes(fragments[0][2]) if fragments and fragments[0][2] else b""
+            tcp_spans_by_flow[flow] = [payload] if payload else []
             continue
         spans, overlaps, gaps = _pcap_reassemble_tcp(fragments)
+        tcp_spans_by_flow[flow] = spans
         tcp_overlap_bytes += overlaps
         tcp_gap_spans += gaps
         for span_index, assembled in enumerate(spans):
@@ -930,6 +2000,156 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
             if message:
                 message.update({"packet": fragments[0][1], "source": flow[0], "destination": flow[2], "source_port": flow[1], "destination_port": flow[3], "reassembled": True})
                 http_messages.append(message)
+
+    # Application formats that routinely appear in PCAP CTFs. They are parsed
+    # from contiguous TCP spans rather than trusting packet boundaries.
+    mqtt_publishes = 0
+    websocket_messages = 0
+    modbus_messages = 0
+    mqtt_topics: set[str] = set()
+    modbus_payloads: list[bytes] = []
+    cleartext_credentials: list[dict[str, Any]] = []
+    credential_seen: set[tuple[str, str, str]] = set()
+    for flow, fragments in tcp_flows.items():
+        ports = {flow[1], flow[3]}
+        if not ports & {21, 23, 25, 80, 110, 143, 502, 1883}:
+            continue
+        spans = tcp_spans_by_flow.get(flow, [])
+        for span in spans:
+            if not span:
+                continue
+            if 1883 in ports:
+                for message in _pcap_mqtt_messages(span):
+                    if message.get("name") != "PUBLISH":
+                        continue
+                    body = bytes(message.get("payload") or b"")
+                    topic = str(message.get("topic") or "")
+                    mqtt_publishes += 1
+                    if topic:
+                        mqtt_topics.add(topic)
+                        add_text(topic, "pcap-mqtt-topic", None, 7)
+                    if body:
+                        direct_flag_hits.update(_pcap_flag_values(body))
+                        if _pcap_printable(body):
+                            add_text(body.decode("latin-1", "ignore"), "pcap-mqtt-publish", None, 9, [f"MQTT PUBLISH topic {topic or '(unnamed)'}"])
+                        try_variants(body, "mqtt-publish", None, include_direct=True)
+            if 502 in ports:
+                for message in _pcap_modbus_payloads(span):
+                    modbus_messages += 1
+                    body = bytes(message.get("data") or b"")
+                    if body:
+                        modbus_payloads.append(body)
+                        direct_flag_hits.update(_pcap_flag_values(body))
+                        try_variants(body, "modbus-register-data", None, include_direct=True)
+            if b"upgrade: websocket" in span.lower() or (80 in ports and span[:1] in {b"\x81", b"\x82"}):
+                for frame in _pcap_websocket_frames(span):
+                    if frame.get("name") not in {"text", "binary"}:
+                        continue
+                    body = bytes(frame.get("payload") or b"")
+                    if not body:
+                        continue
+                    websocket_messages += 1
+                    direct_flag_hits.update(_pcap_flag_values(body))
+                    if _pcap_printable(body):
+                        add_text(body.decode("latin-1", "ignore"), "pcap-websocket-message", None, 9, ["RFC 6455 frame reassembly"])
+                    try_variants(body, "websocket-frame", None, include_direct=True)
+            # FTP, SMTP, POP3, IMAP, and Telnet are often deliberately clear
+            # text. Preserve candidate credentials as findings instead of
+            # attempting password cracking or network interaction.
+            if ports & {21, 23, 25, 110, 143} and _pcap_printable(span, 0.85):
+                for match in re.finditer(rb"(?im)^(USER|PASS|LOGIN|AUTH(?:\s+PLAIN)?)\s+([^\r\n]{1,256})", span):
+                    command = match.group(1).decode("ascii", "ignore").upper()
+                    value = match.group(2).decode("utf-8", "replace").strip()
+                    key = (str(flow[0]), command, value)
+                    if key not in credential_seen and len(cleartext_credentials) < 256:
+                        credential_seen.add(key)
+                        cleartext_credentials.append({"protocol_ports": sorted(int(port) for port in ports if isinstance(port, int)), "source": str(flow[0]), "destination": str(flow[2]), "command": command, "value": value})
+    if modbus_payloads:
+        try_variants(b"".join(modbus_payloads), "modbus-register-concatenation", None, include_direct=True)
+
+    # SocketCAN captures have a dedicated data-link type rather than IP. CTFs
+    # frequently encode text per arbitration ID, column, or ISO-TP message.
+    can_frames = [packet for packet in records if packet.get("special_protocol") == "CAN"]
+    can_groups: defaultdict[int, list[dict[str, Any]]] = defaultdict(list)
+    for packet in can_frames:
+        if isinstance(packet.get("can_id"), int):
+            can_groups[int(packet["can_id"])].append(packet)
+    can_messages: list[dict[str, Any]] = []
+    can_recoveries = 0
+    for can_id, packets in can_groups.items():
+        ordered = sorted(packets, key=_pcap_timestamp_key)
+        payloads = [bytes(packet.get("payload") or b"") for packet in ordered if packet.get("payload") and not packet.get("can_rtr")]
+        if not payloads:
+            continue
+        combined = b"".join(payloads)
+        can_recoveries += try_variants(combined, f"can-id-{can_id:03x}-concatenated", None, include_direct=True)
+        for column in range(min(64, max(map(len, payloads)))):
+            lane = bytes(value[column] for value in payloads if column < len(value))
+            if len(lane) >= 4 and len(set(lane)) > 1:
+                can_recoveries += try_variants(lane, f"can-id-{can_id:03x}-byte-{column}", None, include_direct=True)
+        pending = bytearray()
+        expected = 0
+        target_length = 0
+        for packet in ordered:
+            data_value = bytes(packet.get("payload") or b"")
+            if not data_value:
+                continue
+            frame_type = data_value[0] >> 4
+            if frame_type == 0:
+                length = data_value[0] & 0x0F
+                message = data_value[1:1 + length]
+                if message:
+                    can_messages.append({"can_id": can_id, "packet": packet.get("number"), "kind": "ISO-TP single", "length": len(message), "data_hex": message.hex()})
+                    can_recoveries += try_variants(message, f"can-id-{can_id:03x}-isotp", None, include_direct=True)
+            elif frame_type == 1 and len(data_value) >= 2:
+                target_length = ((data_value[0] & 0x0F) << 8) | data_value[1]
+                pending = bytearray(data_value[2:])
+                expected = 1
+            elif frame_type == 2 and pending and (data_value[0] & 0x0F) == expected % 16:
+                pending.extend(data_value[1:])
+                expected += 1
+                if target_length and len(pending) >= target_length:
+                    message = bytes(pending[:target_length])
+                    can_messages.append({"can_id": can_id, "packet": packet.get("number"), "kind": "ISO-TP multi", "length": len(message), "data_hex": message.hex()})
+                    can_recoveries += try_variants(message, f"can-id-{can_id:03x}-isotp", None, include_direct=True)
+                    pending = bytearray()
+                    target_length = 0
+
+    # RTP telephone-event payloads carry DTMF digits directly. For PCMU/PCMA
+    # streams, emit a standard WAV child artifact so normal audio analysis can
+    # continue with codecs/tone decoders without invoking a player.
+    rtp_groups: defaultdict[tuple[Any, ...], list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
+    for flow, packets in udp_flows.items():
+        for packet in packets:
+            parsed = _pcap_rtp_packet(bytes(packet.get("payload") or b""))
+            if not parsed:
+                continue
+            rtp_groups[(flow[0], flow[1], flow[2], flow[3], parsed["ssrc"], parsed["payload_type"])].append((packet, parsed))
+    rtp_dtmf: list[dict[str, Any]] = []
+    rtp_audio_exports = 0
+    dtmf_seen: set[tuple[Any, ...]] = set()
+    symbols = "0123456789*#ABCD"
+    for flow, entries in rtp_groups.items():
+        ordered = sorted(entries, key=lambda item: (int(item[1]["sequence"]), _pcap_timestamp_key(item[0])))
+        payload_type = int(flow[-1])
+        if payload_type == 101:
+            for packet, parsed in ordered:
+                body = bytes(parsed["payload"])
+                if len(body) < 4 or body[0] >= len(symbols):
+                    continue
+                key = (*flow[:-1], parsed["timestamp"], body[0])
+                if key in dtmf_seen:
+                    continue
+                dtmf_seen.add(key)
+                rtp_dtmf.append({"packet": packet.get("number"), "stream": f"0x{parsed['ssrc']:08X}", "symbol": symbols[body[0]], "duration": int.from_bytes(body[2:4], "big"), "end": bool(body[1] & 0x80)})
+        if payload_type not in {0, 8} or len(ordered) < 2:
+            continue
+        encoded = b"".join(bytes(parsed["payload"]) for _packet, parsed in ordered)
+        if not encoded or len(encoded) > 16 * 1024 * 1024:
+            continue
+        wav = _pcap_pcm_wav((_pcap_g711_sample(byte, alaw=payload_type == 8) for byte in encoded))
+        register_candidate(wav, f"rtp-{'pcma' if payload_type == 8 else 'pcmu'}-stream", None, "RTP G.711 payload reassembly to PCM WAV", force_artifact=True)
+        rtp_audio_exports += 1
 
     # UDP conversations are the usual shark-on-wire-1 pattern. Analyze both
     # directional streams and a canonical bidirectional stream so decoys do
@@ -955,6 +2175,22 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
         direct_flag_hits.update(_pcap_flag_values(blob))
         if _pcap_printable(blob) or re.fullmatch(rb"[A-Za-z0-9+/_=\s.-]{16,}", blob):
             try_variants(blob, "udp-conversation", None)
+
+    # BitTorrent DHT requests identify a torrent by its 20-byte info-hash. A
+    # published picoCTF challenge requires surfacing this value rather than
+    # reconstructing the peer-to-peer transfer itself.
+    dht_info_hashes: list[dict[str, Any]] = []
+    dht_seen: set[tuple[str, str]] = set()
+    for flow, packets in udp_flows.items():
+        for packet in packets:
+            payload = bytes(packet.get("payload") or b"")
+            for match in re.finditer(rb"(?:9:info_hash|9:info-hash)20:(.{20})", payload, re.DOTALL):
+                value = match.group(1).hex()
+                key = (str(packet.get("source")), value)
+                if key in dht_seen or len(dht_info_hashes) >= 1024:
+                    continue
+                dht_seen.add(key)
+                dht_info_hashes.append({"packet": packet.get("number"), "source": packet.get("source"), "destination": packet.get("destination"), "info_hash": value})
 
     # Ph4nt0m-style channels decode every packet independently, then sort the
     # decoded bytes by the packet timestamp before joining them. A capture-order
@@ -1092,9 +2328,192 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
             add_text(value.decode("latin-1", "ignore"), "pcap-tftp-object", None, 10, ["TFTP DATA block reassembly"])
         direct_flag_hits.update(_pcap_flag_values(value))
 
-    # Header/field covert channels. Only promote byte streams when a flag or a
-    # recognized file signature validates the candidate, preventing constant
-    # TTL/IP-ID values from becoming noisy artifacts.
+    # ICMP payload channels range from a direct ping-data concatenation to one
+    # changing byte surrounded by the operating system's repeated padding.
+    # Try the full stream, per-byte columns, and data after removing the common
+    # prefix/suffix. Candidates still require a flag or file signature before
+    # they become artifacts, which keeps ordinary ping traffic quiet.
+    icmp_stream_recoveries = 0
+    icmp_groups: defaultdict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    for packet in records:
+        if packet.get("protocol") in {1, 58} and packet.get("payload"):
+            icmp_groups[(
+                packet.get("source"), packet.get("destination"), packet.get("protocol"),
+                packet.get("icmp_type"), packet.get("icmp_code"), packet.get("icmp_id"),
+            )].append(packet)
+    column_limit = 128 if profile == "quick" else 512 if profile == "balanced" else 2_048
+    for group, packets in icmp_groups.items():
+        ordered = sorted(packets, key=_pcap_timestamp_key)
+        payloads = [bytes(packet.get("payload") or b"") for packet in ordered]
+        if len(payloads) < 2:
+            continue
+        candidates: list[tuple[str, bytes]] = [("capture-order payload concatenation", b"".join(payloads))]
+        minimum_length = min(map(len, payloads))
+        prefix_length = 0
+        while prefix_length < minimum_length and len({value[prefix_length] for value in payloads}) == 1:
+            prefix_length += 1
+        suffix_length = 0
+        while suffix_length < minimum_length - prefix_length and len({value[-1 - suffix_length] for value in payloads}) == 1:
+            suffix_length += 1
+        stripped = b"".join(
+            value[prefix_length:len(value) - suffix_length if suffix_length else len(value)] for value in payloads
+        )
+        if stripped:
+            candidates.append((f"remove common prefix ({prefix_length}) and suffix ({suffix_length})", stripped))
+        candidates.extend((
+            ("first payload byte from each packet", bytes(value[0] for value in payloads if value)),
+            ("last payload byte from each packet", bytes(value[-1] for value in payloads if value)),
+        ))
+        for column in range(min(max(map(len, payloads)), column_limit)):
+            lane = bytes(value[column] for value in payloads if column < len(value))
+            if len(lane) >= 4:
+                candidates.append((f"payload byte column {column}", lane))
+        candidate_seen: set[bytes] = set()
+        for transform, candidate in candidates:
+            if len(candidate) < 4 or len(candidate) > 16 * 1024 * 1024 or candidate in candidate_seen:
+                continue
+            candidate_seen.add(candidate)
+            found = try_variants(candidate, "pcap-icmp-stream", None, include_direct=True)
+            if found:
+                icmp_stream_recoveries += found
+
+    # Bit-valued header and timing channels occur frequently in harder CTFs:
+    # individual TCP flags or an IP flag select bits/chunks, while two timing
+    # clusters encode binary zero/one. Try both bit orders, inversion, and
+    # reverse packet order, but only retain a result when normal flag/file
+    # validation succeeds.
+    bit_channel_recoveries = 0
+
+    def packed_bits(bits: list[int], *, least_significant_first: bool = False) -> bytes:
+        output = bytearray()
+        for start in range(0, len(bits) - 7, 8):
+            value = 0
+            chunk = bits[start:start + 8]
+            if least_significant_first:
+                for index, bit in enumerate(chunk):
+                    value |= (bit & 1) << index
+            else:
+                for bit in chunk:
+                    value = (value << 1) | (bit & 1)
+            output.append(value)
+        return bytes(output)
+
+    def try_bits(bits: list[int], source: str, label: str) -> int:
+        if len(bits) < 16 or len(bits) > 8 * 1024 * 1024:
+            return 0
+        found = 0
+        seen: set[bytes] = set()
+        for order_label, ordered_bits in (("capture order", bits), ("reverse order", list(reversed(bits)))):
+            for inversion_label, candidate_bits in (("normal", ordered_bits), ("inverted", [1 - bit for bit in ordered_bits])):
+                for packing_label, least_first in (("MSB-first", False), ("LSB-first", True)):
+                    candidate = packed_bits(candidate_bits, least_significant_first=least_first)
+                    if len(candidate) < 2 or candidate in seen:
+                        continue
+                    seen.add(candidate)
+                    found += int(register_candidate(
+                        candidate, source, None,
+                        f"{label}: {order_label}, {inversion_label}, {packing_label} bit packing",
+                    ))
+        return found
+
+    timing_groups: defaultdict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    for packet in records:
+        if packet.get("source") is not None and packet.get("destination") is not None:
+            timing_groups[(packet.get("source"), packet.get("destination"), packet.get("protocol"))].append(packet)
+    for group, packets in timing_groups.items():
+        ordered = sorted(packets, key=_pcap_timestamp_key)
+        if len(ordered) < 17:
+            continue
+        scalar_lanes: dict[str, list[int]] = {
+            "tcp-flags": [int(item["tcp_flags"]) & 0x1FF for item in ordered if isinstance(item.get("tcp_flags"), int)],
+            "ip-flags": [int(item["ip_flags"]) & 0x07 for item in ordered if isinstance(item.get("ip_flags"), int)],
+        }
+        for lane_name, values in scalar_lanes.items():
+            if len(values) < 16 or len(set(values)) < 2:
+                continue
+            width = 9 if lane_name == "tcp-flags" else 3
+            for bit_index in range(width):
+                bit_channel_recoveries += try_bits(
+                    [(value >> bit_index) & 1 for value in values],
+                    f"pcap-bit-{lane_name}", f"{lane_name} bit {bit_index}",
+                )
+
+        timestamps = [_pcap_timestamp_seconds(item) for item in ordered]
+        deltas = [
+            float(current) - float(previous)
+            for previous, current in zip(timestamps, timestamps[1:])
+            if previous is not None and current is not None and float(current) >= float(previous)
+        ]
+        if len(deltas) < 16:
+            continue
+        unique = sorted(set(round(value, 9) for value in deltas))
+        if len(unique) >= 2:
+            gaps = [(unique[index + 1] - unique[index], index) for index in range(len(unique) - 1)]
+            largest_gap, split_index = max(gaps)
+            if largest_gap > 0:
+                threshold = (unique[split_index] + unique[split_index + 1]) / 2
+                bit_channel_recoveries += try_bits(
+                    [int(value > threshold) for value in deltas],
+                    "pcap-timing-channel", f"timestamp delta threshold {threshold:.9f}s",
+                )
+        # Some challenges write ASCII directly as millisecond/centisecond
+        # deltas rather than binary clusters.
+        for scale, scale_name in ((1_000, "milliseconds"), (100, "centiseconds"), (1_000_000, "microseconds")):
+            values = [int(round(value * scale)) for value in deltas]
+            if values and all(0 <= value <= 255 for value in values):
+                bit_channel_recoveries += try_variants(
+                    bytes(values), f"pcap-timing-{scale_name}", None, include_direct=True,
+                )
+
+    # Payload bytes selected by unusual flag values can form a file even when
+    # no individual packet contains a recognizable signature (for example the
+    # IPv4 reserved/"evil" bit selecting JPEG chunks).
+    selector_recoveries = 0
+    selectors: tuple[tuple[str, Any], ...] = (
+        ("ipv4-reserved-bit", lambda item: bool(item.get("ip_reserved"))),
+        ("ipv4-dont-fragment-bit", lambda item: bool(item.get("dont_fragment"))),
+        ("tcp-psh-bit", lambda item: isinstance(item.get("tcp_flags"), int) and bool(int(item["tcp_flags"]) & 0x008)),
+        ("tcp-rst-bit", lambda item: isinstance(item.get("tcp_flags"), int) and bool(int(item["tcp_flags"]) & 0x004)),
+        ("tcp-urg-bit", lambda item: isinstance(item.get("tcp_flags"), int) and bool(int(item["tcp_flags"]) & 0x020)),
+    )
+    for selector_name, selector in selectors:
+        selected = [
+            bytes(item.get("payload") or b"") for item in sorted(records, key=_pcap_timestamp_key)
+            if selector(item) and item.get("payload")
+        ]
+        if len(selected) < 2:
+            continue
+        candidate = b"".join(selected)
+        selector_recoveries += try_variants(candidate, f"pcap-selector-{selector_name}", None, include_direct=True)
+
+    # Address-octet channels deliberately vary one endpoint, so they cannot be
+    # grouped by the full source/destination pair used for ordinary flows.
+    address_channel_recoveries = 0
+    address_groups: defaultdict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    for packet in records:
+        if packet.get("source") is None or packet.get("destination") is None:
+            continue
+        address_groups[("source", packet.get("destination"), packet.get("protocol"), packet.get("destination_port"))].append(packet)
+        address_groups[("destination", packet.get("source"), packet.get("protocol"), packet.get("source_port"))].append(packet)
+    for group, packets in address_groups.items():
+        if len(packets) < 4:
+            continue
+        field = str(group[0])
+        lane = bytearray()
+        for packet in sorted(packets, key=_pcap_timestamp_key):
+            try:
+                lane.append(ipaddress.ip_address(str(packet.get(field))).packed[-1])
+            except ValueError:
+                continue
+        if len(lane) >= 4 and len(set(lane)) > 1:
+            address_channel_recoveries += try_variants(
+                bytes(lane), f"pcap-{field}-address-channel", None, include_direct=True,
+            )
+
+    # Header/field covert channels. Every raw lane is tested through the same
+    # bounded decoder and known-prefix byte-key inference as payload streams.
+    # This covers arbitrary constant offsets (for example source octet minus
+    # ten), not only a fixed list of hand-picked subtraction values.
     field_recoveries = 0
     field_groups: defaultdict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
     for packet in records:
@@ -1104,20 +2523,52 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
         ordered = sorted(packets, key=_pcap_timestamp_key)
         if len(ordered) < 4:
             continue
-        fields = {
+        def field_lane(field: str, byte_index: int, width: int) -> bytes:
+            shift = (width - 1 - byte_index) * 8
+            return bytes((int(item[field]) >> shift) & 0xFF for item in ordered if isinstance(item.get(field), int))
+
+        def address_octets(field: str) -> bytes:
+            values = bytearray()
+            for item in ordered:
+                try:
+                    values.append(ipaddress.ip_address(str(item.get(field))).packed[-1])
+                except ValueError:
+                    continue
+            return bytes(values)
+
+        fields: dict[str, bytes] = {
             "ttl": bytes(int(item["ttl"]) & 0xFF for item in ordered if isinstance(item.get("ttl"), int)),
+            "traffic-class": bytes(int(item["traffic_class"]) & 0xFF for item in ordered if isinstance(item.get("traffic_class"), int)),
+            "source-ip-last-octet": address_octets("source"),
+            "destination-ip-last-octet": address_octets("destination"),
             "ip-id-low": bytes(int(item["ip_id"]) & 0xFF for item in ordered if isinstance(item.get("ip_id"), int)),
             "icmp-id-low": bytes(int(item["icmp_id"]) & 0xFF for item in ordered if isinstance(item.get("icmp_id"), int)),
             "icmp-sequence-low": bytes(int(item["icmp_sequence"]) & 0xFF for item in ordered if isinstance(item.get("icmp_sequence"), int)),
             "tcp-ack-low": bytes(int(item["acknowledgement"]) & 0xFF for item in ordered if isinstance(item.get("acknowledgement"), int)),
+            "tcp-flags-low": bytes(int(item["tcp_flags"]) & 0xFF for item in ordered if isinstance(item.get("tcp_flags"), int)),
+            "icmp-type": bytes(int(item["icmp_type"]) & 0xFF for item in ordered if isinstance(item.get("icmp_type"), int)),
+            "icmp-code": bytes(int(item["icmp_code"]) & 0xFF for item in ordered if isinstance(item.get("icmp_code"), int)),
+            "payload-length-low": bytes(len(bytes(item.get("payload") or b"")) & 0xFF for item in ordered),
+            "frame-length-low": bytes(int(item.get("frame_length", 0)) & 0xFF for item in ordered),
         }
+        for field, width, label in (
+            ("ip_id", 2, "ip-id"), ("ip_checksum", 2, "ip-checksum"),
+            ("source_port", 2, "source-port"), ("destination_port", 2, "destination-port"),
+            ("sequence", 4, "tcp-sequence"), ("acknowledgement", 4, "tcp-ack"),
+            ("tcp_window", 2, "tcp-window"), ("tcp_urgent_pointer", 2, "tcp-urgent-pointer"),
+            ("transport_checksum", 2, "transport-checksum"), ("udp_length", 2, "udp-length"),
+            ("flow_label", 4, "ipv6-flow-label"),
+        ):
+            for byte_index in range(width):
+                fields[f"{label}-byte-{byte_index}"] = field_lane(field, byte_index, width)
         acknowledgements = [int(item["acknowledgement"]) for item in ordered if isinstance(item.get("acknowledgement"), int)]
         if len(acknowledgements) >= 2:
             fields["tcp-ack-delta"] = bytes((current - previous) & 0xFF for previous, current in zip(acknowledgements, acknowledgements[1:]))
         for name, value in fields.items():
-            if len(value) < 4:
+            if len(value) < 4 or len(set(value)) < 2:
                 continue
-            for delta in (0, 1, 42, 64, 65, 128, 255):
+            field_recoveries += try_variants(value, f"pcap-field-{name}", None, include_direct=True)
+            for delta in (1, 42, 64, 65, 128, 255):
                 candidate = bytes((item - delta) & 0xFF for item in value)
                 if register_candidate(candidate, f"pcap-field-{name}", None, f"{name} byte stream minus {delta}"):
                     field_recoveries += 1
@@ -1162,7 +2613,18 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
         "ip_fragment_reassemblies": len(rebuilt_fragments), "incomplete_ip_fragment_sets": incomplete_fragments,
         "udp_source_port_recoveries": len(port_recoveries), "dns_queries_or_records": len(dns_entries),
         "dns_recoveries": dns_recoveries, "tftp_objects": len(tftp_objects),
-        "field_stream_recoveries": field_recoveries, "decoded_stream_recoveries": decoded_recoveries,
+        "mqtt_publishes": mqtt_publishes, "mqtt_topics": sorted(mqtt_topics)[:1_024],
+        "websocket_messages": websocket_messages, "modbus_messages": modbus_messages,
+        "cleartext_credentials": cleartext_credentials, "bittorrent_dht_info_hashes": dht_info_hashes,
+        "can_frames": len(can_frames), "can_identifiers": sorted(f"0x{identifier:X}" for identifier in can_groups)[:4_096],
+        "can_isotp_messages": can_messages[:4_096], "can_recoveries": can_recoveries,
+        "rtp_streams": len(rtp_groups), "rtp_dtmf_events": rtp_dtmf[:4_096], "rtp_audio_exports": rtp_audio_exports,
+        "field_stream_recoveries": field_recoveries, "icmp_stream_recoveries": icmp_stream_recoveries,
+        "bit_or_timing_channel_recoveries": bit_channel_recoveries,
+        "flag_selected_payload_recoveries": selector_recoveries,
+        "address_channel_recoveries": address_channel_recoveries,
+        "decoded_stream_recoveries": decoded_recoveries,
+        "traffic_inspection": _pcap_traffic_inspection(records, profile, tftp_objects),
     })
     if unauthorized_cells:
         result["findings"].append(_finding("warning", "network-identity", "Unauthorized test-network broadcast detected", "A broadcast advertises an unauthorized cellular network. HTTP device identifiers can be correlated with its cell ID.", cell_ids=sorted(unauthorized_cells)))
@@ -1174,6 +2636,14 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
         result["findings"].append(_finding("info", "network-covert-channel", "UDP source-port covert channel recovered", "Printable characters encoded as UDP source-port offsets were recovered between stream markers.", flags=sorted(set(port_recoveries))))
     if tftp_objects:
         result["findings"].append(_finding("info", "network-object", "TFTP object reconstructed", "RRQ/WRQ and DATA blocks were reassembled into child artifacts for recursive analysis.", objects=[{key: value for key, value in item.items() if key != "data"} for item in tftp_objects]))
+    if cleartext_credentials:
+        result["findings"].append(_finding("warning", "network-credentials", "Cleartext authentication commands recovered", "FTP/Telnet/mail authentication commands were observed in a reassembled TCP stream.", count=len(cleartext_credentials)))
+    if dht_info_hashes:
+        result["findings"].append(_finding("info", "network-bittorrent", "BitTorrent DHT info-hash recovered", "A DHT bencoded info_hash was extracted; it can identify the requested torrent even when the file itself is not present.", info_hashes=[item["info_hash"] for item in dht_info_hashes[:32]]))
+    if can_frames:
+        result["findings"].append(_finding("info", "network-can", "SocketCAN frames decoded", "CAN arbitration IDs, payload lanes, and bounded ISO-TP messages were inspected for CTF text or embedded files.", frames=len(can_frames), identifiers=len(can_groups), isotp_messages=len(can_messages)))
+    if rtp_dtmf:
+        result["findings"].append(_finding("info", "network-voip", "RTP DTMF events decoded", "RFC 2833/4733 telephone-event payloads were converted into keypad symbols.", symbols="".join(str(item["symbol"]) for item in rtp_dtmf)))
     if dns_recoveries:
         result["findings"].append(_finding("info", "network-decoding", "DNS exfiltration candidate recovered", "DNS labels or TXT answers were deduplicated, ordered, and tested through bounded Base64/Base32/hex/decompression transforms."))
     return result
@@ -1217,13 +2687,8 @@ def parse_pcap(data: bytes, profile: str = "balanced") -> dict[str, Any]:
             break
         frame_offset = offset + 16
         frame = data[frame_offset:frame_offset + included]
-        packet = _pcap_packet_network(frame, linktype)
-        if packet is None:
-            payload_offset, frame_payload = _pcap_frame_payload(frame, linktype)
-            packet = {"source": None, "destination": None, "protocol": None, "source_port": None, "destination_port": None, "sequence": None, "payload": frame_payload, "payload_offset": payload_offset, "network": False}
-        else:
-            packet["network"] = True
-        packet.update({"number": packet_count + 1, "record_offset": record_offset, "frame_offset": frame_offset, "timestamp_key": (sec, subsec), "timestamp_resolution": timestamp_resolution, "frame_length": included})
+        packet = _pcap_capture_packet(frame, linktype)
+        packet.update({"number": packet_count + 1, "record_offset": record_offset, "frame_offset": frame_offset, "timestamp_key": (sec, subsec), "timestamp_resolution": timestamp_resolution, "linktype": linktype, "frame_length": included})
         records.append(packet)
         captured_bytes += included
         packet_count += 1
@@ -1351,12 +2816,7 @@ def parse_pcapng(data: bytes, profile: str = "balanced") -> dict[str, Any]:
             packet_end = min(body_end, packet_start + captured)
             interface = interfaces[interface_id] if interface_id < len(interfaces) else {"linktype": 1, "tsresol": 6, "tsoffset": 0}
             frame = data[packet_start:packet_end]
-            packet = _pcap_packet_network(frame, int(interface.get("linktype", 1)))
-            if packet is None:
-                payload_offset, frame_payload = _pcap_frame_payload(frame, int(interface.get("linktype", 1)))
-                packet = {"source": None, "destination": None, "protocol": None, "source_port": None, "destination_port": None, "sequence": None, "payload": frame_payload, "payload_offset": payload_offset, "network": False}
-            else:
-                packet["network"] = True
+            packet = _pcap_capture_packet(frame, int(interface.get("linktype", 1)))
             timestamp_value = timestamp_ns((ts_high << 32) | ts_low, interface)
             packet.update({"number": len(records) + 1, "record_offset": offset, "frame_offset": packet_start, "timestamp_ns": timestamp_value, "timestamp_key": (timestamp_value // 1_000_000_000, timestamp_value % 1_000_000_000), "interface_id": interface_id, "linktype": interface.get("linktype"), "frame_length": len(frame)})
             records.append(packet)
@@ -1368,12 +2828,7 @@ def parse_pcapng(data: bytes, profile: str = "balanced") -> dict[str, Any]:
                 packet_start = body_start + 4
                 frame = data[packet_start:min(body_end, packet_start + original)]
                 interface = interfaces[0]
-                packet = _pcap_packet_network(frame, int(interface.get("linktype", 1)))
-                if packet is None:
-                    payload_offset, frame_payload = _pcap_frame_payload(frame, int(interface.get("linktype", 1)))
-                    packet = {"source": None, "destination": None, "protocol": None, "source_port": None, "destination_port": None, "sequence": None, "payload": frame_payload, "payload_offset": payload_offset, "network": False}
-                else:
-                    packet["network"] = True
+                packet = _pcap_capture_packet(frame, int(interface.get("linktype", 1)))
                 packet.update({"number": len(records) + 1, "record_offset": offset, "frame_offset": packet_start, "timestamp_key": (len(records), 0), "interface_id": 0, "linktype": interface.get("linktype"), "frame_length": len(frame)})
                 records.append(packet)
         elif block_type == 2:  # Obsolete Packet Block
@@ -1384,12 +2839,7 @@ def parse_pcapng(data: bytes, profile: str = "balanced") -> dict[str, Any]:
                 packet_start = body_start + 20
                 frame = data[packet_start:min(body_end, packet_start + captured)]
                 interface = interfaces[interface_id] if interface_id < len(interfaces) else interfaces[0]
-                packet = _pcap_packet_network(frame, int(interface.get("linktype", 1)))
-                if packet is None:
-                    payload_offset, frame_payload = _pcap_frame_payload(frame, int(interface.get("linktype", 1)))
-                    packet = {"source": None, "destination": None, "protocol": None, "source_port": None, "destination_port": None, "sequence": None, "payload": frame_payload, "payload_offset": payload_offset, "network": False}
-                else:
-                    packet["network"] = True
+                packet = _pcap_capture_packet(frame, int(interface.get("linktype", 1)))
                 timestamp_value = timestamp_ns((ts_high << 32) | ts_low, interface)
                 packet.update({"number": len(records) + 1, "record_offset": offset, "frame_offset": packet_start, "timestamp_ns": timestamp_value, "timestamp_key": (timestamp_value // 1_000_000_000, timestamp_value % 1_000_000_000), "interface_id": interface_id, "linktype": interface.get("linktype"), "frame_length": len(frame)})
                 records.append(packet)

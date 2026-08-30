@@ -165,6 +165,64 @@ def test_tshark_field_adapters_avoid_shell_metacharacter_separator(monkeypatch, 
     assert all(not any("|" in argument for argument in argv) for argv in invocations)
 
 
+def test_tshark_usb_mouse_reports_render_an_svg_artifact() -> None:
+    output = "\n".join(f"1.5.1\t01{index % 4:02x}{(index * 3) % 8:02x}" for index in range(16))
+
+    drawings = ExternalToolRunner._decode_usb_mouse_svg(output)  # noqa: SLF001 - bounded decoder contract
+
+    assert drawings
+    assert drawings[0][0].endswith(".svg")
+    assert drawings[0][1].startswith(b"<svg")
+
+
+def test_tshark_traffic_workspace_adapters_use_fixed_bounded_arguments(monkeypatch, tmp_path: Path) -> None:
+    capture = tmp_path / "capture.pcapng"
+    capture.write_bytes(b"\x0a\x0d\x0d\x0a" + b"\x00" * 24)
+    invocations: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "app.analyzers.external.resolve_tool",
+        lambda executable, **_kwargs: ResolvedTool(
+            source="native", launcher=Path(sys.executable), executable=executable
+        ),
+    )
+    runner = ExternalToolRunner(timeout=1)
+
+    def fake_execute(argv, *, cwd, timeout=None, stdin_data=None):
+        invocations.append(list(argv))
+        return {
+            "status": "completed", "return_code": 0, "stdout": "", "stderr": "",
+            "output_truncated": False,
+        }
+
+    monkeypatch.setattr(runner, "_execute", fake_execute)
+    selected = {
+        "tshark_packet_details", "tshark_statistics", "tshark_expert",
+        "tshark_credentials", "tshark_rtp", "tshark_authentication", "tshark_ftp_objects",
+    }
+    runner.run_all(
+        capture,
+        kind="pcapng",
+        profile="deep",
+        password=None,
+        work_dir=tmp_path,
+        selected_tools=selected,
+    )
+
+    main_calls = [argv for argv in invocations if "-r" in argv]
+    assert len(main_calls) == len(selected)
+    packet_details = next(argv for argv in main_calls if "json" in argv)
+    assert packet_details[packet_details.index("-c") + 1] == "2000"
+    assert "--json-compact" in packet_details and "-x" in packet_details
+    statistics = next(argv for argv in main_calls if "io,phs" in argv)
+    assert "conv,tcp" in statistics and "endpoints,udp" in statistics
+    assert any("expert" in argv for argv in main_calls)
+    assert any("credentials" in argv for argv in main_calls)
+    assert any("rtp,streams" in argv for argv in main_calls)
+    assert any("ntlmssp kerberos ldap http smb smb2" in argv for argv in main_calls)
+    assert any("ftp-data," in argument for argv in main_calls for argument in argv)
+
+
 def test_zsteg_mode_uses_explicit_all_or_lsb_switch(monkeypatch, clean_png: Path, tmp_path: Path) -> None:
     monkeypatch.setattr(shutil, "which", lambda name: sys.executable if name == "zsteg" else None)
     runner = ExternalToolRunner(timeout=1)

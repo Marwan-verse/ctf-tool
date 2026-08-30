@@ -95,8 +95,18 @@ def test_extended_forensics_tools_are_allowlisted_to_fixed_packages() -> None:
     expected = {
         "capinfos": "wireshark-common",
         "tshark_usb_hid": "tshark",
+        "tshark_packet_details": "tshark",
+        "tshark_statistics": "tshark",
+        "tshark_expert": "tshark",
+        "tshark_credentials": "tshark",
+        "tshark_rtp": "tshark",
+        "tshark_authentication": "tshark",
+        "tshark_ftp_objects": "tshark",
         "tshark_tftp_objects": "tshark",
         "tshark_imf_objects": "tshark",
+        "tshark_dicom_objects": "tshark",
+        "tcpflow": "tcpflow",
+        "hcxpcapngtool": "hcxtools",
         "pcapfix": "pcapfix",
         "sqlite3": "sqlite3",
         "olevba": "oletools",
@@ -117,6 +127,7 @@ def test_extended_forensics_tools_are_allowlisted_to_fixed_packages() -> None:
     assert tool_installation.PYTHON_EVTX_VERSION == "0.8.1"
     assert "python-evtx==0.8.1" in tool_installation.PYTHON_EVTX_INSTALL_SCRIPT
     assert tool_installation.WINGET_PACKAGE_IDS["tshark"] == "WiresharkFoundation.Wireshark"
+    assert tool_installation.WINGET_PACKAGE_IDS["tshark_packet_details"] == "WiresharkFoundation.Wireshark"
 
 
 def test_shared_winget_audio_package_is_installed_once(monkeypatch: pytest.MonkeyPatch) -> None:

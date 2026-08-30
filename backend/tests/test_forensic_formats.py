@@ -17,21 +17,32 @@ from app.analyzers.formats import analyze_format
 from app.engine import AnalysisEngine
 
 
-def _raw_ipv4_packet(source: str, destination: str, protocol: int, payload: bytes, *, source_port: int = 1, destination_port: int = 1, sequence: int = 0) -> bytes:
+def _raw_ipv4_packet(
+    source: str,
+    destination: str,
+    protocol: int,
+    payload: bytes,
+    *,
+    source_port: int = 1,
+    destination_port: int = 1,
+    sequence: int = 0,
+    tcp_flags: int = 0x18,
+    ip_flags: int = 0,
+) -> bytes:
     """Build the small checksum-free raw IPv4 packets used by PCAP fixtures."""
 
     source_bytes = bytes(int(part) for part in source.split("."))
     destination_bytes = bytes(int(part) for part in destination.split("."))
     if protocol == 6:
-        transport = struct.pack("!HHIIHHHH", source_port, destination_port, sequence, 0, (5 << 12) | 0x18, 65535, 0, 0) + payload
+        transport = struct.pack("!HHIIHHHH", source_port, destination_port, sequence, 0, (5 << 12) | tcp_flags, 65535, 0, 0) + payload
     else:
         transport = struct.pack("!HHHH", source_port, destination_port, 8 + len(payload), 0) + payload
-    header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(transport), 1, 0, 64, protocol, 0, source_bytes, destination_bytes)
+    header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(transport), 1, (ip_flags & 0x07) << 13, 64, protocol, 0, source_bytes, destination_bytes)
     return header + transport
 
 
-def _raw_pcap(packets: list[bytes]) -> bytes:
-    global_header = b"\xd4\xc3\xb2\xa1" + struct.pack("<HHiIII", 2, 4, 0, 0, 65535, 228)
+def _raw_pcap(packets: list[bytes], *, linktype: int = 228) -> bytes:
+    global_header = b"\xd4\xc3\xb2\xa1" + struct.pack("<HHiIII", 2, 4, 0, 0, 65535, linktype)
     records = b"".join(struct.pack("<IIII", index, 0, len(packet), len(packet)) + packet for index, packet in enumerate(packets, 1))
     return global_header + records
 
@@ -167,6 +178,128 @@ def test_pcap_timestamp_sorted_base64_fragments_are_recovered() -> None:
     report = analyze_format("pcap", global_header + records)
 
     assert any("picoCTF{timestamp_fixture}" in finding["details"]["flags"] for finding in report["findings"] if finding["title"] == "Flag-like text recovered from network payload")
+
+
+def test_pcap_source_address_octet_channel_infers_constant_offset() -> None:
+    encoded = bytes((value + 10) & 0xFF for value in b"picoCTF{address_lane}")
+    packets = [
+        _raw_ipv4_packet(
+            f"10.0.0.{value}", "192.0.2.20", 17, b"x",
+            source_port=40000 + index, destination_port=8000,
+        )
+        for index, value in enumerate(encoded)
+    ]
+
+    report = analyze_format("pcap", _raw_pcap(packets), profile="deep")
+
+    assert report["properties"]["address_channel_recoveries"] >= 1
+    assert any("picoCTF{address_lane}" in finding["details"]["flags"] for finding in report["findings"] if finding["title"] == "Flag-like text recovered from network payload")
+
+
+def test_pcap_tcp_flag_bit_plane_is_packed_into_text() -> None:
+    bits = [int(bit) for value in b"picoCTF{tcp_flag_bits}" for bit in f"{value:08b}"]
+    packets = [
+        _raw_ipv4_packet(
+            "10.10.0.1", "10.10.0.2", 6, b"", source_port=4242,
+            destination_port=8080, sequence=index, tcp_flags=0x10 | (0x08 if bit else 0),
+        )
+        for index, bit in enumerate(bits)
+    ]
+
+    report = analyze_format("pcap", _raw_pcap(packets), profile="deep")
+
+    assert report["properties"]["bit_or_timing_channel_recoveries"] >= 1
+    assert any("picoCTF{tcp_flag_bits}" in finding["details"]["flags"] for finding in report["findings"] if finding["title"] == "Flag-like text recovered from network payload")
+
+
+def test_pcap_ipv4_reserved_bit_selects_payload_chunks() -> None:
+    chunks = [b"picoCTF{", b"evil_", b"bit_selector}"]
+    packets: list[bytes] = []
+    for index, chunk in enumerate(chunks):
+        packets.append(_raw_ipv4_packet("10.20.0.1", "10.20.0.2", 17, b"decoy", source_port=5000, destination_port=6000))
+        packets.append(_raw_ipv4_packet("10.20.0.1", "10.20.0.2", 17, chunk, source_port=5000, destination_port=6000, ip_flags=0b100))
+
+    report = analyze_format("pcap", _raw_pcap(packets), profile="deep")
+
+    assert report["properties"]["flag_selected_payload_recoveries"] >= 1
+    assert any("picoCTF{evil_bit_selector}" in finding["details"]["flags"] for finding in report["findings"] if finding["title"] == "Flag-like text recovered from network payload")
+
+
+def test_pcap_two_cluster_timing_channel_is_bit_packed() -> None:
+    bits = [int(bit) for value in b"picoCTF{timing_bits}" for bit in f"{value:08b}"]
+    packet = _raw_ipv4_packet("10.30.0.1", "10.30.0.2", 6, b"", source_port=7000, destination_port=7001)
+    global_header = b"\xd4\xc3\xb2\xa1" + struct.pack("<HHiIII", 2, 4, 0, 0, 65535, 228)
+    timestamps = [0]
+    for bit in bits:
+        timestamps.append(timestamps[-1] + (100_000 if bit else 10_000))
+    records = b"".join(
+        struct.pack("<IIII", microseconds // 1_000_000, microseconds % 1_000_000, len(packet), len(packet)) + packet
+        for microseconds in timestamps
+    )
+
+    report = analyze_format("pcap", global_header + records, profile="deep")
+
+    assert report["properties"]["bit_or_timing_channel_recoveries"] >= 1
+    assert any("picoCTF{timing_bits}" in finding["details"]["flags"] for finding in report["findings"] if finding["title"] == "Flag-like text recovered from network payload")
+
+
+def test_socketcan_and_isotp_payloads_are_reassembled() -> None:
+    def frame(identifier: int, data: bytes) -> bytes:
+        return struct.pack(">IB3x", identifier, len(data)) + data
+
+    capture = _raw_pcap([
+        frame(0x123, b"BH{CAN}"),
+        frame(0x456, b"\x10\x09BH{ISO"),
+        frame(0x456, b"\x21TP}"),
+    ], linktype=227)
+    result = analyze_format("pcap", capture, profile="balanced")
+
+    assert "BH{CAN}" in str(result)
+    assert "BH{ISOTP}" in str(result)
+    assert result["properties"]["can_frames"] == 3
+    assert result["properties"]["can_isotp_messages"]
+
+
+def test_mqtt_websocket_and_modbus_streams_are_decoded() -> None:
+    mqtt_body = b"\x00\x0bsecret/topicflag{mqtt}"
+    mqtt = b"\x30" + bytes([len(mqtt_body)]) + mqtt_body
+    key = b"\x01\x02\x03\x04"
+    plain = b"flag{websocket}"
+    masked = bytes(value ^ key[index % 4] for index, value in enumerate(plain))
+    websocket = b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n" + bytes([0x81, 0x80 | len(plain)]) + key + masked
+    modbus_data = b"CTF{modbus}"
+    modbus = b"\x00\x01\x00\x00" + struct.pack(">H", 3 + len(modbus_data)) + b"\x01\x03" + bytes([len(modbus_data)]) + modbus_data
+    capture = _raw_pcap([
+        _raw_ipv4_packet("10.0.0.1", "10.0.0.2", 6, mqtt, source_port=40000, destination_port=1883),
+        _raw_ipv4_packet("10.0.0.1", "10.0.0.2", 6, websocket, source_port=40001, destination_port=80),
+        _raw_ipv4_packet("10.0.0.1", "10.0.0.2", 6, modbus, source_port=40002, destination_port=502),
+    ])
+    result = analyze_format("pcap", capture, profile="balanced")
+
+    rendered = str(result)
+    assert "flag{mqtt}" in rendered
+    assert "flag{websocket}" in rendered
+    assert "CTF{modbus}" in rendered
+    assert result["properties"]["mqtt_publishes"] == 1
+    assert result["properties"]["websocket_messages"] == 1
+    assert result["properties"]["modbus_messages"] == 1
+
+
+def test_rtp_dtmf_and_bittorrent_dht_are_surfaced() -> None:
+    def rtp(sequence: int, timestamp: int, event: int) -> bytes:
+        return b"\x80\xe5" + struct.pack(">HII", sequence, timestamp, 0x12345678) + bytes([event, 0x80, 0, 160])
+
+    info_hash = bytes.fromhex("0123456789abcdef0123456789abcdef01234567")
+    dht = b"d1:ad2:id20:abcdefghijklmnopqrst9:info_hash20:" + info_hash + b"ee"
+    capture = _raw_pcap([
+        _raw_ipv4_packet("10.0.0.1", "10.0.0.2", 17, rtp(1, 99, 5), source_port=5004, destination_port=5005),
+        _raw_ipv4_packet("10.0.0.1", "10.0.0.2", 17, rtp(2, 100, 6), source_port=5004, destination_port=5005),
+        _raw_ipv4_packet("10.0.0.3", "10.0.0.4", 17, dht, source_port=6881, destination_port=6881),
+    ])
+    result = analyze_format("pcap", capture, profile="balanced")
+
+    assert "56" == "".join(item["symbol"] for item in result["properties"]["rtp_dtmf_events"])
+    assert result["properties"]["bittorrent_dht_info_hashes"][0]["info_hash"] == info_hash.hex()
 
 
 def test_lz4_uncompressed_frame_is_bounded() -> None:

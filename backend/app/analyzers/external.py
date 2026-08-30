@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
-from .common import cancel_requested, display_text, normalize_json, sniff_kind, utc_now
+from .common import cancel_requested, display_text, normalize_json, safe_label, sniff_kind, utc_now
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,11 +96,21 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("capinfos", "capinfos", "Wireshark capture metadata", "network-metadata", NETWORK_KINDS, frozenset({"quick", "balanced", "deep"}), "https://www.wireshark.org/docs/man-pages/capinfos.html"),
     ToolSpec("tshark", "tshark", "TShark packet and protocol summary", "network", NETWORK_KINDS, frozenset({"balanced", "deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
     ToolSpec("tshark_fields", "tshark", "TShark forensic field extraction", "network", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("tshark_packet_details", "tshark", "TShark Wireshark-grade packet dissection JSON", "network", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("tshark_statistics", "tshark", "TShark protocol/endpoints/conversations statistics", "network-metadata", NETWORK_KINDS, frozenset({"balanced", "deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("tshark_expert", "tshark", "TShark expert information and anomaly report", "network", NETWORK_KINDS, frozenset({"balanced", "deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("tshark_credentials", "tshark", "TShark cleartext credential recovery", "network-decoding", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("tshark_rtp", "tshark", "TShark RTP stream and loss statistics", "network-media", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("tshark_authentication", "tshark", "TShark NTLM/Kerberos authentication dissections", "network-auth", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
     ToolSpec("tshark_usb_hid", "tshark", "TShark USB HID keystroke recovery", "network-decoding", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
     ToolSpec("tshark_http_objects", "tshark", "TShark HTTP object extraction", "embedded-data", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("tshark_ftp_objects", "tshark", "TShark FTP-DATA object extraction", "embedded-data", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
     ToolSpec("tshark_smb_objects", "tshark", "TShark SMB object extraction", "embedded-data", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
     ToolSpec("tshark_tftp_objects", "tshark", "TShark TFTP object extraction", "embedded-data", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
     ToolSpec("tshark_imf_objects", "tshark", "TShark email object extraction", "embedded-data", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("tshark_dicom_objects", "tshark", "TShark DICOM object extraction", "embedded-data", NETWORK_KINDS, frozenset({"deep"}), "https://www.wireshark.org/docs/man-pages/tshark.html"),
+    ToolSpec("tcpflow", "tcpflow", "tcpflow bidirectional TCP stream extraction", "embedded-data", NETWORK_KINDS, frozenset({"deep"}), "https://github.com/simsong/tcpflow"),
+    ToolSpec("hcxpcapngtool", "hcxpcapngtool", "WPA/PMKID and EAPOL hash extraction", "network-auth", NETWORK_KINDS, frozenset({"deep"}), "https://github.com/ZerBea/hcxtools"),
     ToolSpec("pcapfix", "pcapfix", "pcapfix non-destructive capture repair", "repair", NETWORK_KINDS, frozenset({"balanced", "deep"}), "https://github.com/Rup0rt/pcapfix"),
     ToolSpec("sqlite3", "sqlite3", "SQLite read-only safe database dump", "database", frozenset({"sqlite"}), frozenset({"balanced", "deep"}), "https://www.sqlite.org/cli.html"),
     ToolSpec("oleid", "oleid", "Oletools document risk indicators", "document", OFFICE_KINDS, frozenset({"balanced", "deep"}), "https://github.com/decalage2/oletools"),
@@ -433,8 +443,9 @@ class ExternalToolRunner:
             if not allow_extraction and spec.tool_id in {
                 "foremost", "jpseek", "openstego", "outguess", "steghide", "stegseek",
                 "ffmpeg_spectrogram", "ffmpeg_pcm", "sox_spectrogram", "pdfimages", "pdfdetach",
-                "7z_extract", "tshark_http_objects", "tshark_smb_objects", "tshark_tftp_objects",
-                "tshark_imf_objects", "pcapfix", "oleobj", "rtfobj", "tsk_recover",
+                "7z_extract", "tshark_http_objects", "tshark_ftp_objects", "tshark_smb_objects", "tshark_tftp_objects",
+                "tshark_imf_objects", "tshark_dicom_objects", "tcpflow", "hcxpcapngtool",
+                "pcapfix", "oleobj", "rtfobj", "tsk_recover",
                 "readpst",
             }:
                 results.append(self._not_run(spec, "skipped", "External payload extraction is disabled in this job's settings."))
@@ -650,6 +661,38 @@ class ExternalToolRunner:
                     "-e", "data.data", "-e", "tcp.payload", "-e", "udp.payload",
                     "-e", "tcp.reassembled.data", "-e", "http.file_data",
                 ]
+            elif spec.tool_id == "tshark_packet_details":
+                # TShark uses Wireshark's dissectors. Keep this JSON export
+                # bounded while retaining the protocol tree and raw bytes for
+                # detailed CTF review in the traffic workspace.
+                argv = [
+                    executable, "-n", "-r", str(input_path), "-c", "2000",
+                    "-T", "json", "--json-compact", "--no-duplicate-keys", "-x",
+                    "-j", (
+                        "frame eth sll ip ipv6 tcp udp icmp icmpv6 arp dns dhcp http http2 "
+                        "tls ftp smtp imf irc smb smb2 tftp usb usbhid wlan eapol rtp sip "
+                        "mqtt modbus bt-dht kerberos ntlmssp websocket data"
+                    ),
+                ]
+            elif spec.tool_id == "tshark_statistics":
+                argv = [
+                    executable, "-n", "-q", "-r", str(input_path),
+                    "-z", "io,phs", "-z", "endpoints,ip", "-z", "endpoints,ipv6",
+                    "-z", "endpoints,tcp", "-z", "endpoints,udp", "-z", "conv,ip",
+                    "-z", "conv,ipv6", "-z", "conv,tcp", "-z", "conv,udp",
+                    "-z", "io,stat,1",
+                ]
+            elif spec.tool_id == "tshark_expert":
+                argv = [executable, "-n", "-q", "-r", str(input_path), "-z", "expert"]
+            elif spec.tool_id == "tshark_credentials":
+                argv = [executable, "-n", "-q", "-r", str(input_path), "-z", "credentials"]
+            elif spec.tool_id == "tshark_rtp":
+                argv = [executable, "-n", "-q", "-r", str(input_path), "-z", "rtp,streams"]
+            elif spec.tool_id == "tshark_authentication":
+                argv = [
+                    executable, "-n", "-r", str(input_path), "-c", "5000", "-T", "json",
+                    "--json-compact", "--no-duplicate-keys", "-j", "ntlmssp kerberos ldap http smb smb2",
+                ]
             elif spec.tool_id == "tshark_usb_hid":
                 argv = [
                     executable, "-n", "-r", str(input_path), "-c", "50000",
@@ -657,17 +700,27 @@ class ExternalToolRunner:
                     "-E", "separator=/t", "-e", "usb.src", "-e", "usb.capdata", "-e", "usbhid.data",
                 ]
             elif spec.tool_id in {
-                "tshark_http_objects", "tshark_smb_objects", "tshark_tftp_objects", "tshark_imf_objects",
+                "tshark_http_objects", "tshark_ftp_objects", "tshark_smb_objects", "tshark_tftp_objects",
+                "tshark_imf_objects", "tshark_dicom_objects",
             }:
                 protocol = {
                     "tshark_http_objects": "http",
+                    "tshark_ftp_objects": "ftp-data",
                     "tshark_smb_objects": "smb",
                     "tshark_tftp_objects": "tftp",
                     "tshark_imf_objects": "imf",
+                    "tshark_dicom_objects": "dicom",
                 }[spec.tool_id]
                 extracted_dir = temp_dir / f"tshark-{protocol}-objects"
                 extracted_dir.mkdir()
-                argv = [executable, "-n", "-r", str(input_path), "-q", "--export-objects", f"{protocol},{extracted_dir}"]
+                argv = [executable, "-2", "-n", "-r", str(input_path), "-q", "--export-objects", f"{protocol},{extracted_dir}"]
+            elif spec.tool_id == "tcpflow":
+                extracted_dir = temp_dir / "tcpflow-output"
+                extracted_dir.mkdir()
+                argv = [executable, "-r", str(input_path), "-o", str(extracted_dir)]
+            elif spec.tool_id == "hcxpcapngtool":
+                extracted_path = temp_dir / "capture.22000"
+                argv = [executable, "-o", str(extracted_path), str(input_path)]
             elif spec.tool_id == "pcapfix":
                 suffix = ".pcapng" if input_path.suffix.casefold() == ".pcapng" else ".pcap"
                 extracted_path = temp_dir / f"pcapfix_repaired{suffix}"
@@ -854,10 +907,14 @@ class ExternalToolRunner:
             duration_ms = int((time.monotonic() - start) * 1000)
             stdout = self._sanitize(execution["stdout"], input_path, temp_dir, password)
             stderr = self._sanitize(execution["stderr"], input_path, temp_dir, password)
+            mouse_drawings: list[tuple[str, bytes, int]] = []
             if spec.tool_id == "tshark_usb_hid" and stdout:
                 decoded_hid = self._decode_usb_hid(stdout)
                 if decoded_hid:
                     stdout = display_text(stdout + "\n\n[Decoded USB HID keystrokes]\n" + decoded_hid, self.output_limit)
+                mouse_drawings = self._decode_usb_mouse_svg(stdout)
+                if mouse_drawings:
+                    stdout = display_text(stdout + f"\n\n[USB mouse drawings] {len(mouse_drawings)} SVG artifact(s) recovered.", self.output_limit)
             elif spec.tool_id == "tshark_fields" and stdout:
                 decoded_payloads = self._decode_tshark_payloads(stdout)
                 if decoded_payloads:
@@ -910,6 +967,12 @@ class ExternalToolRunner:
                 ),
                 "extracted": [],
             }
+            for label, drawing, movement_count in mouse_drawings:
+                method["extracted"].append({
+                    "label": label, "data": drawing, "producer": "tshark_usb_hid",
+                    "transformation": f"Accumulate {movement_count} USB HID relative mouse reports into SVG paths",
+                    "offset": None, "kind": "svg",
+                })
             if spec.tool_id in {"exiftool", "ffprobe", "mediainfo"} and stdout:
                 try:
                     parsed = json.loads(stdout)
@@ -937,6 +1000,7 @@ class ExternalToolRunner:
                             "gifsicle_repair": ("gifsicle_repaired", "rewrite a GIF with Gifsicle's tolerant parser"),
                             "zipfix": ("zipfix_repaired", "repair a ZIP with Info-ZIP -F"),
                             "zipfix_deep": ("zipfix_deep_repaired", "scan and repair a ZIP with Info-ZIP -FF"),
+                            "hcxpcapngtool": ("wifi_handshake_hashcat_22000", "extract WPA PMKID/EAPOL material in hashcat mode 22000 format"),
                             "pcapfix": ("pcapfix_repaired", "repair a damaged PCAP/PCAPNG with pcapfix"),
                             "pdftotext": ("pdftotext_text", "extract PDF page text with Poppler"),
                             "jpseek": ("jpseek_payload", "extract a JPHide payload with JPSeek"),
@@ -1146,6 +1210,70 @@ class ExternalToolRunner:
             if valid_counts.get(source, 0) >= 3 and len(rendered) >= 3:
                 decoded.append(f"[{source or 'unknown device'}]\n{display_text(rendered, 64 * 1024)}")
         return "\n\n".join(decoded)
+
+    @staticmethod
+    def _decode_usb_mouse_svg(output: str) -> list[tuple[str, bytes, int]]:
+        """Render likely HID relative-mouse reports to isolated SVG artifacts."""
+
+        reports: dict[str, list[bytes]] = {}
+        for line in output.splitlines()[:50_000]:
+            fields = re.split(r"[|\t]", line)
+            source = fields[0].strip() if fields else "unknown"
+            raw = next((value for value in fields[1:] if value.strip()), "")
+            normalized = re.sub(r"[:\s]", "", raw)
+            if len(normalized) not in {6, 8, 10, 16} or not re.fullmatch(r"[0-9A-Fa-f]+", normalized):
+                continue
+            reports.setdefault(source, []).append(bytes.fromhex(normalized))
+
+        def signed(value: int) -> int:
+            return value - 256 if value >= 128 else value
+
+        artifacts: list[tuple[str, bytes, int]] = []
+        for source, values in sorted(reports.items()):
+            # Boot mice use buttons, X, Y; report-ID prefixed variants shift
+            # those fields right one byte. Select the layout with more bounded
+            # non-zero movement, avoiding keyboard reports which use a reserved
+            # zero byte and key codes instead of relative deltas.
+            choices: list[tuple[int, list[tuple[int, int, bool]]]] = []
+            for start in (0, 1):
+                movements: list[tuple[int, int, bool]] = []
+                for report in values:
+                    if len(report) < start + 3:
+                        continue
+                    dx, dy = signed(report[start + 1]), signed(report[start + 2])
+                    if abs(dx) > 100 or abs(dy) > 100:
+                        continue
+                    movements.append((dx, dy, bool(report[start] & 1)))
+                useful = sum(bool(dx or dy) for dx, dy, _pressed in movements)
+                choices.append((useful, movements))
+            useful, movements = max(choices, key=lambda item: item[0], default=(0, []))
+            if useful < 8:
+                continue
+            points = [(0, 0)]
+            drawn = [(0, 0)]
+            x = y = 0
+            for dx, dy, pressed in movements:
+                x += dx
+                y -= dy  # HID Y is down; SVG Y is also down after inversion.
+                points.append((x, y))
+                if pressed:
+                    drawn.append((x, y))
+            xs, ys = zip(*points, strict=True)
+            width, height = max(xs) - min(xs), max(ys) - min(ys)
+            if max(width, height) < 12:
+                continue
+            margin = 12
+            view_box = f"{min(xs) - margin} {min(ys) - margin} {max(1, width + margin * 2)} {max(1, height + margin * 2)}"
+            encode = lambda items: " ".join(f"{px},{py}" for px, py in items)
+            svg = (
+                f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{view_box}" width="800" height="600">'
+                '<rect width="100%" height="100%" fill="white"/>'
+                f'<polyline fill="none" stroke="#9ca3af" stroke-width="1" points="{encode(points)}"/>'
+                f'<polyline fill="none" stroke="#111827" stroke-width="2" points="{encode(drawn)}"/>'
+                '</svg>'
+            ).encode("utf-8")
+            artifacts.append((f"usb_mouse_{safe_label(source) or 'device'}_drawing.svg", svg, useful))
+        return artifacts[:16]
 
     @staticmethod
     def _launch_argv(resolution: ResolvedTool, arguments: list[str]) -> list[str]:

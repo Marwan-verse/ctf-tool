@@ -762,8 +762,9 @@ class AnalysisEngine:
                     excluded_tool_ids.add("zbarimg")
                 if not analysis_options["recursive_extraction"]:
                     excluded_tool_ids.update({
-                        "binwalk", "foremost", "7z", "7z_extract", "tshark_http_objects",
+                        "binwalk", "foremost", "7z", "7z_extract", "tshark_http_objects", "tshark_ftp_objects",
                         "tshark_smb_objects", "tshark_tftp_objects", "tshark_imf_objects",
+                        "tshark_dicom_objects", "tcpflow", "hcxpcapngtool",
                         "oleobj", "rtfobj", "tsk_recover", "readpst",
                     })
                 if not analysis_options["repairs"]:

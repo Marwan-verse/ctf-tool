@@ -8,7 +8,8 @@ type Screen = 'setup' | 'running' | 'results';
 type FileDetection = { label: string; source: 'content' | 'browser' | 'extension' | 'scanning' };
 type ColorTheme = 'light' | 'dark';
 type UiPreferences = { theme: ColorTheme; zoom: number };
-type ResultTab = 'overview' | 'repairs' | 'audio' | 'candidates' | 'artifacts' | 'visual' | 'metadata' | 'hex' | 'tools' | 'methods';
+type ResultTab = 'overview' | 'traffic' | 'repairs' | 'audio' | 'candidates' | 'artifacts' | 'visual' | 'metadata' | 'hex' | 'tools' | 'methods';
+type TrafficPane = 'packets' | 'protocols' | 'endpoints' | 'conversations' | 'streams' | 'objects' | 'events';
 type MethodFilter = 'all' | 'completed' | 'missing' | 'skipped' | 'failed';
 type BooleanOptionKey = 'structure_analysis' | 'visual_analysis' | 'lsb_analysis' | 'ocr' | 'barcodes' | 'recursive_extraction' | 'decoders' | 'crypto_analysis' | 'repairs' | 'external_tools' | 'external_extraction' | 'audio_spectrogram' | 'audio_signal_decoders' | 'audio_sstv' | 'audio_channel_exports' | 'audio_audacity_bundle';
 
@@ -402,6 +403,7 @@ const profiles: Array<{ id: Profile; symbol: string; name: string; copy: string;
 ];
 const resultTabs: Array<{ id: ResultTab; label: string }> = [
   { id: 'overview', label: 'Overview' },
+  { id: 'traffic', label: 'Traffic lab' },
   { id: 'repairs', label: 'Repair lab' },
   { id: 'audio', label: 'Audio lab' },
   { id: 'candidates', label: 'Flag candidates' },
@@ -705,6 +707,297 @@ function searchable(...values: unknown[]) {
 
 function boundedDisplay(value: string, maximum = 20_000) {
   return value.length <= maximum ? value : `${value.slice(0, maximum)}\n\n… ${value.length - maximum} more characters are available in the exported report.`;
+}
+
+type TrafficRecord = Record<string, unknown>;
+
+function asTrafficRecord(value: unknown): TrafficRecord | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as TrafficRecord : null;
+}
+
+function trafficArray(record: TrafficRecord, ...keys: string[]) {
+  for (const key of keys) {
+    const value = record[key];
+    if (Array.isArray(value)) return value.map(asTrafficRecord).filter((item): item is TrafficRecord => Boolean(item));
+  }
+  return [];
+}
+
+function trafficValue(record: TrafficRecord, keys: string[], fallback = '—') {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    if (typeof value === 'boolean') return value ? 'yes' : 'no';
+    if (Array.isArray(value) && value.length) return value.map(String).join(', ');
+  }
+  return fallback;
+}
+
+function trafficNumber(record: TrafficRecord, keys: string[], fallback = 0) {
+  for (const key of keys) {
+    const value = Number(record[key]);
+    if (Number.isFinite(value)) return value;
+  }
+  return fallback;
+}
+
+function findTrafficInspection(value: unknown, depth = 0): TrafficRecord | null {
+  if (depth > 5) return null;
+  const record = asTrafficRecord(value);
+  if (!record) {
+    if (Array.isArray(value)) {
+      for (const entry of value.slice(0, 200)) {
+        const found = findTrafficInspection(entry, depth + 1);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+  const direct = asTrafficRecord(record.traffic_inspection);
+  if (direct) return direct;
+  if (['packet_rows', 'packets', 'protocol_hierarchy', 'conversations', 'endpoints', 'streams'].some((key) => Array.isArray(record[key]))) return record;
+  for (const [key, entry] of Object.entries(record)) {
+    if (!/(?:structure|detail|propert|metadata|traffic|capture|network)/i.test(key)) continue;
+    const found = findTrafficInspection(entry, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+function trafficInspectionFor(result: AnalysisResult | null | undefined, methods: MethodRun[]) {
+  if (!result) return null;
+  const roots: unknown[] = [result.structure, result.metadata, result];
+  for (const method of methods) {
+    if ((method.id || method.tool_id) === 'built-in-structure' || /(?:pcap|tshark|wireshark|network)/i.test(`${methodName(method)} ${method.category || ''}`)) roots.push(method.details);
+  }
+  for (const root of roots) {
+    const found = findTrafficInspection(root);
+    if (found) return found;
+  }
+  return null;
+}
+
+function captureResult(result: AnalysisResult | null | undefined, job: Job | null, inspection: TrafficRecord | null) {
+  const detected = String(result?.source?.detected_type || result?.input?.detected_type || '').toLowerCase();
+  const name = String(result?.source?.name || jobName(job));
+  return Boolean(inspection) || detected === 'pcap' || detected === 'pcapng' || /\.pcap(?:ng)?$/i.test(name);
+}
+
+function packetFieldValues(packet: TrafficRecord, field: string): string[] {
+  const aliases: Record<string, string[]> = {
+    'frame.number': ['number', 'frame_number', 'no', 'index'],
+    'frame.len': ['length', 'frame_length', 'captured_length', 'bytes'],
+    'frame.time': ['time', 'timestamp', 'time_relative', 'relative_time'],
+    'ip.src': ['source', 'src', 'source_address', 'ip_src'],
+    'ipv6.src': ['source', 'src', 'source_address', 'ip_src'],
+    'ip.dst': ['destination', 'dst', 'destination_address', 'ip_dst'],
+    'ipv6.dst': ['destination', 'dst', 'destination_address', 'ip_dst'],
+    'ip.addr': ['source', 'src', 'source_address', 'ip_src', 'destination', 'dst', 'destination_address', 'ip_dst'],
+    'tcp.port': ['source_port', 'src_port', 'destination_port', 'dst_port'],
+    'udp.port': ['source_port', 'src_port', 'destination_port', 'dst_port'],
+    'tcp.srcport': ['source_port', 'src_port'],
+    'tcp.dstport': ['destination_port', 'dst_port'],
+    'udp.srcport': ['source_port', 'src_port'],
+    'udp.dstport': ['destination_port', 'dst_port'],
+    'tcp.stream': ['stream', 'stream_id', 'tcp_stream'],
+    'udp.stream': ['stream', 'stream_id', 'udp_stream'],
+    protocol: ['protocol', 'highest_protocol', '_ws_col_protocol'],
+    info: ['info', 'summary', '_ws_col_info'],
+  };
+  const keys = aliases[field.toLowerCase()] || [field, field.replaceAll('.', '_')];
+  return keys.flatMap((key) => {
+    const value = packet[key];
+    return Array.isArray(value) ? value.map(String) : value === undefined || value === null ? [] : [String(value)];
+  });
+}
+
+function packetMatchesDisplayFilter(packet: TrafficRecord, filter: string) {
+  const query = filter.trim();
+  if (!query) return true;
+  const evaluateTerm = (raw: string) => {
+    let term = raw.trim();
+    let negate = false;
+    if (term.startsWith('!')) { negate = true; term = term.slice(1).trim(); }
+    if (/^not\s+/i.test(term)) { negate = true; term = term.replace(/^not\s+/i, ''); }
+    const comparison = term.match(/^([\w.]+)\s*(==|!=|>=|<=|>|<|contains|matches)\s*(.+)$/i);
+    let matched: boolean;
+    if (comparison) {
+      const [, field, operator, rawExpected] = comparison;
+      const expected = rawExpected.trim().replace(/^(?:"(.*)"|'(.*)')$/, '$1$2').toLowerCase();
+      const values = packetFieldValues(packet, field);
+      matched = values.some((value) => {
+        const normalized = value.toLowerCase();
+        if (operator === '==' || operator.toLowerCase() === 'contains') return operator === '==' ? normalized === expected : normalized.includes(expected);
+        if (operator === '!=') return normalized !== expected;
+        if (operator.toLowerCase() === 'matches') {
+          try { return new RegExp(expected, 'i').test(value); } catch { return normalized.includes(expected); }
+        }
+        const left = Number(value); const right = Number(expected);
+        if (!Number.isFinite(left) || !Number.isFinite(right)) return false;
+        if (operator === '>') return left > right;
+        if (operator === '<') return left < right;
+        if (operator === '>=') return left >= right;
+        return left <= right;
+      });
+    } else {
+      const needle = term.toLowerCase();
+      const protocol = trafficValue(packet, ['protocol', 'highest_protocol', '_ws_col_protocol'], '').toLowerCase();
+      matched = protocol === needle || searchable(packet).includes(needle);
+    }
+    return negate ? !matched : matched;
+  };
+  return query.split(/\s*\|\|\s*/).some((branch) => branch.split(/\s*(?:&&|\band\b)\s*/i).filter(Boolean).every(evaluateTerm));
+}
+
+function packetTime(packet: TrafficRecord) {
+  const raw = trafficValue(packet, ['time_relative', 'relative_time', 'time', 'timestamp', 'frame_time'], '—');
+  const numeric = Number(raw);
+  return Number.isFinite(numeric) ? numeric.toFixed(numeric >= 1000 ? 3 : 6) : raw;
+}
+
+function PcapTrafficWorkspace({ inspection, findings, artifacts, jobId, sourceType }: { inspection: TrafficRecord; findings: Finding[]; artifacts: Artifact[]; jobId: string; sourceType: string }) {
+  const [pane, setPane] = useState<TrafficPane>('packets');
+  const [displayFilter, setDisplayFilter] = useState('');
+  const [packetPage, setPacketPage] = useState(0);
+  const [selectedPacketIndex, setSelectedPacketIndex] = useState<number | null>(null);
+  const packetRows = useMemo(() => trafficArray(inspection, 'packet_rows', 'packets', 'frames'), [inspection]);
+  const suppliedProtocols = useMemo(() => trafficArray(inspection, 'protocol_hierarchy', 'protocols'), [inspection]);
+  const suppliedEndpoints = useMemo(() => trafficArray(inspection, 'endpoints', 'hosts'), [inspection]);
+  const suppliedConversations = useMemo(() => trafficArray(inspection, 'conversations', 'flows'), [inspection]);
+  const suppliedStreams = useMemo(() => trafficArray(inspection, 'streams', 'tcp_streams', 'udp_streams'), [inspection]);
+  const suppliedObjects = useMemo(() => trafficArray(inspection, 'objects', 'exported_objects', 'transferred_objects'), [inspection]);
+  const dnsRows = useMemo(() => trafficArray(inspection, 'dns', 'dns_records', 'dns_messages'), [inspection]);
+  const httpRows = useMemo(() => trafficArray(inspection, 'http', 'http_messages', 'http_requests'), [inspection]);
+  const tlsRows = useMemo(() => trafficArray(inspection, 'tls', 'tls_records', 'tls_handshakes'), [inspection]);
+  const eventRows = useMemo(() => trafficArray(inspection, 'events', 'expert_info', 'anomalies'), [inspection]);
+
+  const protocols = useMemo(() => {
+    if (suppliedProtocols.length) return suppliedProtocols;
+    const counts = new Map<string, { packets: number; bytes: number }>();
+    for (const packet of packetRows) {
+      const name = trafficValue(packet, ['protocol', 'highest_protocol', '_ws_col_protocol'], 'OTHER').toUpperCase();
+      const current = counts.get(name) || { packets: 0, bytes: 0 };
+      current.packets += 1; current.bytes += trafficNumber(packet, ['length', 'frame_length', 'captured_length']); counts.set(name, current);
+    }
+    return [...counts.entries()].map(([protocol, totals]) => ({ protocol, ...totals })).sort((a, b) => b.packets - a.packets);
+  }, [packetRows, suppliedProtocols]);
+
+  const endpoints = useMemo(() => {
+    if (suppliedEndpoints.length) return suppliedEndpoints;
+    const totals = new Map<string, { sent: number; received: number; packets: number; bytes: number; protocols: Set<string> }>();
+    for (const packet of packetRows) {
+      const source = trafficValue(packet, ['source', 'src', 'source_address'], '');
+      const destination = trafficValue(packet, ['destination', 'dst', 'destination_address'], '');
+      const bytes = trafficNumber(packet, ['length', 'frame_length', 'captured_length']);
+      const protocol = trafficValue(packet, ['protocol', 'highest_protocol'], 'OTHER');
+      for (const [address, direction] of [[source, 'sent'], [destination, 'received']] as const) {
+        if (!address) continue;
+        const current = totals.get(address) || { sent: 0, received: 0, packets: 0, bytes: 0, protocols: new Set<string>() };
+        current[direction] += bytes; current.packets += 1; current.bytes += bytes; current.protocols.add(protocol); totals.set(address, current);
+      }
+    }
+    return [...totals.entries()].map(([address, row]) => ({ address, ...row, protocols: [...row.protocols] })).sort((a, b) => b.bytes - a.bytes);
+  }, [packetRows, suppliedEndpoints]);
+
+  const conversations = useMemo(() => {
+    if (suppliedConversations.length) return suppliedConversations;
+    const totals = new Map<string, TrafficRecord>();
+    for (const packet of packetRows) {
+      const source = trafficValue(packet, ['source', 'src'], ''); const destination = trafficValue(packet, ['destination', 'dst'], '');
+      if (!source || !destination) continue;
+      const sourcePort = trafficValue(packet, ['source_port', 'src_port'], ''); const destinationPort = trafficValue(packet, ['destination_port', 'dst_port'], '');
+      const protocol = trafficValue(packet, ['protocol', 'highest_protocol'], 'OTHER').toUpperCase();
+      const first = `${source}:${sourcePort}`; const second = `${destination}:${destinationPort}`; const ordered = [first, second].sort();
+      const key = `${protocol}|${ordered[0]}|${ordered[1]}`;
+      const current = totals.get(key) || { protocol, endpoint_a: ordered[0], endpoint_b: ordered[1], packets: 0, bytes: 0 };
+      current.packets = Number(current.packets || 0) + 1; current.bytes = Number(current.bytes || 0) + trafficNumber(packet, ['length', 'frame_length', 'captured_length']); totals.set(key, current);
+    }
+    return [...totals.values()].sort((a, b) => Number(b.bytes || 0) - Number(a.bytes || 0));
+  }, [packetRows, suppliedConversations]);
+
+  const streams = useMemo(() => {
+    if (suppliedStreams.length) return suppliedStreams;
+    const totals = new Map<string, TrafficRecord>();
+    for (const packet of packetRows) {
+      const stream = trafficValue(packet, ['stream', 'stream_id', 'tcp_stream', 'udp_stream'], '');
+      if (!stream) continue;
+      const protocol = trafficValue(packet, ['protocol', 'highest_protocol'], 'STREAM').toUpperCase();
+      const key = `${protocol}:${stream}`; const current = totals.get(key) || { stream_id: stream, protocol, packets: 0, bytes: 0, source: trafficValue(packet, ['source', 'src']), destination: trafficValue(packet, ['destination', 'dst']) };
+      current.packets = Number(current.packets || 0) + 1; current.bytes = Number(current.bytes || 0) + trafficNumber(packet, ['length', 'frame_length', 'captured_length']); totals.set(key, current);
+    }
+    return [...totals.values()];
+  }, [packetRows, suppliedStreams]);
+
+  const objects = useMemo(() => {
+    if (suppliedObjects.length) return suppliedObjects;
+    return artifacts.filter((artifact) => artifact.kind !== 'original').map((artifact) => ({ artifact_id: artifactId(artifact), name: artifactName(artifact), protocol: artifactOrigin(artifact), size: artifactSize(artifact), media_type: artifactMediaType(artifact), sha256: artifact.sha256, download_url: artifact.download_url }));
+  }, [artifacts, suppliedObjects]);
+
+  const filteredPackets = useMemo(() => packetRows.filter((packet) => packetMatchesDisplayFilter(packet, displayFilter)), [displayFilter, packetRows]);
+  useEffect(() => { setPacketPage(0); setSelectedPacketIndex(null); }, [displayFilter]);
+  const pageSize = 100;
+  const pageCount = Math.max(1, Math.ceil(filteredPackets.length / pageSize));
+  const pagePackets = filteredPackets.slice(packetPage * pageSize, (packetPage + 1) * pageSize);
+  const selectedPacket = selectedPacketIndex === null ? null : filteredPackets[selectedPacketIndex] || null;
+  const totalBytes = trafficNumber(inspection, ['captured_bytes', 'captured_payload_bytes', 'network_payload_bytes', 'bytes'], packetRows.reduce((sum, packet) => sum + trafficNumber(packet, ['length', 'frame_length', 'captured_length']), 0));
+  const packetCount = trafficNumber(inspection, ['packet_count', 'packet_records_scanned', 'packets'], packetRows.length);
+  const duration = trafficValue(inspection, ['duration_seconds', 'duration', 'capture_duration'], '—');
+  const networkFindings = findings.filter((finding) => /(?:network|pcap|dns|http|tls|covert|packet|stream)/i.test(`${finding.category || ''} ${finding.title || ''} ${finding.method_id || ''}`));
+  const protocolMax = Math.max(1, ...protocols.map((row) => trafficNumber(row, ['packets', 'packet_count', 'count'])));
+  const eventGroups = [
+    ...dnsRows.map((row) => ({ ...row, event_kind: 'DNS' })),
+    ...httpRows.map((row) => ({ ...row, event_kind: 'HTTP' })),
+    ...tlsRows.map((row) => ({ ...row, event_kind: 'TLS' })),
+    ...eventRows.map((row) => ({ ...row, event_kind: trafficValue(row, ['event_kind', 'kind', 'protocol'], 'Expert') })),
+  ];
+  const protocolNames = protocols.slice(0, 8).map((row) => trafficValue(row, ['protocol', 'name', 'label'], 'OTHER'));
+  const selectedPayloadHex = selectedPacket ? trafficValue(selectedPacket, ['payload_hex', 'data_hex', 'hex'], '') : '';
+  const selectedPayloadText = selectedPacket ? trafficValue(selectedPacket, ['payload_ascii', 'payload_text', 'ascii', 'text'], '') : '';
+
+  const paneItems: Array<{ id: TrafficPane; label: string; count: number }> = [
+    { id: 'packets', label: 'Packets', count: packetRows.length }, { id: 'protocols', label: 'Protocols', count: protocols.length },
+    { id: 'endpoints', label: 'Endpoints', count: endpoints.length }, { id: 'conversations', label: 'Conversations', count: conversations.length },
+    { id: 'streams', label: 'Streams', count: streams.length }, { id: 'objects', label: 'Objects', count: objects.length }, { id: 'events', label: 'Protocol events', count: eventGroups.length },
+  ];
+
+  return <section className="tab-panel pcap-workspace">
+    <header className="pcap-heading"><div><p className="eyebrow">Packet investigation</p><h2>Traffic laboratory</h2><p>Wireshark-style inspection with display filters, packet details, flow pivots, stream recovery and exported objects.</p></div><div className="pcap-live-badge"><span />{sourceType.toUpperCase()} · read-only</div></header>
+    <div className="pcap-stat-grid">
+      <div><span>Packets</span><strong>{packetCount.toLocaleString()}</strong><small>{packetRows.length.toLocaleString()} indexed rows</small></div>
+      <div><span>Captured</span><strong>{formatBytes(totalBytes)}</strong><small>bounded evidence bytes</small></div>
+      <div><span>Protocols</span><strong>{protocols.length}</strong><small>{protocolNames.slice(0, 3).join(' · ') || 'No decoded layers'}</small></div>
+      <div><span>Conversations</span><strong>{conversations.length}</strong><small>{endpoints.length} endpoints</small></div>
+      <div><span>Duration</span><strong>{duration === '—' ? duration : `${duration}s`}</strong><small>{networkFindings.length} network findings</small></div>
+    </div>
+    {networkFindings.length ? <div className="pcap-findings">{networkFindings.slice(0, 4).map((finding, index) => <article key={finding.id || `${finding.title}-${index}`}><span className={finding.severity || 'info'}>{finding.severity === 'warning' ? '!' : finding.severity === 'error' ? '×' : 'i'}</span><div><strong>{finding.title || 'Network finding'}</strong><p>{finding.description || finding.summary || finding.evidence}</p></div></article>)}</div> : null}
+    <nav className="pcap-nav" aria-label="Traffic analysis views">{paneItems.map((item) => <button key={item.id} className={pane === item.id ? 'active' : ''} onClick={() => setPane(item.id)}><span>{item.label}</span><em>{item.count.toLocaleString()}</em></button>)}</nav>
+
+    {pane === 'packets' && <div className="pcap-packet-pane">
+      <div className="pcap-filter-bar"><span>⌕</span><label className="sr-only" htmlFor="pcap-display-filter">Packet display filter</label><input id="pcap-display-filter" value={displayFilter} onChange={(event) => setDisplayFilter(event.target.value.slice(0, 512))} placeholder="Display filter: tcp && ip.addr == 10.0.0.5, udp.port == 53, info contains flag…" spellCheck={false} />{displayFilter ? <button onClick={() => setDisplayFilter('')}>Clear</button> : <kbd>Ctrl + /</kbd>}<small>{filteredPackets.length.toLocaleString()} shown</small></div>
+      <div className="pcap-filter-chips"><span>Quick filters</span>{protocolNames.map((protocol) => <button key={protocol} onClick={() => setDisplayFilter(protocol.toLowerCase())}>{protocol}</button>)}<button onClick={() => setDisplayFilter('info contains flag')}>Flag text</button><button onClick={() => setDisplayFilter('tcp.port == 80 || tcp.port == 443')}>Web</button></div>
+      <div className={`pcap-packet-layout ${selectedPacket ? 'has-inspector' : ''}`}>
+        <div className="pcap-table-wrap"><div className="pcap-packet-table" role="table" aria-label="Capture packets"><div className="pcap-packet-head" role="row"><span>No.</span><span>Time</span><span>Source</span><span>Destination</span><span>Protocol</span><span>Length</span><span>Info</span></div>{pagePackets.map((packet, pageIndex) => {
+          const absoluteIndex = packetPage * pageSize + pageIndex; const protocol = trafficValue(packet, ['protocol', 'highest_protocol', '_ws_col_protocol'], 'OTHER');
+          return <button className={`pcap-packet-row protocol-${protocol.toLowerCase().replace(/[^a-z0-9]+/g, '-')}${selectedPacketIndex === absoluteIndex ? ' selected' : ''}`} role="row" key={`${trafficValue(packet, ['number', 'frame_number'], String(absoluteIndex + 1))}-${absoluteIndex}`} onClick={() => setSelectedPacketIndex(absoluteIndex)}><span>{trafficValue(packet, ['number', 'frame_number', 'no', 'index'], String(absoluteIndex + 1))}</span><span className="mono">{packetTime(packet)}</span><span title={trafficValue(packet, ['source', 'src', 'source_address'])}>{trafficValue(packet, ['source', 'src', 'source_address'])}</span><span title={trafficValue(packet, ['destination', 'dst', 'destination_address'])}>{trafficValue(packet, ['destination', 'dst', 'destination_address'])}</span><span><em>{protocol}</em></span><span>{trafficValue(packet, ['length', 'frame_length', 'captured_length'], '0')}</span><span title={trafficValue(packet, ['info', 'summary', '_ws_col_info'])}>{trafficValue(packet, ['info', 'summary', '_ws_col_info'])}</span></button>;
+        })}{!pagePackets.length && <div className="pcap-empty"><span>⌕</span><strong>No packets match this display filter</strong><p>Try a protocol name, address, port, frame number, or a plain-text search.</p></div>}</div>
+        {filteredPackets.length > pageSize && <footer className="pcap-pagination"><span>Rows {packetPage * pageSize + 1}–{Math.min(filteredPackets.length, (packetPage + 1) * pageSize)} of {filteredPackets.length.toLocaleString()}</span><div><button disabled={packetPage === 0} onClick={() => setPacketPage((current) => Math.max(0, current - 1))}>← Previous</button><em>{packetPage + 1} / {pageCount}</em><button disabled={packetPage + 1 >= pageCount} onClick={() => setPacketPage((current) => Math.min(pageCount - 1, current + 1))}>Next →</button></div></footer>}</div>
+        {selectedPacket && <aside className="pcap-packet-inspector"><header><div><p className="eyebrow">Packet details</p><h3>Frame {trafficValue(selectedPacket, ['number', 'frame_number'], String((selectedPacketIndex || 0) + 1))}</h3></div><button onClick={() => setSelectedPacketIndex(null)} aria-label="Close packet details">×</button></header><div className="pcap-layer-chips">{String(trafficValue(selectedPacket, ['layers', 'protocol_stack'], trafficValue(selectedPacket, ['protocol'], 'FRAME'))).split(/[,/ >]+/).filter(Boolean).map((layer) => <span key={layer}>{layer}</span>)}</div><dl><div><dt>Arrival</dt><dd className="mono">{packetTime(selectedPacket)}</dd></div><div><dt>Source</dt><dd>{trafficValue(selectedPacket, ['source', 'src'])}:{trafficValue(selectedPacket, ['source_port', 'src_port'], '')}</dd></div><div><dt>Destination</dt><dd>{trafficValue(selectedPacket, ['destination', 'dst'])}:{trafficValue(selectedPacket, ['destination_port', 'dst_port'], '')}</dd></div><div><dt>Length</dt><dd>{trafficValue(selectedPacket, ['length', 'frame_length', 'captured_length'], '0')} bytes</dd></div></dl>{trafficValue(selectedPacket, ['info', 'summary'], '') && <p className="pcap-packet-summary">{trafficValue(selectedPacket, ['info', 'summary'])}</p>}{selectedPayloadHex && <div className="pcap-payload"><span>Payload hex</span><pre>{boundedDisplay(selectedPayloadHex, 8000)}</pre></div>}{selectedPayloadText && <div className="pcap-payload"><span>Payload text</span><pre>{boundedDisplay(selectedPayloadText, 8000)}</pre></div>}<details className="raw-details"><summary>All decoded fields</summary><pre>{boundedDisplay(JSON.stringify(selectedPacket, null, 2), 14000)}</pre></details></aside>}
+      </div>
+    </div>}
+
+    {pane === 'protocols' && <div className="pcap-data-pane"><div className="pcap-pane-heading"><div><p className="eyebrow">Statistics</p><h3>Protocol hierarchy</h3></div><span>Packets and byte share by decoded layer</span></div><div className="pcap-protocol-list">{protocols.map((row, index) => { const packets = trafficNumber(row, ['packets', 'packet_count', 'count']); const name = trafficValue(row, ['protocol', 'name', 'label'], `Protocol ${index + 1}`); return <article key={`${name}-${index}`}><span className="pcap-protocol-rank">{String(index + 1).padStart(2, '0')}</span><div><header><strong>{name}</strong><small>{packets.toLocaleString()} packets · {formatBytes(trafficNumber(row, ['bytes', 'byte_count']))}</small></header><i><b style={{ width: `${Math.max(2, packets / protocolMax * 100)}%` }} /></i></div><em>{trafficValue(row, ['percent', 'packet_percent'], `${packetCount ? (packets / packetCount * 100).toFixed(1) : '0.0'}%`)}</em></article>; })}{!protocols.length && <div className="pcap-empty"><strong>No protocol hierarchy was returned</strong></div>}</div></div>}
+
+    {pane === 'endpoints' && <div className="pcap-data-pane"><div className="pcap-pane-heading"><div><p className="eyebrow">Statistics</p><h3>Endpoints</h3></div><span>Address activity across the complete capture</span></div><div className="pcap-generic-table endpoints"><div className="pcap-generic-head"><span>Address</span><span>Protocols</span><span>Packets</span><span>Sent</span><span>Received</span><span>Total bytes</span></div>{endpoints.map((row, index) => <article key={`${trafficValue(row, ['address', 'endpoint', 'host'], String(index))}-${index}`}><strong className="mono">{trafficValue(row, ['address', 'endpoint', 'host'])}</strong><span>{trafficValue(row, ['protocols', 'protocol'], '—')}</span><span>{trafficNumber(row, ['packets', 'packet_count']).toLocaleString()}</span><span>{formatBytes(trafficNumber(row, ['sent', 'tx_bytes', 'bytes_sent']))}</span><span>{formatBytes(trafficNumber(row, ['received', 'rx_bytes', 'bytes_received']))}</span><span>{formatBytes(trafficNumber(row, ['bytes', 'total_bytes']))}</span></article>)}</div></div>}
+
+    {pane === 'conversations' && <div className="pcap-data-pane"><div className="pcap-pane-heading"><div><p className="eyebrow">Flow statistics</p><h3>Conversations</h3></div><span>Bidirectional endpoint pairs</span></div><div className="pcap-generic-table conversations"><div className="pcap-generic-head"><span>Protocol</span><span>Endpoint A</span><span>Endpoint B</span><span>Packets</span><span>Bytes</span><span>Duration</span></div>{conversations.map((row, index) => <article key={`${trafficValue(row, ['endpoint_a', 'source', 'src'], String(index))}-${index}`}><span><em>{trafficValue(row, ['protocol', 'transport'], 'FLOW')}</em></span><strong className="mono">{trafficValue(row, ['endpoint_a', 'source', 'src'])}</strong><strong className="mono">{trafficValue(row, ['endpoint_b', 'destination', 'dst'])}</strong><span>{trafficNumber(row, ['packets', 'packet_count']).toLocaleString()}</span><span>{formatBytes(trafficNumber(row, ['bytes', 'byte_count']))}</span><span>{trafficValue(row, ['duration', 'duration_seconds'], '—')}</span></article>)}</div></div>}
+
+    {pane === 'streams' && <div className="pcap-data-pane"><div className="pcap-pane-heading"><div><p className="eyebrow">Reassembly</p><h3>Follow streams</h3></div><span>Contiguous TCP/UDP payload views and recovered channels</span></div><div className="pcap-stream-grid">{streams.map((row, index) => <article key={`${trafficValue(row, ['stream_id', 'stream', 'id'], String(index))}-${index}`}><header><span>{trafficValue(row, ['protocol', 'transport'], 'STREAM')}</span><strong>Stream {trafficValue(row, ['stream_id', 'stream', 'id'], String(index))}</strong><em>{formatBytes(trafficNumber(row, ['bytes', 'byte_count']))}</em></header><p><code>{trafficValue(row, ['source', 'endpoint_a', 'src'])}</code><span>⇄</span><code>{trafficValue(row, ['destination', 'endpoint_b', 'dst'])}</code></p><small>{trafficNumber(row, ['packets', 'packet_count']).toLocaleString()} packets{trafficNumber(row, ['gaps', 'gap_count']) ? ` · ${trafficNumber(row, ['gaps', 'gap_count'])} gaps` : ''}{trafficNumber(row, ['overlaps', 'overlap_count']) ? ` · ${trafficNumber(row, ['overlaps', 'overlap_count'])} overlaps` : ''}</small>{trafficValue(row, ['preview', 'text', 'ascii'], '') && <pre>{boundedDisplay(trafficValue(row, ['preview', 'text', 'ascii']), 3000)}</pre>}<details className="raw-details"><summary>Stream metadata</summary><pre>{JSON.stringify(row, null, 2)}</pre></details></article>)}{!streams.length && <div className="pcap-empty"><span>⇄</span><strong>No numbered transport streams were exposed</strong><p>Recovered stream content can still appear in Findings and Artifacts.</p></div>}</div></div>}
+
+    {pane === 'objects' && <div className="pcap-data-pane"><div className="pcap-pane-heading"><div><p className="eyebrow">Export objects</p><h3>Transferred files</h3></div><span>HTTP, SMB, TFTP, IMF and carved payloads</span></div><div className="pcap-object-list">{objects.map((row, index) => { const publicId = trafficValue(row, ['artifact_id', 'id'], ''); const artifact = artifacts.find((item) => artifactId(item) === publicId); const rawDownload = trafficValue(row, ['download_url'], '') || artifact?.download_url || ''; const download = normalizeUrl(rawDownload) || (publicId ? `${API_BASE}/api/jobs/${jobId}/artifacts/${publicId}/download` : ''); return <article key={`${publicId}-${trafficValue(row, ['name', 'filename'], String(index))}`}><span>⇩</span><div><strong>{trafficValue(row, ['name', 'filename', 'logical_name'], `Object ${index + 1}`)}</strong><small>{trafficValue(row, ['protocol', 'producer', 'source'], 'Network payload')} · {trafficValue(row, ['media_type', 'mime_type', 'kind'], 'binary')} · {formatBytes(trafficNumber(row, ['size', 'size_bytes', 'bytes']))}</small><code>{trafficValue(row, ['sha256', 'hash'], '')}</code></div>{download ? <a href={download} download>Download ↓</a> : <em>Recorded</em>}</article>; })}{!objects.length && <div className="pcap-empty"><span>⇩</span><strong>No transferable objects were reconstructed</strong><p>Object extraction results appear here when protocol data yields a bounded file.</p></div>}</div></div>}
+
+    {pane === 'events' && <div className="pcap-data-pane"><div className="pcap-pane-heading"><div><p className="eyebrow">Protocol intelligence</p><h3>DNS, HTTP, TLS &amp; expert events</h3></div><span>{dnsRows.length} DNS · {httpRows.length} HTTP · {tlsRows.length} TLS · {eventRows.length} expert</span></div><div className="pcap-event-list">{eventGroups.map((row, index) => <article key={`${trafficValue(row, ['event_kind'], 'Event')}-${index}`}><span className={`event-${trafficValue(row, ['event_kind'], 'expert').toLowerCase()}`}>{trafficValue(row, ['event_kind'], 'Expert')}</span><div><strong>{trafficValue(row, ['name', 'query', 'host', 'method', 'server_name', 'title', 'summary'], `Protocol event ${index + 1}`)}</strong><p>{trafficValue(row, ['info', 'description', 'answer', 'target', 'uri', 'subject', 'details'], 'Structured protocol evidence')}</p><small>{trafficValue(row, ['source', 'src'], '')}{trafficValue(row, ['destination', 'dst'], '') ? ` → ${trafficValue(row, ['destination', 'dst'])}` : ''}{trafficValue(row, ['time', 'timestamp', 'frame_number'], '') ? ` · ${trafficValue(row, ['time', 'timestamp', 'frame_number'])}` : ''}</small></div><details className="raw-details"><summary>Fields</summary><pre>{JSON.stringify(row, null, 2)}</pre></details></article>)}{!eventGroups.length && <div className="pcap-empty"><span>◇</span><strong>No structured service events were returned</strong><p>Packet rows and stream reconstruction remain available.</p></div>}</div></div>}
+  </section>;
 }
 
 function methodStatusGroup(method: MethodRun): Exclude<MethodFilter, 'all'> {
@@ -1060,6 +1353,9 @@ function HomeWorkbench() {
   const toolMethods = useMemo(() => {
     return methods.filter((method) => Boolean(method.tool?.executable || method.command?.length || method.stdout || method.stderr || method.details));
   }, [methods]);
+  const trafficInspection = useMemo(() => trafficInspectionFor(result, methods), [methods, result]);
+  const isPcapResult = captureResult(result, job, trafficInspection);
+  const trafficPacketCount = trafficInspection ? trafficArray(trafficInspection, 'packet_rows', 'packets', 'frames').length : 0;
   const declaredExternalToolIds = useMemo(() => new Set(capabilities.map((capability) => capability.id).filter((id): id is string => Boolean(id))), [capabilities]);
   const capabilitiesById = useMemo(() => new Map(capabilities.map((capability) => [capability.id || capability.executable || '', capability])), [capabilities]);
   const findings = useMemo(() => result?.findings || [], [result]);
@@ -1099,6 +1395,7 @@ function HomeWorkbench() {
   const availableTools = relevantCapabilities.filter((capability) => capability.available === true).length;
   const armedMethodCount = 1 + currentConfigurableMethods.filter((method) => scanOptions[method.key]).length + availableTools;
   const activeResultTabs = resultTabs.filter((tab) => {
+    if (tab.id === 'traffic') return isPcapResult;
     if (tab.id === 'audio') return isAudioResult;
     if (tab.id === 'repairs') return isRecoveryResult || repairArtifacts.length > 0;
     return true;
@@ -1860,16 +2157,16 @@ function HomeWorkbench() {
             )}
 
             <nav className="result-tabs" aria-label="Analysis result sections">
-              {activeResultTabs.map((tab) => <button key={tab.id} className={activeTab === tab.id ? 'active' : ''} onClick={() => setActiveTab(tab.id)}>{tab.label}{tab.id === 'repairs' && <span>{repairArtifacts.length}</span>}{tab.id === 'audio' && <span>{audioVisuals.length}</span>}{tab.id === 'candidates' && <span>{candidates.length}</span>}{tab.id === 'artifacts' && <span>{artifacts.length}</span>}{tab.id === 'metadata' && <span>{metadataRows.length}</span>}{tab.id === 'tools' && <span>{toolMethods.length}</span>}{tab.id === 'methods' && <span>{methods.length}</span>}</button>)}
+              {activeResultTabs.map((tab) => <button key={tab.id} className={activeTab === tab.id ? 'active' : ''} onClick={() => setActiveTab(tab.id)}>{tab.label}{tab.id === 'traffic' && <span>{trafficPacketCount}</span>}{tab.id === 'repairs' && <span>{repairArtifacts.length}</span>}{tab.id === 'audio' && <span>{audioVisuals.length}</span>}{tab.id === 'candidates' && <span>{candidates.length}</span>}{tab.id === 'artifacts' && <span>{artifacts.length}</span>}{tab.id === 'metadata' && <span>{metadataRows.length}</span>}{tab.id === 'tools' && <span>{toolMethods.length}</span>}{tab.id === 'methods' && <span>{methods.length}</span>}</button>)}
             </nav>
 
-            <div className="result-search">
+            {activeTab !== 'traffic' && <div className="result-search">
               <span aria-hidden="true">⌕</span>
               <label className="sr-only" htmlFor="evidence-search">Search all recovered information</label>
               <input id="evidence-search" type="search" value={resultQuery} onChange={(event) => setResultQuery(event.target.value)} placeholder={isRecoveryResult ? 'Search damage signals, repairs, hashes, artifacts and tool output…' : 'Search flags, metadata, hashes, artifacts and tool output…'} />
               {resultQuery && <button onClick={() => setResultQuery('')} aria-label="Clear evidence search">Clear</button>}
               <small>{resultQuery ? `${filteredCandidates.length + filteredArtifacts.length + filteredToolMethods.length + filteredMetadata.length} matching records` : `${candidates.length + artifacts.length + toolMethods.length + metadataRows.length} indexed records`}</small>
-            </div>
+            </div>}
 
             <div className="result-content">
               {activeTab === 'overview' && (
@@ -1900,6 +2197,16 @@ function HomeWorkbench() {
                     </div>
                   </section>
                 </div>
+              )}
+
+              {activeTab === 'traffic' && isPcapResult && (
+                <PcapTrafficWorkspace
+                  inspection={trafficInspection || {}}
+                  findings={findings}
+                  artifacts={artifacts}
+                  jobId={jobId}
+                  sourceType={String(result?.source?.detected_type || 'pcap')}
+                />
               )}
 
               {activeTab === 'repairs' && (
