@@ -45,13 +45,22 @@ class ResolvedTool:
 
 IMAGE_KINDS = frozenset({"png", "jpeg", "gif", "bmp", "webp", "tiff", "ico"})
 AUDIO_KINDS = frozenset({"audio", "wav", "aiff", "flac", "ogg", "mp3", "aac", "m4a", "au", "asf", "amr", "caf", "midi"})
+VIDEO_KINDS = frozenset({"mp4", "mov", "matroska", "webm", "avi"})
+PROGRAM_KINDS = frozenset({"pe", "elf", "macho", "wasm", "dex", "java_class"})
 PDF_KINDS = frozenset({"pdf"})
 TEXT_KINDS = frozenset({"text", "svg"})
 NETWORK_KINDS = frozenset({"pcap", "pcapng"})
-ARCHIVE_KINDS = frozenset({"zip", "7z", "rar", "tar", "gzip", "bzip2", "xz", "zstd"})
-OFFICE_KINDS = frozenset({"ole", "rtf", "zip"})
-DISK_KINDS = frozenset({"disk", "ewf"})
+ARCHIVE_KINDS = frozenset({"zip", "7z", "rar", "tar", "gzip", "bzip2", "xz", "zstd", "android_backup"})
+OFFICE_KINDS = frozenset({"ole", "rtf", "zip", "docx", "xlsx", "pptx", "odt", "ods", "odp"})
+DISK_KINDS = frozenset({"disk", "ewf", "qcow", "vmdk", "vhdx", "vdi", "dmg", "aff"})
 MEMORY_KINDS = frozenset({"memory"})
+THUMBCACHE_KINDS = frozenset({"thumbcache"})
+JOURNAL_KINDS = frozenset({"systemd_journal"})
+TIMELINE_KINDS = DISK_KINDS | frozenset({
+    "registry", "evtx", "mft", "usn", "prefetch", "lnk", "jumplist", "recycle_bin_i",
+    "sqlite", "sqlite_wal", "sqlite_journal", "ese", "pst", "systemd_journal", "utmp",
+    "plist", "ios_mbdb", "binarycookies", "ds_store", "leveldb", "mozlz4",
+})
 
 
 TOOL_SPECS: tuple[ToolSpec, ...] = (
@@ -114,6 +123,16 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("hcxpcapngtool", "hcxpcapngtool", "WPA/PMKID and EAPOL hash extraction", "network-auth", NETWORK_KINDS, frozenset({"deep"}), "https://github.com/ZerBea/hcxtools"),
     ToolSpec("pcapfix", "pcapfix", "pcapfix non-destructive capture repair", "repair", NETWORK_KINDS, frozenset({"balanced", "deep"}), "https://github.com/Rup0rt/pcapfix"),
     ToolSpec("sqlite3", "sqlite3", "SQLite read-only safe database dump", "database", frozenset({"sqlite"}), frozenset({"balanced", "deep"}), "https://www.sqlite.org/cli.html"),
+    ToolSpec("lnkinfo", "lnkinfo", "liblnk Windows shortcut report", "endpoint-artifact", frozenset({"lnk"}), frozenset({"quick", "balanced", "deep"}), "https://github.com/libyal/liblnk"),
+    ToolSpec("sccainfo", "sccainfo", "libscca Windows Prefetch report", "endpoint-artifact", frozenset({"prefetch"}), frozenset({"quick", "balanced", "deep"}), "https://github.com/libyal/libscca"),
+    ToolSpec("plistutil", "plistutil", "libplist property-list cross-check", "mobile-artifact", frozenset({"plist"}), frozenset({"balanced", "deep"}), "https://github.com/libimobiledevice/libplist"),
+    ToolSpec("esedbinfo", "esedbinfo", "libesedb ESE database catalog report", "database", frozenset({"ese"}), frozenset({"balanced", "deep"}), "https://github.com/libyal/libesedb"),
+    ToolSpec("qemu_img_info", "qemu-img", "QEMU virtual-disk metadata report", "disk", DISK_KINDS - {"ewf"}, frozenset({"balanced", "deep"}), "https://www.qemu.org/docs/master/tools/qemu-img.html"),
+    ToolSpec("bulk_extractor", "bulk_extractor", "bulk_extractor bounded feature scan", "forensic-features", DISK_KINDS | MEMORY_KINDS, frozenset({"deep"}), "https://github.com/simsong/bulk_extractor"),
+    ToolSpec("wtcdbinfo", "wtcdbinfo", "libwtcdb thumbnail-cache metadata report", "endpoint-artifact", THUMBCACHE_KINDS, frozenset({"quick", "balanced", "deep"}), "https://github.com/libyal/libwtcdb"),
+    ToolSpec("wtcdbexport", "wtcdbexport", "libwtcdb thumbnail image extraction", "embedded-data", THUMBCACHE_KINDS, frozenset({"deep"}), "https://github.com/libyal/libwtcdb"),
+    ToolSpec("utmpdump", "utmpdump", "util-linux login accounting dump", "endpoint-artifact", frozenset({"utmp"}), frozenset({"quick", "balanced", "deep"}), "https://man7.org/linux/man-pages/man1/utmpdump.1.html"),
+    ToolSpec("journalctl", "journalctl", "systemd journal read-only field rendering", "event-log", JOURNAL_KINDS, frozenset({"balanced", "deep"}), "https://www.freedesktop.org/software/systemd/man/latest/journalctl.html"),
     ToolSpec("oleid", "oleid", "Oletools document risk indicators", "document", OFFICE_KINDS, frozenset({"balanced", "deep"}), "https://github.com/decalage2/oletools"),
     ToolSpec("olevba", "olevba", "Oletools VBA extraction and deobfuscation", "document", OFFICE_KINDS, frozenset({"deep"}), "https://github.com/decalage2/oletools"),
     ToolSpec("oleobj", "oleobj", "Oletools embedded OLE object extraction", "embedded-data", frozenset({"ole", "zip"}), frozenset({"deep"}), "https://github.com/decalage2/oletools"),
@@ -131,15 +150,24 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("volatility3_windows", "vol", "Volatility 3 offline Windows process triage", "memory", MEMORY_KINDS, frozenset({"deep"}), "https://github.com/volatilityfoundation/volatility3"),
     ToolSpec("tesseract", "tesseract", "Tesseract OCR command-line cross-check", "ocr", IMAGE_KINDS, frozenset({"balanced", "deep"})),
     ToolSpec("zbarimg", "zbarimg", "ZBar barcode command-line cross-check", "barcodes", IMAGE_KINDS, frozenset({"balanced", "deep"})),
-    ToolSpec("ffprobe", "ffprobe", "FFprobe stream and codec inspection", "audio-metadata", AUDIO_KINDS, frozenset({"quick", "balanced", "deep"})),
+    ToolSpec("ffprobe", "ffprobe", "FFprobe stream and codec inspection", "media-metadata", AUDIO_KINDS | VIDEO_KINDS, frozenset({"quick", "balanced", "deep"})),
+    ToolSpec("ffmpeg_frames", "ffmpeg", "FFmpeg bounded video frame contact set", "video-frames", VIDEO_KINDS, frozenset({"balanced", "deep"}), "https://ffmpeg.org/ffmpeg.html"),
     ToolSpec("ffmpeg_spectrogram", "ffmpeg", "FFmpeg full-band spectrogram", "audio-spectrum", AUDIO_KINDS, frozenset({"quick", "balanced", "deep"})),
     ToolSpec("ffmpeg_pcm", "ffmpeg", "FFmpeg Audacity-compatible PCM conversion", "audio", AUDIO_KINDS, frozenset({"balanced", "deep"})),
     ToolSpec("sox_stats", "sox", "SoX signal statistics", "audio-signal", AUDIO_KINDS, frozenset({"balanced", "deep"})),
     ToolSpec("sox_spectrogram", "sox", "SoX high-resolution spectrogram", "audio-spectrum", AUDIO_KINDS, frozenset({"deep"})),
-    ToolSpec("mediainfo", "mediainfo", "MediaInfo audio container inspection", "audio-metadata", AUDIO_KINDS, frozenset({"balanced", "deep"})),
+    ToolSpec("mediainfo", "mediainfo", "MediaInfo media container inspection", "media-metadata", AUDIO_KINDS | VIDEO_KINDS, frozenset({"balanced", "deep"})),
     ToolSpec("multimon_ng", "multimon-ng", "multimon-ng DTMF and AFSK decoder", "audio-decoding", frozenset({"wav"}), frozenset({"deep"})),
     ToolSpec("minimodem", "minimodem", "minimodem 1200-baud FSK decoder", "audio-decoding", frozenset({"wav"}), frozenset({"deep"})),
     ToolSpec("minimodem_300", "minimodem", "minimodem 300-baud Bell 103 FSK decoder", "audio-decoding", frozenset({"wav"}), frozenset({"deep"})),
+    ToolSpec("yara_x_dump", "yr", "YARA-X executable module inspection", "program-structure", frozenset({"pe", "elf", "macho", "dex", "lnk"}), frozenset({"balanced", "deep"}), "https://virustotal.github.io/yara-x/docs/cli/commands/"),
+    ToolSpec("capa", "capa", "capa static capability identification", "program-capabilities", frozenset({"pe", "elf"}), frozenset({"balanced", "deep"}), "https://github.com/mandiant/capa"),
+    ToolSpec("floss", "floss", "FLOSS static and decoded string extraction", "program-strings", frozenset({"pe", "elf", "macho"}), frozenset({"deep"}), "https://github.com/mandiant/flare-floss"),
+    ToolSpec("zeek", "zeek", "Zeek offline protocol and event logs", "network", NETWORK_KINDS, frozenset({"balanced", "deep"}), "https://docs.zeek.org/en/stable/"),
+    ToolSpec("plaso_timeline", "psteal.py", "Plaso normalized forensic timeline", "timeline", TIMELINE_KINDS, frozenset({"deep"}), "https://plaso.readthedocs.io/en/latest/"),
+    ToolSpec("kaitai_dump", "ksdump", "Kaitai Struct bounded header dump", "program-structure", frozenset({"pe", "wasm"}), frozenset({"deep"}), "https://github.com/kaitai-io/kaitai_struct_visualizer"),
+    ToolSpec("ileapp", "ileapp", "iLEAPP iOS extraction artifact report", "mobile-forensics", frozenset({"zip", "tar", "gzip"}), frozenset({"deep"}), "https://github.com/abrignoni/iLEAPP"),
+    ToolSpec("aleapp", "aleapp", "ALEAPP Android extraction artifact report", "mobile-forensics", frozenset({"zip", "tar", "gzip"}), frozenset({"deep"}), "https://github.com/abrignoni/ALEAPP"),
 )
 
 
@@ -408,6 +436,180 @@ def tool_environment() -> dict[str, str]:
     return environment
 
 
+class TSharkWorkbenchError(RuntimeError):
+    """A bounded on-demand TShark operation could not be completed safely."""
+
+
+def _tshark_flatten_fields(value: Any, output: dict[str, list[str]], depth: int = 0) -> None:
+    if depth > 32:
+        return
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if isinstance(child, (str, int, float, bool)):
+                output.setdefault(str(key), []).append(str(child))
+            else:
+                _tshark_flatten_fields(child, output, depth + 1)
+    elif isinstance(value, list):
+        for child in value[:10_000]:
+            _tshark_flatten_fields(child, output, depth + 1)
+
+
+def _tshark_first(fields: dict[str, list[str]], *names: str) -> str:
+    for name in names:
+        values = fields.get(name)
+        if values:
+            return values[0]
+    return ""
+
+
+def _normalize_tshark_packets(payload: Any, maximum: int) -> list[dict[str, Any]]:
+    if not isinstance(payload, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in payload[:maximum]:
+        if not isinstance(item, dict):
+            continue
+        source = item.get("_source")
+        layers = source.get("layers") if isinstance(source, dict) else None
+        if not isinstance(layers, dict):
+            continue
+        fields: dict[str, list[str]] = {}
+        _tshark_flatten_fields(layers, fields)
+        stack = _tshark_first(fields, "frame.protocols")
+        protocols = [part for part in stack.split(":") if part]
+        protocol = protocols[-1].upper() if protocols else "FRAME"
+        tcp_stream = _tshark_first(fields, "tcp.stream")
+        udp_stream = _tshark_first(fields, "udp.stream")
+        payload_hex = _tshark_first(
+            fields, "tcp.payload", "udp.payload", "data.data", "http.file_data",
+        ).replace(":", "")[:131_072]
+        info = _tshark_first(
+            fields, "_ws.col.Info", "http.request.full_uri", "http.request.uri",
+            "dns.qry.name", "tls.handshake.extensions_server_name", "tcp.analysis.flags",
+        ) or protocol
+        rows.append({
+            "number": _tshark_first(fields, "frame.number"),
+            "time": _tshark_first(fields, "frame.time_epoch", "frame.time"),
+            "time_relative": _tshark_first(fields, "frame.time_relative"),
+            "source": _tshark_first(fields, "ip.src", "ipv6.src", "eth.src", "wlan.sa", "usb.src"),
+            "destination": _tshark_first(fields, "ip.dst", "ipv6.dst", "eth.dst", "wlan.da", "usb.dst"),
+            "source_port": _tshark_first(fields, "tcp.srcport", "udp.srcport", "sctp.srcport"),
+            "destination_port": _tshark_first(fields, "tcp.dstport", "udp.dstport", "sctp.dstport"),
+            "protocol": protocol,
+            "protocol_stack": protocols,
+            "length": _tshark_first(fields, "frame.len", "frame.cap_len"),
+            "stream_id": tcp_stream or udp_stream,
+            "tcp_stream": tcp_stream,
+            "udp_stream": udp_stream,
+            "info": display_text(info, 16_384),
+            "payload_hex": payload_hex,
+            "details": normalize_json(layers),
+        })
+    return rows
+
+
+def run_tshark_workbench(
+    path: Path,
+    *,
+    keylog_path: Path | None = None,
+    action: str,
+    display_filter: str = "",
+    packet_limit: int = 500,
+    include_raw_bytes: bool = False,
+    follow_protocol: str = "tcp",
+    stream_index: int = 0,
+    follow_mode: str = "ascii",
+    statistic: str = "protocol_hierarchy",
+    timeout: int = 30,
+    output_limit: int = 8 * 1024 * 1024,
+) -> dict[str, Any]:
+    """Run one read-only TShark workbench action using argument arrays only."""
+
+    resolution = resolve_tool("tshark")
+    if resolution is None:
+        raise TSharkWorkbenchError("TShark is not installed or visible in Windows/WSL.")
+    runner = ExternalToolRunner(timeout=max(1, min(timeout, 60)), output_limit=max(64 * 1024, min(output_limit, 8 * 1024 * 1024)))
+    # Always override the personal-profile keylog setting. With no explicitly
+    # selected same-job artifact this empty preference still allows embedded
+    # PCAPNG DSB secrets while avoiding unrelated workstation key material.
+    common = ["-2", "-n", "-r", str(path), "-o", f"tls.keylog_file:{keylog_path or ''}"]
+    if action == "packets":
+        arguments = [*common, "-c", str(max(1, min(packet_limit, 2000)))]
+        if display_filter:
+            arguments.extend(["-Y", display_filter])
+        # Plain ``-T json`` is supported by substantially older TShark builds;
+        # json-compact/no-duplicate-keys are optional newer-version flags.
+        arguments.extend(["-T", "json"])
+        if include_raw_bytes:
+            arguments.append("-x")
+    elif action == "follow":
+        protocols = {"tcp", "udp", "dccp", "tls", "dtls", "http", "http2", "quic", "mp2t", "mpeg-pes"}
+        modes = {"ascii", "hex", "raw", "yaml"}
+        if follow_protocol not in protocols or follow_mode not in modes or not 0 <= stream_index <= 1_000_000:
+            raise TSharkWorkbenchError("Unsupported follow-stream request.")
+        arguments = [*common, "-q", "-z", f"follow,{follow_protocol},{follow_mode},{stream_index}"]
+    elif action == "statistics":
+        taps: dict[str, tuple[str, ...]] = {
+            "protocol_hierarchy": ("io,phs",),
+            "io_graph": ("io,stat,1",),
+            "packet_lengths": ("plen,tree",),
+            "flow_graph": ("flow,any,network",),
+            "endpoints": ("endpoints,eth", "endpoints,ip", "endpoints,ipv6", "endpoints,tcp", "endpoints,udp", "endpoints,wlan", "endpoints,usb"),
+            "conversations": ("conv,eth", "conv,ip", "conv,ipv6", "conv,tcp", "conv,udp"),
+            "dns": ("dns,tree",),
+            "http": ("http,tree", "http_srv,tree"),
+            "http_requests": ("http_req,tree", "http_seq,tree"),
+            "http2": ("http2,tree",),
+            "icmp": ("icmp,srt", "icmpv6,srt"),
+            "sip": ("sip,stat",),
+            "rtp": ("rtp,streams",),
+            "smb2": ("smb2,srt",),
+            "expert": ("expert",),
+            "credentials": ("credentials",),
+        }
+        selected = taps.get(statistic)
+        if selected is None:
+            raise TSharkWorkbenchError("Unsupported Wireshark statistics request.")
+        arguments = [*common, "-q"]
+        for tap in selected:
+            arguments.extend(["-z", tap])
+    else:
+        raise TSharkWorkbenchError("Unsupported TShark workbench action.")
+
+    argv = runner._launch_argv(resolution, arguments)  # noqa: SLF001 - central safe launcher
+    execution = runner._execute(argv, cwd=path.parent, timeout=max(1, min(timeout, 60)))  # noqa: SLF001
+    if execution["status"] == "timed_out":
+        raise TSharkWorkbenchError("TShark reached the bounded workbench timeout.")
+    if execution["status"] != "completed" or execution["return_code"] not in {0, None}:
+        diagnostic = display_text(execution.get("stderr") or execution.get("stdout") or "TShark rejected the request.", 2_000)
+        raise TSharkWorkbenchError(diagnostic)
+
+    response: dict[str, Any] = {
+        "action": action,
+        "display_filter": display_filter if action == "packets" else "",
+        "output_truncated": bool(execution["output_truncated"]),
+        "stderr": display_text(execution.get("stderr", ""), 16_384),
+        "tool": {"name": "TShark", "source": resolution.source, "resolved": resolution.display},
+    }
+    stdout = str(execution.get("stdout") or "")
+    if action == "packets":
+        if execution["output_truncated"]:
+            raise TSharkWorkbenchError("The filtered packet tree exceeded the bounded response limit; use a narrower filter or lower packet limit.")
+        try:
+            decoded = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise TSharkWorkbenchError("TShark returned malformed packet JSON.") from exc
+        rows = _normalize_tshark_packets(decoded, max(1, min(packet_limit, 2000)))
+        response.update({"packet_rows": rows, "packet_count": len(rows), "packet_limit": packet_limit})
+    else:
+        response["output"] = display_text(stdout, 8 * 1024 * 1024)
+        if action == "follow":
+            response.update({"protocol": follow_protocol, "stream_index": stream_index, "mode": follow_mode})
+        else:
+            response["statistic"] = statistic
+    return response
+
+
 class ExternalToolRunner:
     """Run optional forensic CLIs using fixed argument arrays and hard bounds."""
 
@@ -447,7 +649,8 @@ class ExternalToolRunner:
                 "7z_extract", "tshark_http_objects", "tshark_ftp_objects", "tshark_smb_objects", "tshark_tftp_objects",
                 "tshark_imf_objects", "tshark_dicom_objects", "tshark_http2_ranges", "tcpflow", "hcxpcapngtool",
                 "pcapfix", "oleobj", "rtfobj", "tsk_recover",
-                "readpst",
+                "readpst", "bulk_extractor", "wtcdbexport", "ffmpeg_frames", "zeek",
+                "plaso_timeline", "ileapp", "aleapp",
             }:
                 results.append(self._not_run(spec, "skipped", "External payload extraction is disabled in this job's settings."))
                 continue
@@ -470,6 +673,7 @@ class ExternalToolRunner:
                     spec,
                     resolution,
                     path,
+                    kind,
                     profile,
                     password,
                     work_dir,
@@ -486,6 +690,7 @@ class ExternalToolRunner:
         spec: ToolSpec,
         resolution: ResolvedTool,
         input_path: Path,
+        input_kind: str,
         profile: str,
         password: str | None,
         work_dir: Path,
@@ -742,6 +947,33 @@ class ExternalToolRunner:
                 ]
             elif spec.tool_id == "sqlite3":
                 argv = [executable, "-readonly", "-safe", str(input_path), ".dump"]
+            elif spec.tool_id in {"lnkinfo", "sccainfo", "esedbinfo"}:
+                argv = [executable, str(input_path)]
+            elif spec.tool_id == "plistutil":
+                argv = [executable, "-i", str(input_path), "-f", "json"]
+            elif spec.tool_id == "qemu_img_info":
+                # Metadata only: do not convert, repair, rebase, resize, or
+                # request the backing chain.
+                argv = [executable, "info", "--output=json", str(input_path)]
+            elif spec.tool_id == "bulk_extractor":
+                extracted_dir = temp_dir / "bulk-extractor-output"
+                extracted_dir.mkdir()
+                argv = [executable, "-q", "-o", str(extracted_dir), str(input_path)]
+            elif spec.tool_id == "wtcdbinfo":
+                argv = [executable, str(input_path)]
+            elif spec.tool_id == "wtcdbexport":
+                extracted_dir = temp_dir / "wtcdb-export"
+                argv = [executable, "-t", str(extracted_dir), str(input_path)]
+            elif spec.tool_id == "utmpdump":
+                # Deliberately omit -r/--reverse: evidence is dump-only.
+                argv = [executable, str(input_path)]
+            elif spec.tool_id == "journalctl":
+                # --file only selects evidence. Deliberately omit verification,
+                # vacuum, rotate, flush, sync, and other state-changing actions.
+                argv = [
+                    executable, "--file", str(input_path), "--utc", "--no-pager",
+                    "--output=short-iso",
+                ]
             elif spec.tool_id == "oleid":
                 argv = [executable, str(input_path)]
             elif spec.tool_id == "olevba":
@@ -793,7 +1025,16 @@ class ExternalToolRunner:
             elif spec.tool_id == "zbarimg":
                 argv = [executable, "--quiet", "--raw", str(input_path)]
             elif spec.tool_id == "ffprobe":
-                argv = [executable, "-v", "error", "-show_format", "-show_streams", "-of", "json", str(input_path)]
+                argv = [executable, "-v", "error", "-protocol_whitelist", "file,pipe,crypto,data", "-show_format", "-show_streams", "-of", "json", str(input_path)]
+            elif spec.tool_id == "ffmpeg_frames":
+                extracted_dir = temp_dir / "frames"
+                extracted_dir.mkdir()
+                argv = [
+                    executable, "-hide_banner", "-nostdin", "-y",
+                    "-protocol_whitelist", "file,pipe,crypto,data", "-i", str(input_path),
+                    "-vf", "fps=1/5,scale=min(1280\\,iw):-2", "-frames:v", "24",
+                    str(extracted_dir / "frame_%03d.png"),
+                ]
             elif spec.tool_id == "ffmpeg_spectrogram":
                 extracted_path = temp_dir / "ffmpeg_spectrogram.png"
                 argv = [
@@ -823,13 +1064,54 @@ class ExternalToolRunner:
                 argv = [executable, "--rx", "1200", "-f", str(input_path)]
             elif spec.tool_id == "minimodem_300":
                 argv = [executable, "--rx", "300", "-f", str(input_path)]
+            elif spec.tool_id == "yara_x_dump":
+                argv = [executable, "dump", "--output-format", "json", "--no-colors", str(input_path)]
+            elif spec.tool_id == "capa":
+                argv = [executable, "-j", str(input_path)]
+            elif spec.tool_id == "floss":
+                argv = [executable, "-j", "--color", "never", str(input_path)]
+            elif spec.tool_id == "zeek":
+                extracted_dir = temp_dir / "zeek-logs"
+                extracted_dir.mkdir()
+                argv = [
+                    executable, "-C", "-r", str(input_path),
+                    "LogAscii::use_json=T", f"Log::default_logdir={extracted_dir}",
+                ]
+            elif spec.tool_id == "plaso_timeline":
+                extracted_dir = temp_dir / "plaso-timeline"
+                extracted_dir.mkdir()
+                argv = [
+                    executable, "--source", str(input_path),
+                    "--write", str(extracted_dir / "timeline.l2tcsv"),
+                    "--storage-file", str(extracted_dir / "timeline.plaso"),
+                    "-o", "l2tcsv", "--status-view", "none",
+                ]
+            elif spec.tool_id == "kaitai_dump":
+                schema_name = {"pe": "pe_header.ksy", "wasm": "wasm_header.ksy"}.get(input_kind)
+                if not schema_name:
+                    return self._not_run(spec, "skipped", f"No bundled Kaitai schema is registered for {input_kind}.", executable=resolution.display)
+                schema_path = Path(__file__).with_name("kaitai_specs") / schema_name
+                argv = [executable, "-f", "json", str(input_path), str(schema_path)]
+            elif spec.tool_id in {"ileapp", "aleapp"}:
+                extracted_dir = temp_dir / f"{spec.tool_id}-report"
+                extracted_dir.mkdir()
+                extraction_type = {"zip": "zip", "tar": "tar", "gzip": "gz"}.get(input_kind)
+                if not extraction_type:
+                    return self._not_run(spec, "skipped", f"{spec.name} requires a ZIP, TAR, or GZIP extraction archive.", executable=resolution.display)
+                argv = [executable, "-t", extraction_type, "-i", str(input_path), "-o", str(extracted_dir)]
             else:
                 return self._not_run(spec, "skipped", "No fixed invocation is registered.", executable=resolution.display)
 
             started_at = utc_now()
             start = time.monotonic()
             launch_argv = self._launch_argv(resolution, argv[1:])
-            execution = self._execute(launch_argv, cwd=execution_cwd, stdin_data=stdin_data)
+            if spec.tool_id == "floss":
+                execution = self._execute(
+                    launch_argv, cwd=execution_cwd, stdin_data=stdin_data,
+                    env_overrides={"FLOSS_CACHE_ENABLE": "0", "FLOSS_SAVE_WORKSPACE": "0"},
+                )
+            else:
+                execution = self._execute(launch_argv, cwd=execution_cwd, stdin_data=stdin_data)
             if spec.tool_id in {"fsstat", "fls", "tsk_recover"} and len(disk_offsets) > 1:
                 successful = int(execution["status"] == "completed")
                 deadline = start + self.timeout
@@ -997,14 +1279,15 @@ class ExternalToolRunner:
                     "transformation": f"Place {fragment_count} HTTP/2 DATA fragment(s) at Content-Range byte offsets",
                     "offset": None, "kind": sniff_kind(recovered, label),
                 })
-            if spec.tool_id in {"exiftool", "ffprobe", "mediainfo"} and stdout:
+            json_tools = {"ffprobe", "mediainfo", "plistutil", "qemu_img_info", "yara_x_dump", "capa", "floss", "kaitai_dump"}
+            if spec.tool_id in {"exiftool", *json_tools} and stdout:
                 try:
                     parsed = json.loads(stdout)
                     if spec.tool_id == "exiftool" and isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
                         metadata = dict(parsed[0])
                         metadata.pop("SourceFile", None)
                         method["metadata"] = normalize_json(metadata)
-                    elif spec.tool_id in {"ffprobe", "mediainfo"} and isinstance(parsed, dict):
+                    elif spec.tool_id in json_tools and isinstance(parsed, dict):
                         method["metadata"] = normalize_json(parsed)
                 except (ValueError, TypeError) as exc:
                     method["metadata_parse_error"] = f"{type(exc).__name__}: {display_text(exc, 200)}"
@@ -1361,7 +1644,16 @@ class ExternalToolRunner:
         direct = _windows_path_to_wsl(value)
         if direct != value:
             return direct
+        if value.startswith("tls.keylog_file:"):
+            prefix = "tls.keylog_file:"
+            return prefix + _windows_path_to_wsl(value[len(prefix):])
         for prefix in ("-o", "--out="):
+            if value.startswith(prefix):
+                suffix = value[len(prefix):]
+                converted = _windows_path_to_wsl(suffix)
+                if converted != suffix:
+                    return prefix + converted
+        for prefix in ("Log::default_logdir=", "--source=", "--write=", "--storage-file="):
             if value.startswith(prefix):
                 suffix = value[len(prefix):]
                 converted = _windows_path_to_wsl(suffix)
@@ -1408,11 +1700,20 @@ class ExternalToolRunner:
         cwd: Path,
         timeout: int | None = None,
         stdin_data: bytes | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         status = "completed"
         output_truncated = False
         return_code: int | None = None
         with tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(mode="w+b") as stderr_file:
+            environment = tool_environment()
+            for key, value in (env_overrides or {}).items():
+                if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", key):
+                    environment[key] = display_text(value, 256)
+            if env_overrides and os.name == "nt":
+                inherited = [item for item in environment.get("WSLENV", "").split(":") if item]
+                inherited.extend(key for key in env_overrides if key not in inherited)
+                environment["WSLENV"] = ":".join(inherited)
             kwargs: dict[str, Any] = {
                 "args": argv,
                 "cwd": str(cwd),
@@ -1421,7 +1722,7 @@ class ExternalToolRunner:
                 "stderr": stderr_file,
                 "shell": False,
                 "close_fds": True,
-                "env": tool_environment(),
+                "env": environment,
             }
             if os.name == "nt":
                 kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -1519,6 +1820,13 @@ class ExternalToolRunner:
             "ffprobe": ["-version"], "ffmpeg_spectrogram": ["-version"], "ffmpeg_pcm": ["-version"],
             "sox_stats": ["--version"], "sox_spectrogram": ["--version"],
             "mediainfo": ["--Version"], "multimon_ng": ["--help"], "minimodem": ["--version"],
+            "lnkinfo": ["-V"], "sccainfo": ["-V"], "esedbinfo": ["-V"],
+            "plistutil": ["--version"], "qemu_img_info": ["--version"], "bulk_extractor": ["-V"],
+            "wtcdbinfo": ["-V"], "wtcdbexport": ["-V"], "utmpdump": ["--version"],
+            "journalctl": ["--version"],
+            "yara_x_dump": ["--version"], "capa": ["--version"], "floss": ["--version"],
+            "zeek": ["--version"], "plaso_timeline": ["--version"], "kaitai_dump": ["--version"],
+            "ileapp": ["--version"], "aleapp": ["--version"], "ffmpeg_frames": ["-version"],
         }.get(spec.tool_id, ["--version"])
         result = self._execute(self._launch_argv(resolution, version_args), cwd=cwd, timeout=4)
         combined = (result["stdout"] or result["stderr"]).strip().splitlines()

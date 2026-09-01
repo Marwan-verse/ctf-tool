@@ -8,7 +8,37 @@ import zipfile
 import zlib
 from pathlib import Path
 
-from app.analyzers.formats import analyze_format, parse_bmp, parse_png, propose_header_repairs
+from app.analyzers.formats import analyze_format, parse_bmp, parse_gif, parse_png, propose_header_repairs
+
+
+def _png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
+    return struct.pack(">I", len(payload)) + chunk_type + payload + struct.pack(">I", binascii.crc32(chunk_type + payload) & 0xFFFFFFFF)
+
+
+def _rgb_png(width: int, height: int) -> bytes:
+    scanlines = bytearray()
+    for y in range(height):
+        scanlines.append(0)
+        for x in range(width):
+            scanlines.extend(((x * 41) & 0xFF, (y * 67) & 0xFF, ((x + y) * 23) & 0xFF))
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IDAT", zlib.compress(bytes(scanlines), 9)) + _png_chunk(b"IEND", b"")
+
+
+def _chunked_rgb_png(width: int, height: int, chunk_size: int = 512) -> bytes:
+    compressor = zlib.compressobj(level=9, wbits=15)
+    compressed = bytearray()
+    for y in range(height):
+        row = bytearray([0])
+        for x in range(width):
+            row.extend(((x // 4 % 8) * 24, (y // 4 % 8) * 24, ((x + y) // 8 % 8) * 24))
+        compressed.extend(compressor.compress(bytes(row)))
+        if y % 32 == 31 and y + 1 < height:
+            compressed.extend(compressor.flush(zlib.Z_FULL_FLUSH))
+    compressed.extend(compressor.flush())
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    idats = b"".join(_png_chunk(b"IDAT", bytes(compressed[offset:offset + chunk_size])) for offset in range(0, len(compressed), chunk_size))
+    return b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr) + idats + _png_chunk(b"IEND", b"")
 
 
 def test_png_text_metadata_is_extracted_with_provenance(metadata_png: Path) -> None:
@@ -42,6 +72,55 @@ def test_bad_png_crc_is_reported_and_deep_mode_proposes_copy_only_repair(malform
     assert parse_png(repair["data"], profile="quick")["properties"]["bad_crc_count"] == 0
     # The derived repair must not mutate the evidence file.
     assert malformed_png.read_bytes() == source
+
+
+def test_png_hidden_scanlines_get_an_exact_uncrop_candidate() -> None:
+    original = _rgb_png(4, 3)
+    cropped_header = bytearray(original)
+    ihdr = bytearray(cropped_header[16:29])
+    ihdr[4:8] = (1).to_bytes(4, "big")
+    cropped_header[16:29] = ihdr
+    cropped_header[29:33] = struct.pack(">I", binascii.crc32(b"IHDR" + ihdr) & 0xFFFFFFFF)
+
+    result = parse_png(bytes(cropped_header), profile="balanced")
+
+    [repair] = [item for item in result["repairs"] if item["label"] == "png_hidden_scanlines_uncropped"]
+    assert repair["data"] == original
+    assert repair["details"]["unknown_pixels_filled"] is False
+    assert any(finding["title"] == "PNG canvas hides encoded pixels" for finding in result["findings"])
+
+
+def test_png_hidden_columns_get_an_exact_uncrop_candidate() -> None:
+    original = _rgb_png(4, 3)
+    cropped_header = bytearray(original)
+    ihdr = bytearray(cropped_header[16:29])
+    ihdr[:4] = (2).to_bytes(4, "big")
+    cropped_header[16:29] = ihdr
+    cropped_header[29:33] = struct.pack(">I", binascii.crc32(b"IHDR" + ihdr) & 0xFFFFFFFF)
+
+    result = parse_png(bytes(cropped_header), profile="balanced")
+
+    [repair] = [item for item in result["repairs"] if item["label"] == "png_hidden_columns_uncropped"]
+    assert repair["data"] == original
+    assert repair["details"]["recovered_width"] == 4
+
+
+def test_png_acropalypse_residue_gets_a_partial_uncrop_candidate() -> None:
+    original = _chunked_rgb_png(64, 256)
+    cropped = _rgb_png(8, 8)
+    assert len(cropped) < 41 + 512
+    vulnerable_save = bytearray(original)
+    vulnerable_save[:len(cropped)] = cropped
+
+    result = parse_png(bytes(vulnerable_save), profile="balanced")
+
+    [repair] = [item for item in result["repairs"] if item["label"] == "png_acropalypse_partial_uncrop"]
+    assert repair["details"]["recovered_width"] == 64
+    assert repair["details"]["partial_recovery"] is True
+    repaired_report = parse_png(repair["data"], profile="quick")
+    assert repaired_report["properties"]["width"] == 64
+    assert repaired_report["properties"]["bad_crc_count"] == 0
+    assert any(finding["title"] == "Recoverable cropped screenshot residue" for finding in result["findings"])
 
 
 def test_malformed_input_returns_a_report_instead_of_raising() -> None:
@@ -190,3 +269,40 @@ def test_corrupted_bmp_height_gets_exact_row_stride_repair() -> None:
 
     assert int.from_bytes(candidate["data"][22:26], "little", signed=True) == height
     assert parse_bmp(candidate["data"], profile="quick")["properties"]["height"] == height
+
+
+def test_bmp_declared_pixel_array_exposes_hidden_complete_rows() -> None:
+    width, actual_height, stored_height, bpp = 4, 3, 1, 24
+    row_stride = ((width * bpp + 31) // 32) * 4
+    pixel_offset = 54
+    bmp = bytearray(pixel_offset + row_stride * actual_height)
+    bmp[:2] = b"BM"
+    struct.pack_into("<I", bmp, 2, len(bmp))
+    struct.pack_into("<I", bmp, 10, pixel_offset)
+    struct.pack_into("<IiiHHII", bmp, 14, 40, width, stored_height, 1, bpp, 0, row_stride * actual_height)
+
+    result = parse_bmp(bytes(bmp), profile="balanced")
+
+    [repair] = [item for item in result["repairs"] if item["label"] == "bmp_hidden_rows_uncropped"]
+    assert int.from_bytes(repair["data"][22:26], "little", signed=True) == actual_height
+    assert repair["details"]["unknown_pixels_filled"] is False
+    assert any(finding["title"] == "BMP header hides complete pixel rows" for finding in result["findings"])
+
+
+def test_gif_frame_extents_expand_hidden_logical_canvas() -> None:
+    # The parser needs only a structurally complete frame stream here; the
+    # frame descriptor itself proves the canvas extent independently of LZW.
+    source = (
+        b"GIF89a"
+        + struct.pack("<HHBBB", 1, 1, 0, 0, 0)
+        + b"\x2c"
+        + struct.pack("<HHHHB", 1, 2, 2, 3, 0)
+        + b"\x02\x02\x44\x01\x00\x3b"
+    )
+
+    result = parse_gif(source, profile="balanced")
+
+    [repair] = [item for item in result["repairs"] if item["label"] == "gif_hidden_canvas_uncropped"]
+    assert struct.unpack_from("<HH", repair["data"], 6) == (3, 5)
+    assert repair["details"]["unknown_pixels_filled"] is False
+    assert any(finding["title"] == "GIF frames extend outside the logical canvas" for finding in result["findings"])

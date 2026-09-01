@@ -127,6 +127,6 @@ def test_zip_export_uses_generated_paths_and_skips_escape(tmp_path: Path) -> Non
         names = archive.namelist()
         manifest = json.loads(archive.read("manifest.json"))
     assert names[:2] == ["report.json", "report.html"]
-    assert "artifacts/safe-id/hostile.bin" in names
+    assert "artifacts/safe-id/hostile.txt" in names
     assert all(".." not in name and not name.startswith("/") for name in names)
     assert [item["id"] for item in manifest["artifacts"]] == ["safe-id"]

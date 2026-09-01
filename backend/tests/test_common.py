@@ -8,6 +8,7 @@ import pytest
 from app.analyzers.common import (
     AnalyzerCancelled,
     bounded_read,
+    bounded_read_and_sha256,
     check_cancelled,
     find_magic_offsets,
     iter_ascii_strings,
@@ -44,12 +45,37 @@ def test_bounded_read_reports_truncation(tmp_path: Path) -> None:
     assert bounded_read(source, 10) == (b"0123456789", False)
 
 
+def test_bounded_read_and_hash_uses_complete_file_integrity(tmp_path: Path) -> None:
+    source = tmp_path / "evidence.bin"
+    payload = b"0123456789" * 1000
+    source.write_bytes(payload)
+
+    data, truncated, digest, size = bounded_read_and_sha256(source, 37, chunk_size=31)
+
+    assert data == payload[:37]
+    assert truncated is True
+    assert digest == hashlib.sha256(payload).hexdigest()
+    assert size == len(payload)
+
+
 def test_string_scanners_preserve_offsets() -> None:
     ascii_hits = list(iter_ascii_strings(b"\0\0flag{ascii}\0"))
-    utf16_hits = list(iter_utf16_strings(b"XX" + "flag{utf16}".encode("utf-16-le") + b"\0\0"))
+    utf16_hits = list(
+        iter_utf16_strings(
+            b"X" + "flag{utf16}".encode("utf-16-le") + b"\0" + "flag{big}".encode("utf-16-be")
+        )
+    )
 
     assert ascii_hits == [{"encoding": "ascii", "offset": 2, "text": "flag{ascii}"}]
-    assert any(hit["text"] == "flag{utf16}" for hit in utf16_hits)
+    offsets = {hit["text"]: hit["offset"] for hit in utf16_hits}
+    assert offsets["flag{utf16}"] == 1
+    assert offsets["flag{big}"] == 24
+
+
+def test_ascii_scanner_flushes_a_string_at_end_of_file() -> None:
+    assert list(iter_ascii_strings(b"\0flag{at_eof}")) == [
+        {"encoding": "ascii", "offset": 1, "text": "flag{at_eof}"}
+    ]
 
 
 def test_magic_scan_finds_embedded_archive_offset() -> None:

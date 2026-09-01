@@ -3,18 +3,51 @@ from __future__ import annotations
 import base64
 import binascii
 import bz2
+import codecs
+import datetime as dt
 import email.policy
+import html
+import io
 import ipaddress
 import itertools
+import json
 import re
+import sqlite3
 import struct
+import time
+import zipfile
 import zlib
 from collections import Counter, defaultdict
 from email.parser import BytesParser
 from typing import Any, Callable, Iterable
 
+from .artifacts import (
+    parse_android_backup,
+    parse_binarycookies,
+    parse_ds_store,
+    parse_ese,
+    parse_ios_mbdb,
+    parse_jumplist,
+    parse_leveldb,
+    parse_lnk,
+    parse_mft,
+    parse_mozlz4,
+    parse_plist,
+    parse_prefetch,
+    parse_recycle_bin_i,
+    parse_sqlite_journal,
+    parse_sqlite_wal,
+    parse_systemd_journal,
+    parse_thumbcache,
+    parse_utmp,
+    parse_usn,
+    parse_virtual_disk,
+)
 from .common import byte_entropy, display_text, iter_ascii_strings, iter_utf16_strings, safe_label, sniff_kind
 from .compression import DECODERS, CompressionError
+from .programs import parse_dex, parse_elf, parse_java_class, parse_macho, parse_pe, parse_wasm
+from .structured import parse_bencode, parse_cbor, parse_msgpack, parse_protobuf
+from .video import parse_avi, parse_ebml_video, parse_iso_bmff
 
 
 def analyze_format(kind: str, data: bytes, *, profile: str = "balanced") -> dict[str, Any]:
@@ -26,13 +59,62 @@ def analyze_format(kind: str, data: bytes, *, profile: str = "balanced") -> dict
         "webp": parse_webp,
         "tiff": parse_tiff,
         "ico": parse_ico,
+        "mp4": lambda source, selected: parse_iso_bmff(source, selected, kind="mp4"),
+        "mov": lambda source, selected: parse_iso_bmff(source, selected, kind="mov"),
+        "matroska": lambda source, selected: parse_ebml_video(source, selected, kind="matroska"),
+        "webm": lambda source, selected: parse_ebml_video(source, selected, kind="webm"),
+        "avi": parse_avi,
+        "pe": parse_pe,
+        "elf": parse_elf,
+        "macho": parse_macho,
+        "wasm": parse_wasm,
+        "dex": parse_dex,
+        "java_class": parse_java_class,
+        "bencode": parse_bencode,
+        "cbor": parse_cbor,
+        "msgpack": parse_msgpack,
+        "protobuf": parse_protobuf,
         "pdf": parse_pdf,
+        "text": parse_text,
+        "docx": lambda source, selected: parse_document_package(source, selected, package_kind="docx"),
+        "xlsx": lambda source, selected: parse_document_package(source, selected, package_kind="xlsx"),
+        "pptx": lambda source, selected: parse_document_package(source, selected, package_kind="pptx"),
+        "odt": lambda source, selected: parse_document_package(source, selected, package_kind="odt"),
+        "ods": lambda source, selected: parse_document_package(source, selected, package_kind="ods"),
+        "odp": lambda source, selected: parse_document_package(source, selected, package_kind="odp"),
+        "epub": lambda source, selected: parse_document_package(source, selected, package_kind="epub"),
+        "android_backup": parse_android_backup,
+        "binarycookies": parse_binarycookies,
+        "ds_store": parse_ds_store,
+        "plist": parse_plist,
+        "lnk": parse_lnk,
+        "jumplist": parse_jumplist,
+        "prefetch": parse_prefetch,
+        "mft": parse_mft,
+        "usn": parse_usn,
+        "recycle_bin_i": parse_recycle_bin_i,
+        "ese": parse_ese,
+        "qcow": lambda source, selected: parse_virtual_disk(source, selected, disk_kind="qcow"),
+        "vmdk": lambda source, selected: parse_virtual_disk(source, selected, disk_kind="vmdk"),
+        "vhdx": lambda source, selected: parse_virtual_disk(source, selected, disk_kind="vhdx"),
+        "vdi": lambda source, selected: parse_virtual_disk(source, selected, disk_kind="vdi"),
+        "dmg": lambda source, selected: parse_virtual_disk(source, selected, disk_kind="dmg"),
+        "aff": lambda source, selected: parse_virtual_disk(source, selected, disk_kind="aff"),
         "pcap": parse_pcap,
         "pcapng": parse_pcapng,
         "sqlite": parse_sqlite,
+        "sqlite_wal": parse_sqlite_wal,
+        "sqlite_journal": parse_sqlite_journal,
+        "thumbcache": parse_thumbcache,
+        "utmp": parse_utmp,
+        "ios_mbdb": parse_ios_mbdb,
+        "mozlz4": parse_mozlz4,
+        "leveldb": parse_leveldb,
         "ole": parse_ole,
         "rtf": parse_rtf,
         "eml": parse_eml,
+        "mbox": parse_mbox,
+        "systemd_journal": parse_systemd_journal,
         "disk": parse_disk,
         "ewf": parse_ewf,
         "registry": parse_registry,
@@ -81,6 +163,154 @@ def _finding(severity: str, category: str, title: str, description: str, **detai
         "description": description,
         "details": details,
     }
+
+
+def _decode_text_document(data: bytes) -> tuple[str, str]:
+    """Decode a textual evidence item without treating arbitrary bytes as text.
+
+    ``sniff_kind`` already establishes the ASCII/whitespace threshold before
+    this helper is called.  BOMs and UTF-16's characteristic NUL lanes are
+    handled explicitly so text-only CTF challenges keep their original
+    readable content instead of being split into individual string fragments.
+    """
+
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data.decode("utf-8-sig", "replace"), "utf-8"
+    if data.startswith(b"\xff\xfe"):
+        return data.decode("utf-16", "replace"), "utf-16-le"
+    if data.startswith(b"\xfe\xff"):
+        return data.decode("utf-16", "replace"), "utf-16-be"
+    sample = data[: min(len(data), 16 * 1024)]
+    if sample and sample.count(0) / len(sample) >= 0.20:
+        little_endian_nuls = sum(1 for index in range(1, len(sample), 2) if sample[index] == 0)
+        big_endian_nuls = sum(1 for index in range(0, len(sample), 2) if sample[index] == 0)
+        encoding = "utf-16-le" if little_endian_nuls >= big_endian_nuls else "utf-16-be"
+        try:
+            return data.decode(encoding), encoding
+        except UnicodeDecodeError:
+            pass
+    try:
+        return data.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        # The format classifier has already proved this is text. Windows-1252
+        # is a useful lossless-ish fallback for older CTF fixtures.
+        return data.decode("cp1252", "replace"), "windows-1252"
+
+
+def _text_document_derivations(text: str) -> list[dict[str, Any]]:
+    """Expose encoded markup/JSON text without executing document content.
+
+    These are deliberately small, deterministic normalizations.  They cover
+    common CTF fixtures such as HTML entities, XML text broken across tags,
+    and JSON ``\\uXXXX`` escapes, while the original document remains the
+    primary record.
+    """
+
+    derived: list[dict[str, Any]] = []
+    bounded = text[:2_000_000]
+    if "&" in bounded:
+        unescaped = html.unescape(bounded)
+        if unescaped != bounded:
+            derived.append({
+                "encoding": "html-entity-decoded", "offset": 0,
+                "text": display_text(unescaped, 2_000_000), "source": "text HTML/XML entity decoding",
+                "confidence_hint": 9,
+                "transform_chain": ["decode text", "HTML/XML entity unescape"],
+            })
+    if "<" in bounded and ">" in bounded:
+        # Tags are removed as delimiters *and* as empty joins.  The joined
+        # form matters when a flag is split across adjacent XML text runs.
+        without_tags = re.sub(r"<[^>]{0,4096}>", "", bounded)
+        without_tags = html.unescape(without_tags)
+        if without_tags and without_tags != bounded:
+            derived.append({
+                "encoding": "markup-text", "offset": 0,
+                "text": display_text(without_tags, 2_000_000), "source": "text markup nodes",
+                "confidence_hint": 9,
+                "transform_chain": ["decode text", "remove bounded markup tags", "HTML/XML entity unescape"],
+            })
+    stripped = bounded.lstrip()
+    if "\\u" in bounded and stripped[:1] in {"{", "[", "\""}:
+        try:
+            parsed = json.loads(bounded)
+        except (TypeError, ValueError, RecursionError):
+            parsed = None
+        if parsed is not None:
+            values: list[str] = []
+            pending: list[Any] = [parsed]
+            while pending and len(values) < 2_000:
+                current = pending.pop()
+                if isinstance(current, str):
+                    values.append(current)
+                elif isinstance(current, dict):
+                    for key, value in list(current.items())[:2_000]:
+                        pending.append(value)
+                        pending.append(str(key))
+                elif isinstance(current, list):
+                    pending.extend(reversed(current[:2_000]))
+            # A JSON string can deliberately contain a *literal* ``\uXXXX``
+            # sequence by escaping its backslash. Decode only that narrow,
+            # deterministic form after the JSON parser has already handled
+            # normal escapes; do not invoke the broad ``unicode_escape`` codec.
+            decoded_values = [
+                re.sub(
+                    r"\\u([0-9A-Fa-f]{4})",
+                    lambda match: chr(int(match.group(1), 16)),
+                    value,
+                )
+                for value in values
+            ]
+            decoded = "\n".join(value for value in decoded_values if value)
+            if decoded:
+                derived.append({
+                    "encoding": "json-decoded", "offset": 0,
+                    "text": display_text(decoded, 2_000_000), "source": "text JSON decoded strings",
+                    "confidence_hint": 9,
+                    "transform_chain": ["parse JSON without object hooks", "collect string keys and values"],
+                })
+                compact = "".join(value for value in decoded_values if value)
+                if len(values) > 1 and compact and len(compact) <= 2_000_000:
+                    derived.append({
+                        "encoding": "json-decoded-compact", "offset": 0,
+                        "text": compact, "source": "text JSON adjacent strings",
+                        "confidence_hint": 8,
+                        "transform_chain": ["parse JSON without object hooks", "join adjacent string values"],
+                    })
+    return derived
+
+
+def parse_text(data: bytes, profile: str = "balanced") -> dict[str, Any]:
+    """Record complete, bounded plain-text evidence for CTF decoding.
+
+    Unlike the generic strings pass, this preserves newlines and adjacent
+    short tokens. That is important for challenges that hide an encoded value
+    across lines, whitespace, JSON, XML, CSV, or a short configuration file.
+    """
+
+    result = _result("text")
+    text, encoding = _decode_text_document(data)
+    visible = display_text(text, 2_000_000)
+    if not visible:
+        result["findings"].append(_finding(
+            "warning", "document", "Text document contains no displayable characters",
+            "The file was classified as text, but its bounded content has no displayable characters.",
+        ))
+        return result
+    result["properties"].update({
+        "encoding": encoding,
+        "character_count": len(visible),
+        "line_count": visible.count("\n") + (1 if visible else 0),
+        "truncated": len(visible) < len(text),
+    })
+    result["text_records"].append({
+        "encoding": encoding,
+        "offset": 0,
+        "text": visible,
+        "source": "plain-text-document",
+        "confidence_hint": 9,
+    })
+    result["text_records"].extend(_text_document_derivations(visible))
+    return result
 
 
 _PCAP_FLAG_PREFIXES = (
@@ -476,6 +706,28 @@ def _pcap_http_message(payload: bytes) -> dict[str, Any] | None:
         "filename": filename_match.group(1).strip() if filename_match else "",
         "headers": header_map, "body": body,
     }
+
+
+def _pcap_http_basic_credential(headers: dict[str, str]) -> tuple[str, str] | None:
+    """Decode one bounded HTTP Basic credential without treating it as crypto."""
+
+    value = headers.get("authorization", "").strip()
+    scheme, separator, token = value.partition(" ")
+    token = re.sub(r"\s+", "", token)
+    if not separator or scheme.casefold() != "basic" or not 4 <= len(token) <= 2048:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", token):
+        return None
+    try:
+        decoded = base64.b64decode(token + "=" * (-len(token) % 4), validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    if not 1 <= len(decoded) <= 1024 or b":" not in decoded:
+        return None
+    username, secret = decoded.split(b":", 1)
+    if not username or any(byte < 32 or byte == 127 for byte in decoded):
+        return None
+    return username.decode("utf-8", "replace"), secret.decode("utf-8", "replace")
 
 
 def _pcap_tls_version(value: int) -> str:
@@ -2870,6 +3122,36 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
                 if register_candidate(candidate, f"pcap-field-{name}", None, f"{name} byte stream minus {delta}"):
                     field_recoveries += 1
 
+    # HTTP Basic is merely Base64 encoding, not encryption. CTFs frequently
+    # place a flag or a password for an exported object in this header, so
+    # decode it locally and feed its bounded value into the ordinary candidate
+    # pipeline. The properties retain only non-secret routing context.
+    http_basic_credentials: list[dict[str, Any]] = []
+    http_basic_seen: set[tuple[str, str, str, str]] = set()
+    for message in http_messages:
+        credential = _pcap_http_basic_credential(dict(message.get("headers") or {}))
+        if credential is None:
+            continue
+        username, secret = credential
+        key = (
+            str(message.get("source") or ""), str(message.get("destination") or ""),
+            str(message.get("target") or ""), f"{username}:{secret}",
+        )
+        if key in http_basic_seen or len(http_basic_credentials) >= 256:
+            continue
+        http_basic_seen.add(key)
+        http_basic_credentials.append({
+            "packet": message.get("packet"), "source": key[0], "destination": key[1],
+            "host": str(message.get("host") or ""), "target": key[2], "username": username,
+        })
+        decoded = f"{username}:{secret}".encode("utf-8", "replace")
+        add_text(
+            decoded.decode("utf-8", "replace"), "pcap-http-basic-authorization", None, 10,
+            ["HTTP Authorization: Basic Base64 decode"],
+        )
+        direct_flag_hits.update(_pcap_flag_values(decoded))
+        try_variants(secret.encode("utf-8", "replace"), "http-basic-secret", None, include_direct=True)
+
     # IMSI/XOR HTTP uploads from the rogue-cell challenge remain a first-class
     # correlation because the key is not inferable from a generic decoder.
     post_groups: defaultdict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -2915,7 +3197,8 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
         "http2_data_streams": len(http2_streams), "http2_recoveries": http2_exports,
         "mqtt_publishes": mqtt_publishes, "mqtt_topics": sorted(mqtt_topics)[:1_024],
         "websocket_messages": websocket_messages, "modbus_messages": modbus_messages,
-        "cleartext_credentials": cleartext_credentials, "bittorrent_dht_info_hashes": dht_info_hashes,
+        "cleartext_credentials": cleartext_credentials, "http_basic_credentials": http_basic_credentials,
+        "bittorrent_dht_info_hashes": dht_info_hashes,
         "can_frames": len(can_frames), "can_identifiers": sorted(f"0x{identifier:X}" for identifier in can_groups)[:4_096],
         "can_isotp_messages": can_messages[:4_096], "can_recoveries": can_recoveries,
         "rtp_streams": len(rtp_groups), "rtp_dtmf_events": rtp_dtmf[:4_096], "rtp_audio_exports": rtp_audio_exports,
@@ -2938,6 +3221,8 @@ def _analyze_capture_records(result: dict[str, Any], records: list[dict[str, Any
         result["findings"].append(_finding("info", "network-object", "TFTP object reconstructed", "RRQ/WRQ and DATA blocks were reassembled into child artifacts for recursive analysis.", objects=[{key: value for key, value in item.items() if key != "data"} for item in tftp_objects]))
     if cleartext_credentials:
         result["findings"].append(_finding("warning", "network-credentials", "Cleartext authentication commands recovered", "FTP/Telnet/mail authentication commands were observed in a reassembled TCP stream.", count=len(cleartext_credentials)))
+    if http_basic_credentials:
+        result["findings"].append(_finding("warning", "network-credentials", "HTTP Basic authorization decoded", "HTTP Basic credentials are Base64-encoded rather than encrypted. Their decoded values were tested locally for flags and bounded transform candidates; only endpoint and username context is retained in properties.", count=len(http_basic_credentials)))
     if dhcp_messages:
         result["findings"].append(_finding("info", "network-dhcp", "DHCP option evidence decoded", "BOOTP/DHCP hostname, domain, vendor, user-class, boot-file, and server options were decoded and tested as CTF clue channels.", messages=len(dhcp_messages)))
     if coap_messages:
@@ -3238,8 +3523,234 @@ def parse_pcapng(data: bytes, profile: str = "balanced") -> dict[str, Any]:
     return analyzed
 
 
+_FORENSIC_SQLITE_QUERIES: tuple[tuple[str, frozenset[str], str, dict[str, str]], ...] = (
+    (
+        "chromium-visit", frozenset({"urls", "visits"}),
+        "SELECT v.visit_time, u.url, u.title, u.visit_count, v.transition FROM visits AS v JOIN urls AS u ON u.id = v.url LIMIT ?",
+        {"visit_time": "webkit"},
+    ),
+    (
+        "chromium-search", frozenset({"urls", "keyword_search_terms"}),
+        "SELECT k.term, u.url FROM keyword_search_terms AS k JOIN urls AS u ON u.id = k.url_id LIMIT ?",
+        {},
+    ),
+    (
+        "chromium-download", frozenset({"downloads"}),
+        "SELECT target_path, tab_url, referrer, start_time, end_time, total_bytes, state, danger_type FROM downloads LIMIT ?",
+        {"start_time": "webkit", "end_time": "webkit"},
+    ),
+    (
+        "firefox-visit", frozenset({"moz_places", "moz_historyvisits"}),
+        "SELECT h.visit_date, p.url, p.title, p.visit_count, h.visit_type FROM moz_historyvisits AS h JOIN moz_places AS p ON p.id = h.place_id LIMIT ?",
+        {"visit_date": "unix_us"},
+    ),
+    (
+        "firefox-bookmark", frozenset({"moz_places", "moz_bookmarks"}),
+        "SELECT b.title, p.url, b.dateAdded, b.lastModified FROM moz_bookmarks AS b LEFT JOIN moz_places AS p ON p.id = b.fk LIMIT ?",
+        {"dateAdded": "unix_us", "lastModified": "unix_us"},
+    ),
+    (
+        "firefox-cookie", frozenset({"moz_cookies"}),
+        "SELECT host, name, value, path, expiry, lastAccessed, creationTime, isSecure, isHttpOnly FROM moz_cookies LIMIT ?",
+        {"expiry": "unix_s", "lastAccessed": "unix_us", "creationTime": "unix_us"},
+    ),
+    (
+        "firefox-form-history", frozenset({"moz_formhistory"}),
+        "SELECT fieldname, value, timesUsed, firstUsed, lastUsed FROM moz_formhistory LIMIT ?",
+        {"firstUsed": "unix_us", "lastUsed": "unix_us"},
+    ),
+    (
+        "safari-visit", frozenset({"history_items", "history_visits"}),
+        "SELECT v.visit_time, i.url, i.title, i.visit_count FROM history_visits AS v JOIN history_items AS i ON i.id = v.history_item LIMIT ?",
+        {"visit_time": "apple"},
+    ),
+    (
+        "windows-timeline", frozenset({"Activity"}),
+        "SELECT AppId, Payload, StartTime, EndTime, LastModifiedTime, ClipboardPayload, ActivityType, ActivityStatus FROM Activity LIMIT ?",
+        {"StartTime": "unix_s", "EndTime": "unix_s", "LastModifiedTime": "unix_s"},
+    ),
+    (
+        "windows-timeline-core", frozenset({"Activity"}),
+        "SELECT AppId, Payload, StartTime, EndTime, LastModifiedTime, ActivityType FROM Activity LIMIT ?",
+        {"StartTime": "unix_s", "EndTime": "unix_s", "LastModifiedTime": "unix_s"},
+    ),
+    (
+        "macos-quarantine", frozenset({"LSQuarantineEvent"}),
+        "SELECT LSQuarantineTimeStamp, LSQuarantineAgentName, LSQuarantineDataURLString, LSQuarantineOriginURLString, LSQuarantineSenderName FROM LSQuarantineEvent LIMIT ?",
+        {"LSQuarantineTimeStamp": "apple"},
+    ),
+    (
+        "ios-message", frozenset({"message", "handle"}),
+        "SELECT m.text, m.date, m.is_from_me, m.service, h.id AS handle FROM message AS m LEFT JOIN handle AS h ON h.ROWID = m.handle_id LIMIT ?",
+        {"date": "apple_auto"},
+    ),
+    (
+        "ios-message-core", frozenset({"message", "handle"}),
+        "SELECT m.text, m.date, m.is_from_me, h.id AS handle FROM message AS m LEFT JOIN handle AS h ON h.ROWID = m.handle_id LIMIT ?",
+        {"date": "apple_auto"},
+    ),
+    (
+        "android-sms", frozenset({"sms"}),
+        "SELECT _id, address, date, type, body, read FROM sms LIMIT ?",
+        {"date": "unix_ms"},
+    ),
+)
+
+
+def _browser_time(value: Any, epoch: str) -> str | None:
+    try:
+        numeric = float(value)
+        if epoch == "webkit":
+            moment = dt.datetime(1601, 1, 1, tzinfo=dt.UTC) + dt.timedelta(microseconds=numeric)
+        elif epoch == "unix_us":
+            moment = dt.datetime(1970, 1, 1, tzinfo=dt.UTC) + dt.timedelta(microseconds=numeric)
+        elif epoch == "unix_s":
+            moment = dt.datetime(1970, 1, 1, tzinfo=dt.UTC) + dt.timedelta(seconds=numeric)
+        elif epoch == "unix_ms":
+            moment = dt.datetime(1970, 1, 1, tzinfo=dt.UTC) + dt.timedelta(milliseconds=numeric)
+        elif epoch == "apple_auto":
+            seconds = numeric / 1_000_000_000 if abs(numeric) > 10_000_000_000 else numeric
+            moment = dt.datetime(2001, 1, 1, tzinfo=dt.UTC) + dt.timedelta(seconds=seconds)
+        else:
+            moment = dt.datetime(2001, 1, 1, tzinfo=dt.UTC) + dt.timedelta(seconds=numeric)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return moment.isoformat().replace("+00:00", "Z")
+
+
+def _browser_sqlite_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        strings = list(iter_ascii_strings(value[:65_536], minimum=4, limit=20))
+        strings.extend(iter_utf16_strings(value[:65_536], minimum=4, limit=20))
+        rendered = " | ".join(str(item["text"]) for item in strings)
+        return display_text(rendered or f"<blob {len(value)} bytes>", 16_384)
+    return display_text(str(value), 16_384)
+
+
+def _inspect_forensic_sqlite(data: bytes, profile: str, result: dict[str, Any]) -> None:
+    """Run fixed, read-only forensic queries against a bounded in-memory snapshot."""
+
+    maximum_database = 128 * 1024 * 1024 if profile == "deep" else 64 * 1024 * 1024
+    if len(data) > maximum_database or not hasattr(sqlite3.Connection, "deserialize"):
+        result["properties"]["structured_sqlite_scan"] = "skipped-size-or-runtime"
+        return
+    connection: sqlite3.Connection | None = None
+    deadline = time.monotonic() + (8.0 if profile == "deep" else 3.0)
+    progress_calls = 0
+
+    def progress() -> int:
+        nonlocal progress_calls
+        progress_calls += 1
+        return int(progress_calls > (20_000 if profile == "deep" else 5_000) or time.monotonic() > deadline)
+
+    try:
+        connection = sqlite3.connect(":memory:")
+        connection.enable_load_extension(False)
+        for limit_name, limit_value in (
+            ("SQLITE_LIMIT_ATTACHED", 0),
+            ("SQLITE_LIMIT_COLUMN", 128),
+            ("SQLITE_LIMIT_COMPOUND_SELECT", 8),
+            ("SQLITE_LIMIT_LENGTH", 16 * 1024 * 1024),
+            ("SQLITE_LIMIT_SQL_LENGTH", 100_000),
+            ("SQLITE_LIMIT_TRIGGER_DEPTH", 0),
+            ("SQLITE_LIMIT_VARIABLE_NUMBER", 16),
+        ):
+            category = getattr(sqlite3, limit_name, None)
+            if category is not None:
+                connection.setlimit(category, limit_value)
+        connection.deserialize(data)
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA trusted_schema=OFF")
+        connection.execute("PRAGMA cell_size_check=ON")
+        connection.set_progress_handler(progress, 1_000)
+        allowed_actions = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ}
+
+        def authorize(action: int, _arg1: str | None, _arg2: str | None, _database: str | None, _trigger: str | None) -> int:
+            return sqlite3.SQLITE_OK if action in allowed_actions else sqlite3.SQLITE_DENY
+
+        connection.set_authorizer(authorize)
+        schema_rows = connection.execute(
+            "SELECT name, type, sql FROM sqlite_master WHERE type = 'table' LIMIT 1000"
+        ).fetchall()
+        tables = {
+            str(name)
+            for name, object_type, sql in schema_rows
+            if object_type == "table" and isinstance(name, str)
+            and not (isinstance(sql, str) and sql.lstrip().casefold().startswith("create virtual table"))
+        }
+        result["properties"]["structured_tables_detected"] = sorted(tables & set().union(*(query[1] for query in _FORENSIC_SQLITE_QUERIES)))
+        maximum_rows = 20_000 if profile == "deep" else 8_000
+        per_query = 5_000 if profile == "deep" else 2_000
+        lines: list[str] = []
+        rendered_characters = 0
+        matched_families: set[str] = set()
+        successful_query_groups: set[str] = set()
+        query_errors = 0
+        for label, required_tables, query, timestamp_columns in _FORENSIC_SQLITE_QUERIES:
+            if not required_tables.issubset(tables) or len(lines) >= maximum_rows:
+                continue
+            query_group = label.removesuffix("-core")
+            if label.endswith("-core") and query_group in successful_query_groups:
+                continue
+            try:
+                cursor = connection.execute(query, (min(per_query, maximum_rows - len(lines)),))
+                columns = [str(item[0]) for item in cursor.description or ()]
+                for row in cursor:
+                    fields: list[str] = []
+                    for column, value in zip(columns, row):
+                        fields.append(f"{column}={_browser_sqlite_value(value)}")
+                        if column in timestamp_columns:
+                            normalized = _browser_time(value, timestamp_columns[column])
+                            if normalized:
+                                fields.append(f"{column}_utc={normalized}")
+                    rendered = f"artifact={label} " + " ".join(fields)
+                    if rendered_characters + len(rendered) <= 4_000_000:
+                        lines.append(rendered)
+                        rendered_characters += len(rendered)
+                    if len(lines) >= maximum_rows:
+                        break
+                matched_families.add(label.split("-", 1)[0])
+                successful_query_groups.add(query_group)
+            except sqlite3.DatabaseError:
+                query_errors += 1
+        result["properties"].update({
+            "structured_sqlite_scan": "completed",
+            "browser_families": sorted(matched_families & {"chromium", "firefox", "safari"}),
+            "structured_families": sorted(matched_families),
+            "structured_rows_rendered": len(lines),
+            "structured_query_errors": query_errors,
+        })
+        if lines:
+            result["text_records"].append({
+                "encoding": "browser-sqlite-rows",
+                "offset": None,
+                "text": display_text("\n".join(lines), 2_000_000),
+                "source": "read-only browser/OS/mobile forensic SQLite queries",
+                "confidence_hint": 10,
+            })
+            result["findings"].append(_finding(
+                "info", "database", "Structured forensic SQLite records recovered",
+                "Fixed read-only queries recovered supported browser, operating-system timeline, quarantine, or mobile-message rows from an isolated in-memory snapshot.",
+                families=sorted(matched_families), rows=len(lines),
+            ))
+    except sqlite3.DatabaseError as exc:
+        result["properties"]["structured_sqlite_scan"] = "rejected"
+        result["findings"].append(_finding(
+            "warning", "structure", "Structured SQLite scan stopped safely",
+            "The database was malformed, unsupported, or exceeded the fixed virtual-machine/time bounds; raw forensic scanning remains available.",
+            error=display_text(exc, 300),
+        ))
+    finally:
+        if connection is not None:
+            connection.set_progress_handler(None, 0)
+            connection.set_authorizer(None)
+            connection.close()
+
+
 def parse_sqlite(data: bytes, profile: str = "balanced") -> dict[str, Any]:
-    """Inspect SQLite's fixed header and promote bounded schema-like strings."""
+    """Inspect SQLite structure and recover supported browser timeline rows."""
 
     result = _result("sqlite")
     if len(data) < 100 or not data.startswith(b"SQLite format 3\x00"):
@@ -3262,9 +3773,10 @@ def parse_sqlite(data: bytes, profile: str = "balanced") -> dict[str, Any]:
         lowered = record["text"].lower()
         if any(marker in lowered for marker in ("create table", "create index", "sqlite_", "flag{")):
             result["text_records"].append({**record, "source": "sqlite-raw-record", "confidence_hint": 8})
+    _inspect_forensic_sqlite(data, profile, result)
     result["findings"].append(_finding(
         "info", "database", "SQLite database detected",
-        "Deep scans can use the optional read-only SQLite dump adapter to enumerate schema and rows without modifying the source.",
+        "Supported browser schemas are queried through a bounded, read-only in-memory snapshot; deep scans can also use the optional SQLite dump adapter.",
     ))
     return result
 
@@ -3301,8 +3813,374 @@ def parse_ole(data: bytes, profile: str = "balanced") -> dict[str, Any]:
     return result
 
 
+_DOCUMENT_PACKAGE_ENTRY_LIMIT = 1_000
+_DOCUMENT_PACKAGE_TEXT_PART_LIMIT = 96
+_DOCUMENT_PACKAGE_MEMBER_LIMIT = 2 * 1024 * 1024
+_DOCUMENT_PACKAGE_TOTAL_LIMIT = 8 * 1024 * 1024
+
+
+def _document_package_family(package_kind: str, names: set[str]) -> str | None:
+    if package_kind == "docx" and "word/document.xml" in names:
+        return "word"
+    if package_kind == "xlsx" and ("xl/workbook.xml" in names or "xl/sharedstrings.xml" in names):
+        return "spreadsheet"
+    if package_kind == "pptx" and any(name.startswith("ppt/slides/slide") and name.endswith(".xml") for name in names):
+        return "presentation"
+    if package_kind in {"odt", "ods", "odp"} and "content.xml" in names:
+        return "odf"
+    if package_kind == "epub" and ("meta-inf/container.xml" in names or any(name.endswith((".xhtml", ".html", ".htm")) for name in names)):
+        return "epub"
+    return None
+
+
+def _document_package_text_part(family: str, name: str) -> bool:
+    lowered = name.casefold()
+    if lowered.startswith(("docprops/", "customxml/")) and lowered.endswith(".xml"):
+        return True
+    if family == "word":
+        return (
+            lowered.startswith("word/")
+            and lowered.endswith(".xml")
+            and "/_rels/" not in lowered
+            and not lowered.startswith(("word/theme/", "word/fonts/"))
+        )
+    if family == "spreadsheet":
+        return (
+            lowered in {"xl/sharedstrings.xml", "xl/workbook.xml"}
+            or lowered.startswith(("xl/worksheets/", "xl/comments", "xl/threadedcomments/"))
+            and lowered.endswith(".xml")
+        )
+    if family == "presentation":
+        return (
+            lowered.startswith(("ppt/slides/", "ppt/notesslides/", "ppt/comments/"))
+            and lowered.endswith(".xml")
+            and "/_rels/" not in lowered
+        )
+    if family == "odf":
+        return lowered in {"content.xml", "meta.xml", "settings.xml"}
+    if family == "epub":
+        return lowered.endswith((".xhtml", ".html", ".htm", ".opf", ".ncx"))
+    return False
+
+
+def _package_xml_values(payload: bytes, local_names: tuple[str, ...]) -> list[str]:
+    """Collect simple XML text nodes without resolving XML entities or DTDs."""
+
+    if not payload or not local_names:
+        return []
+    names = "|".join(re.escape(name) for name in local_names)
+    pattern = re.compile(
+        rf"<(?:(?:[A-Za-z_][\w.-]*):)?(?:{names})\b[^>]*>(.*?)</(?:(?:[A-Za-z_][\w.-]*):)?(?:{names})\s*>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    source = payload.decode("utf-8", "replace")
+    values: list[str] = []
+    for match in pattern.finditer(source):
+        value = re.sub(r"<[^>]{0,4096}>", "", match.group(1))
+        value = display_text(html.unescape(value).strip(), 256_000)
+        if value:
+            values.append(value)
+        if len(values) >= 4_000:
+            break
+    return values
+
+
+def _package_markup_text(payload: bytes) -> str:
+    source = payload.decode("utf-8", "replace")
+    source = re.sub(r"</(?:w:)?(?:p|tr|tc)\s*>", "\n", source, flags=re.IGNORECASE)
+    source = re.sub(r"</(?:text:p|text:h|table:table-row|table:table-cell)\s*>", "\n", source, flags=re.IGNORECASE)
+    source = re.sub(r"<br\b[^>]*/?>", "\n", source, flags=re.IGNORECASE)
+    source = re.sub(r"<[^>]{0,4096}>", "", source)
+    return display_text(html.unescape(source).strip(), 2_000_000)
+
+
+def _append_package_text(
+    result: dict[str, Any], package_kind: str, part_name: str, role: str, text: str, *,
+    confidence_hint: int = 9, transform_chain: list[str] | None = None,
+) -> None:
+    if not text:
+        return
+    result["text_records"].append({
+        "encoding": "document-package-text",
+        "offset": None,
+        "text": display_text(text, 2_000_000),
+        "source": f"{package_kind.upper()} {role}:{display_text(part_name, 240)}",
+        "confidence_hint": confidence_hint,
+        "transform_chain": transform_chain,
+    })
+
+
+def parse_document_package(data: bytes, profile: str = "balanced", *, package_kind: str) -> dict[str, Any]:
+    """Inspect OOXML, ODF, and EPUB text parts without rendering a document.
+
+    Document packages are ZIP containers, but CTF flags frequently live in
+    review revisions, comments, custom XML, formula strings, or adjacent text
+    runs.  This parser reads only bounded in-memory parts; it never extracts a
+    supplied path, follows relationships, opens Office, or executes a macro.
+    """
+
+    result = _result(package_kind)
+    entry_limit = _DOCUMENT_PACKAGE_ENTRY_LIMIT
+    member_limit = _DOCUMENT_PACKAGE_MEMBER_LIMIT * (2 if profile == "deep" else 1)
+    total_limit = _DOCUMENT_PACKAGE_TOTAL_LIMIT * (4 if profile == "deep" else 1)
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except (OSError, ValueError, zipfile.BadZipFile):
+        result["findings"].append(_finding(
+            "error", "structure", "Invalid document package",
+            "The extension indicates a ZIP-based document, but its package directory could not be read.",
+        ))
+        return result
+
+    with archive:
+        infos = archive.infolist()
+        names = {info.filename.replace("\\", "/").casefold() for info in infos if not info.is_dir()}
+        family = _document_package_family(package_kind, names)
+        result["properties"].update({
+            "package_entry_count": len(infos),
+            "package_family": family,
+            "has_macro_project": any(name.endswith("vbaproject.bin") for name in names),
+            "embedded_object_parts": sum("/embeddings/" in f"/{name}" for name in names),
+            "custom_xml_parts": sum(name.startswith("customxml/") and name.endswith(".xml") for name in names),
+        })
+        if len(infos) > entry_limit:
+            result["findings"].append(_finding(
+                "warning", "resource-limit", "Document package entry count bounded",
+                "Only the first bounded set of package entries was considered.",
+                declared_entries=len(infos), limit=entry_limit,
+            ))
+        if family is None:
+            result["findings"].append(_finding(
+                "warning", "structure", "Expected document package parts are missing",
+                "The ZIP package does not expose the expected document-content parts for its extension.",
+            ))
+            return result
+        if result["properties"]["has_macro_project"]:
+            result["findings"].append(_finding(
+                "warning", "document-active-content", "VBA macro project found",
+                "A vbaProject.bin part is present. It was not opened or executed.",
+            ))
+        if result["properties"]["embedded_object_parts"]:
+            result["findings"].append(_finding(
+                "info", "embedded-data", "Embedded document objects found",
+                "Embedded package objects remain available to the bounded recursive archive analyzer.",
+                count=result["properties"]["embedded_object_parts"],
+            ))
+        if result["properties"]["custom_xml_parts"]:
+            result["findings"].append(_finding(
+                "info", "document", "Custom XML parts found",
+                "Custom XML data is often not shown in the document body and was included in text scanning.",
+                count=result["properties"]["custom_xml_parts"],
+            ))
+
+        text_parts = 0
+        skipped = 0
+        total_read = 0
+        deleted_text_parts = 0
+        external_relationships: list[str] = []
+        for info in infos[:entry_limit]:
+            if info.is_dir():
+                continue
+            name = info.filename.replace("\\", "/")
+            lowered = name.casefold()
+            is_relationship = lowered.endswith(".rels")
+            if not is_relationship and not _document_package_text_part(family, lowered):
+                continue
+            if text_parts >= _DOCUMENT_PACKAGE_TEXT_PART_LIMIT:
+                skipped += 1
+                continue
+            if info.flag_bits & 0x1 or info.file_size < 1 or info.file_size > member_limit:
+                skipped += 1
+                continue
+            if info.compress_size and info.file_size / max(1, info.compress_size) > 200:
+                skipped += 1
+                continue
+            remaining = total_limit - total_read
+            if remaining <= 0:
+                skipped += 1
+                continue
+            try:
+                with archive.open(info, "r") as member:
+                    payload = member.read(min(member_limit, remaining) + 1)
+            except (OSError, RuntimeError, zipfile.BadZipFile):
+                skipped += 1
+                continue
+            if len(payload) > min(member_limit, remaining):
+                payload = payload[:min(member_limit, remaining)]
+                skipped += 1
+            total_read += len(payload)
+            text_parts += 1
+            if is_relationship:
+                relationship_source = payload.decode("utf-8", "replace")
+                for relationship in re.findall(r"<Relationship\b[^>]{0,4096}>", relationship_source, re.IGNORECASE):
+                    if not re.search(r"\bTargetMode\s*=\s*[\"']External[\"']", relationship, re.IGNORECASE):
+                        continue
+                    target = re.search(r"\bTarget\s*=\s*[\"']([^\"']{1,1024})[\"']", relationship, re.IGNORECASE)
+                    if target:
+                        external_relationships.append(display_text(html.unescape(target.group(1)), 500))
+                continue
+
+            if family == "word":
+                ordinary = _package_xml_values(payload, ("t", "instrText"))
+                deleted = _package_xml_values(payload, ("delText", "delInstrText"))
+                if deleted:
+                    deleted_text_parts += 1
+                    _append_package_text(
+                        result, package_kind, name, "revision-deleted-or-field text", "\n".join(deleted),
+                        confidence_hint=10,
+                        transform_chain=["read bounded XML part", "collect w:delText/w:delInstrText"],
+                    )
+            elif family == "spreadsheet":
+                ordinary = _package_xml_values(payload, ("t", "f", "v"))
+                deleted = []
+            elif family == "presentation":
+                ordinary = _package_xml_values(payload, ("t",))
+                deleted = []
+            elif family == "odf":
+                ordinary = _package_xml_values(payload, ("p", "h", "span"))
+                deleted = []
+            else:
+                ordinary = []
+                deleted = []
+
+            if ordinary:
+                _append_package_text(
+                    result, package_kind, name, "text runs", "\n".join(ordinary),
+                    transform_chain=["read bounded XML part", "collect document text nodes"],
+                )
+                compact = "".join(ordinary)
+                if len(ordinary) > 1 and compact:
+                    _append_package_text(
+                        result, package_kind, name, "adjacent text runs", compact, confidence_hint=9,
+                        transform_chain=["read bounded XML part", "join adjacent document text nodes"],
+                    )
+            else:
+                fallback = _package_markup_text(payload)
+                _append_package_text(
+                    result, package_kind, name, "markup text", fallback, confidence_hint=7,
+                    transform_chain=["read bounded markup part", "remove markup tags", "HTML/XML entity unescape"],
+                )
+
+        result["properties"].update({
+            "text_parts_scanned": text_parts,
+            "text_parts_skipped": skipped,
+            "text_bytes_read": total_read,
+            "external_relationship_count": len(external_relationships),
+        })
+        if deleted_text_parts:
+            result["findings"].append(_finding(
+                "info", "document", "Tracked-deletion text recovered",
+                "Revision-deleted Word text was kept as a separate CTF scan record.",
+                parts=deleted_text_parts,
+            ))
+        if external_relationships:
+            result["findings"].append(_finding(
+                "warning", "document-external-reference", "External document relationships found",
+                "External relationship targets were reported as text only; no links were followed.",
+                count=len(external_relationships), targets=external_relationships[:20],
+            ))
+    return result
+
+
+def _rtf_hidden_text(raw: str) -> str:
+    """Return text in RTF hidden-text scopes with a small tokenizer."""
+
+    visibility = [False]
+    output: list[str] = []
+    index = 0
+    while index < len(raw) and len(output) < 2_000_000:
+        character = raw[index]
+        if character == "{":
+            visibility.append(visibility[-1])
+            index += 1
+            continue
+        if character == "}":
+            if len(visibility) > 1:
+                visibility.pop()
+            index += 1
+            continue
+        if character != "\\":
+            if visibility[-1]:
+                output.append(character)
+            index += 1
+            continue
+        index += 1
+        if index >= len(raw):
+            break
+        escaped = raw[index]
+        if escaped in "\\{}":
+            if visibility[-1]:
+                output.append(escaped)
+            index += 1
+            continue
+        if escaped == "'" and index + 2 < len(raw):
+            token = raw[index + 1:index + 3]
+            if re.fullmatch(r"[0-9A-Fa-f]{2}", token) and visibility[-1]:
+                output.append(bytes([int(token, 16)]).decode("cp1252", "replace"))
+            index += 3
+            continue
+        if not escaped.isalpha():
+            index += 1
+            continue
+        start = index
+        while index < len(raw) and raw[index].isalpha():
+            index += 1
+        word = raw[start:index].casefold()
+        number_start = index
+        if index < len(raw) and raw[index] in "+-":
+            index += 1
+        while index < len(raw) and raw[index].isdigit():
+            index += 1
+        number_text = raw[number_start:index]
+        if index < len(raw) and raw[index] == " ":
+            index += 1
+        if word == "v":
+            try:
+                visibility[-1] = int(number_text or "1") != 0
+            except ValueError:
+                visibility[-1] = True
+        elif word == "plain":
+            visibility[-1] = False
+        elif visibility[-1] and word in {"par", "line"}:
+            output.append("\n")
+        elif visibility[-1] and word == "tab":
+            output.append("\t")
+        elif visibility[-1] and word == "u":
+            try:
+                code_point = int(number_text)
+                output.append(chr(code_point if code_point >= 0 else code_point + 65_536))
+            except (ValueError, OverflowError):
+                pass
+    return display_text("".join(output).strip(), 2_000_000)
+
+
+def _rtf_objdata_payloads(data: bytes, maximum: int) -> list[tuple[int, bytes]]:
+    """Decode contiguous hexadecimal bytes from RTF objdata as inert bytes."""
+
+    recovered: list[tuple[int, bytes]] = []
+    for match in re.finditer(br"\\objdata\b", data, re.IGNORECASE):
+        if len(recovered) >= 16:
+            break
+        segment = data[match.end():match.end() + maximum * 2 + 16_384]
+        hex_match = re.match(br"(?:[\t\r\n 0-9A-Fa-f]){16,}", segment)
+        if hex_match is None:
+            continue
+        compact = re.sub(br"\s+", b"", hex_match.group(0))
+        if len(compact) % 2:
+            compact = compact[:-1]
+        if not compact or len(compact) > maximum * 2:
+            continue
+        try:
+            payload = bytes.fromhex(compact.decode("ascii"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if payload:
+            recovered.append((match.start(), payload[:maximum]))
+    return recovered
+
+
 def parse_rtf(data: bytes, profile: str = "balanced") -> dict[str, Any]:
-    """Recover bounded visible and hex-escaped text from RTF source."""
+    """Recover bounded visible, hidden, and embedded RTF evidence."""
 
     result = _result("rtf")
     if not data.startswith(b"{\\rtf"):
@@ -3319,8 +4197,26 @@ def parse_rtf(data: bytes, profile: str = "balanced") -> dict[str, Any]:
     visible = re.sub(r"\s+", " ", visible).strip()
     if visible:
         result["text_records"].append({"encoding": "rtf-text", "offset": 0, "text": display_text(visible, 2_000_000), "source": "rtf-visible-text", "confidence_hint": 8})
+    hidden = _rtf_hidden_text(raw)
+    if hidden:
+        result["text_records"].append({
+            "encoding": "rtf-hidden-text", "offset": 0, "text": hidden, "source": "rtf-hidden-text",
+            "confidence_hint": 10, "transform_chain": ["parse RTF groups", "select hidden-text scopes"],
+        })
+        result["findings"].append(_finding(
+            "info", "document", "RTF hidden text recovered",
+            "Text marked with the RTF hidden-text control word was kept as a separate CTF scan record.",
+        ))
     object_count = len(re.findall(br"\\object\b|\\objdata\b", scan, re.IGNORECASE))
     result["properties"]["object_markers"] = object_count
+    recovered_objects = _rtf_objdata_payloads(scan, 4 * 1024 * 1024 if profile == "deep" else 1 * 1024 * 1024)
+    for index, (offset, payload) in enumerate(recovered_objects):
+        result["extracted"].append({
+            "label": f"rtf_objdata_{index:03d}", "data": payload, "producer": "rtf-parser",
+            "transformation": "decode contiguous hexadecimal bytes from RTF objdata group",
+            "offset": offset, "kind": sniff_kind(payload),
+        })
+    result["properties"]["objdata_payloads_recovered"] = len(recovered_objects)
     if object_count:
         result["findings"].append(_finding("info", "embedded-data", "RTF object markers found", "The optional rtfobj adapter can decode and extract these embedded OLE objects.", count=object_count))
     return result
@@ -3373,6 +4269,98 @@ def parse_eml(data: bytes, profile: str = "balanced") -> dict[str, Any]:
     return result
 
 
+def parse_mbox(data: bytes, profile: str = "balanced") -> dict[str, Any]:
+    """Split a bounded Unix MBOX and reuse the safe MIME attachment parser."""
+
+    result = _result("mbox")
+    scan_limit = min(len(data), 256 * 1024 * 1024 if profile == "deep" else 64 * 1024 * 1024)
+    source = data[:scan_limit]
+    maximum_messages = 10_000 if profile == "deep" else 2_000
+    separators = list(itertools.islice(
+        re.finditer(br"(?m)^From [^\r\n]{1,998}\r?$", source),
+        maximum_messages + 1,
+    ))
+    if not separators or separators[0].start() != 0:
+        result["findings"].append(_finding(
+            "error", "structure", "Invalid MBOX mailbox",
+            "No initial From_ envelope separator was found.",
+        ))
+        return result
+    rendered_characters = 0
+    extracted_bytes = 0
+    maximum_extracted = 128 * 1024 * 1024 if profile == "deep" else 32 * 1024 * 1024
+    messages = 0
+    malformed = 0
+    for index, separator in enumerate(separators[:maximum_messages]):
+        line_end = source.find(b"\n", separator.start())
+        if line_end < 0:
+            malformed += 1
+            continue
+        message_end = separators[index + 1].start() if index + 1 < len(separators) else len(source)
+        message_bytes = source[line_end + 1:message_end]
+        if not message_bytes or len(message_bytes) > 32 * 1024 * 1024:
+            malformed += 1
+            continue
+        try:
+            parsed = parse_eml(message_bytes, profile)
+        except (LookupError, TypeError, ValueError):
+            malformed += 1
+            continue
+        if parsed.get("properties", {}).get("parser_error"):
+            malformed += 1
+            continue
+        messages += 1
+        envelope = display_text(separator.group(0).decode("utf-8", "replace"), 2_048)
+        summary_fields = [f"message={index}", f"envelope={envelope}"]
+        for key in ("date", "from", "to", "subject", "message_id"):
+            value = parsed.get("metadata", {}).get(key)
+            if value:
+                summary_fields.append(f"{key}={display_text(value, 16_384)}")
+        summary = " ".join(summary_fields)
+        if rendered_characters + len(summary) <= 4_000_000:
+            result["text_records"].append({
+                "encoding": "mbox-envelope-and-headers", "offset": separator.start(), "text": summary,
+                "source": f"mbox-message:{index}", "confidence_hint": 9,
+            })
+            rendered_characters += len(summary)
+        for record in parsed.get("text_records", []):
+            text = display_text(record.get("text", ""), 250_000)
+            if not text or rendered_characters + len(text) > 4_000_000:
+                continue
+            result["text_records"].append({
+                **record,
+                "text": text,
+                "source": f"mbox-message:{index}:{record.get('source', 'mail')}",
+            })
+            rendered_characters += len(text)
+        for artifact_index, artifact in enumerate(parsed.get("extracted", [])):
+            payload = artifact.get("data")
+            if not isinstance(payload, bytes) or extracted_bytes + len(payload) > maximum_extracted:
+                continue
+            result["extracted"].append({
+                **artifact,
+                "label": safe_label(f"mbox_{index:05d}_{artifact_index:03d}_{artifact.get('label', 'attachment')}")[:240],
+                "producer": "mbox-email-parser",
+                "transformation": "split MBOX envelope and " + str(artifact.get("transformation", "decode MIME attachment")),
+            })
+            extracted_bytes += len(payload)
+    result["properties"].update({
+        "envelopes_found": len(separators),
+        "messages_parsed": messages,
+        "malformed_or_oversized_messages": malformed,
+        "attachments_extracted": len(result["extracted"]),
+        "extracted_bytes": extracted_bytes,
+        "bytes_scanned": scan_limit,
+        "truncated": len(data) > scan_limit or len(separators) > maximum_messages,
+    })
+    result["findings"].append(_finding(
+        "info", "email", "MBOX mailbox inspected",
+        "Messages were separated in memory and MIME attachments were decoded into isolated child artifacts; no mailbox paths were materialized.",
+        messages=messages,
+    ))
+    return result
+
+
 def parse_disk(data: bytes, profile: str = "balanced") -> dict[str, Any]:
     """Inspect raw MBR/GPT/filesystem signatures without mounting the image."""
 
@@ -3412,19 +4400,319 @@ def parse_ewf(data: bytes, profile: str = "balanced") -> dict[str, Any]:
     return result
 
 
+def _registry_filetime(value: int) -> str | None:
+    if value <= 0:
+        return None
+    try:
+        timestamp = dt.datetime(1601, 1, 1, tzinfo=dt.timezone.utc) + dt.timedelta(microseconds=value // 10)
+        return timestamp.isoformat().replace("+00:00", "Z")
+    except (OverflowError, ValueError):
+        return None
+
+
+def _registry_text(raw: bytes, compressed: bool) -> str:
+    encoding = "latin-1" if compressed else "utf-16le"
+    return display_text(raw.decode(encoding, "replace").rstrip("\x00"), 65_536)
+
+
+def _registry_value_text(value_type: int, raw: bytes) -> str:
+    """Render bounded registry values without dumping opaque binary or credentials."""
+
+    if value_type in {1, 2, 6}:
+        return display_text(raw.decode("utf-16le", "replace").rstrip("\x00"), 250_000)
+    if value_type == 7:
+        values = [item for item in raw.decode("utf-16le", "replace").split("\x00") if item]
+        return display_text(" | ".join(values), 250_000)
+    if value_type == 4 and len(raw) >= 4:
+        return str(int.from_bytes(raw[:4], "little"))
+    if value_type == 5 and len(raw) >= 4:
+        return str(int.from_bytes(raw[:4], "big"))
+    if value_type == 11 and len(raw) >= 8:
+        return str(int.from_bytes(raw[:8], "little"))
+    strings = list(iter_ascii_strings(raw[:1_000_000], minimum=4, limit=200))
+    strings.extend(iter_utf16_strings(raw[:1_000_000], minimum=4, limit=200))
+    rendered = " | ".join(str(item["text"]) for item in strings)
+    return display_text(rendered, 250_000) if rendered else f"<{len(raw)} binary bytes>"
+
+
 def parse_registry(data: bytes, profile: str = "balanced") -> dict[str, Any]:
+    """Enumerate bounded REGF cells, including stale values and UserAssist records."""
+
     result = _result("registry")
     if len(data) < 4096 or not data.startswith(b"regf"):
         result["findings"].append(_finding("error", "structure", "Invalid registry hive", "A Windows registry hive requires a complete base block."))
         return result
+
+    maximum_scan = 256 * 1024 * 1024 if profile == "deep" else 64 * 1024 * 1024
+    maximum_cells = 1_000_000 if profile == "deep" else 250_000
+    maximum_values = 250_000 if profile == "deep" else 75_000
+    maximum_value_bytes = 4 * 1024 * 1024 if profile == "deep" else 1 * 1024 * 1024
+    deadline = time.monotonic() + (14.0 if profile == "deep" else 5.0)
+    format_major = int.from_bytes(data[20:24], "little")
+    format_minor = int.from_bytes(data[24:28], "little")
+    legacy_11 = format_major == 1 and format_minor == 1
+    record_prefix = 4 if legacy_11 else 0
+    hive_bins_size = int.from_bytes(data[40:44], "little")
+    declared_end = 4096 + hive_bins_size if hive_bins_size else len(data)
+    scan_limit = min(len(data), declared_end, maximum_scan)
+    cells: dict[int, dict[str, Any]] = {}
+    bin_cursor = 4096
+    hbins = 0
+    malformed_cells = 0
+    timed_out = False
+
+    while bin_cursor + 32 <= scan_limit and len(cells) < maximum_cells:
+        if data[bin_cursor:bin_cursor + 4] != b"hbin":
+            malformed_cells += 1
+            break
+        bin_size = int.from_bytes(data[bin_cursor + 8:bin_cursor + 12], "little")
+        if bin_size < 4096 or bin_size % 4096 or bin_cursor + bin_size > scan_limit:
+            malformed_cells += 1
+            break
+        hbins += 1
+        cell_cursor = bin_cursor + 32
+        bin_end = bin_cursor + bin_size
+        while cell_cursor + 4 <= bin_end and len(cells) < maximum_cells:
+            if len(cells) % 8192 == 0 and time.monotonic() > deadline:
+                timed_out = True
+                break
+            signed_size = int.from_bytes(data[cell_cursor:cell_cursor + 4], "little", signed=True)
+            cell_size = abs(signed_size)
+            if cell_size < 8 or cell_size % 8 or cell_cursor + cell_size > bin_end:
+                malformed_cells += 1
+                break
+            relative = cell_cursor - 4096
+            cells[relative] = {
+                "absolute": cell_cursor,
+                "start": cell_cursor + 4,
+                "end": cell_cursor + cell_size,
+                "allocated": signed_size < 0,
+            }
+            cell_cursor += cell_size
+        if timed_out:
+            break
+        bin_cursor += bin_size
+
+    key_cells: dict[int, dict[str, Any]] = {}
+    value_cells: dict[int, dict[str, Any]] = {}
+    for relative, cell in cells.items():
+        start = int(cell["start"])
+        end = int(cell["end"])
+        signature = data[start + record_prefix:start + record_prefix + 2]
+        if signature == b"nk" and end - start >= record_prefix + 76:
+            name_length = int.from_bytes(data[start + record_prefix + 72:start + record_prefix + 74], "little")
+            if name_length > end - (start + record_prefix + 76):
+                malformed_cells += 1
+                continue
+            flags = int.from_bytes(data[start + record_prefix + 2:start + record_prefix + 4], "little")
+            key_cells[relative] = {
+                **cell,
+                "name": _registry_text(
+                    data[start + record_prefix + 76:start + record_prefix + 76 + name_length],
+                    bool(flags & 0x20),
+                ),
+                "parent": int.from_bytes(data[start + record_prefix + 16:start + record_prefix + 20], "little"),
+                "last_write": _registry_filetime(int.from_bytes(data[start + record_prefix + 4:start + record_prefix + 12], "little")),
+                "value_count": int.from_bytes(data[start + record_prefix + 36:start + record_prefix + 40], "little"),
+                "value_list": int.from_bytes(data[start + record_prefix + 40:start + record_prefix + 44], "little"),
+            }
+        elif signature == b"vk" and end - start >= record_prefix + 20:
+            name_length = int.from_bytes(data[start + record_prefix + 2:start + record_prefix + 4], "little")
+            if name_length > end - (start + record_prefix + 20):
+                malformed_cells += 1
+                continue
+            flags = int.from_bytes(data[start + record_prefix + 16:start + record_prefix + 18], "little")
+            value_cells[relative] = {
+                **cell,
+                "name": _registry_text(
+                    data[start + record_prefix + 20:start + record_prefix + 20 + name_length],
+                    bool(flags & 0x01),
+                ),
+                "data_size": int.from_bytes(data[start + record_prefix + 4:start + record_prefix + 8], "little"),
+                "data_offset": int.from_bytes(data[start + record_prefix + 8:start + record_prefix + 12], "little"),
+                "value_type": int.from_bytes(data[start + record_prefix + 12:start + record_prefix + 16], "little"),
+            }
+
+    path_cache: dict[int, str] = {}
+
+    def key_path(relative: int) -> str:
+        if relative in path_cache:
+            return path_cache[relative]
+        names: list[str] = []
+        seen: set[int] = set()
+        cursor = relative
+        for _ in range(512):
+            if cursor in seen or cursor not in key_cells:
+                break
+            seen.add(cursor)
+            key = key_cells[cursor]
+            if key["name"]:
+                names.append(str(key["name"]))
+            parent = int(key["parent"])
+            if parent == 0xFFFFFFFF:
+                break
+            cursor = parent
+        path = "\\".join(reversed(names)) or "<unnamed-key>"
+        path_cache[relative] = path
+        return path
+
+    def value_data(value: dict[str, Any]) -> bytes | None:
+        raw_size = int(value["data_size"])
+        size = raw_size & 0x7FFFFFFF
+        if size > maximum_value_bytes:
+            return None
+        if size == 0:
+            return b""
+        if raw_size & 0x80000000:
+            return int(value["data_offset"]).to_bytes(4, "little")[:size]
+        data_cell = cells.get(int(value["data_offset"]))
+        if not data_cell:
+            return None
+        start = int(data_cell["start"])
+        cell_end = int(data_cell["end"])
+        if not legacy_11 and size > 16_344 and data[start:start + 2] == b"db" and cell_end - start >= 8:
+            segment_count = int.from_bytes(data[start + 2:start + 4], "little")
+            segment_list = cells.get(int.from_bytes(data[start + 4:start + 8], "little"))
+            if not segment_list or segment_count <= 0 or segment_count > 65_536:
+                return None
+            list_start = int(segment_list["start"])
+            available = (int(segment_list["end"]) - list_start) // 4
+            if segment_count > available:
+                return None
+            joined = bytearray()
+            for index in range(segment_count):
+                segment_relative = int.from_bytes(data[list_start + index * 4:list_start + index * 4 + 4], "little")
+                segment = cells.get(segment_relative)
+                if not segment:
+                    return None
+                segment_start = int(segment["start"])
+                segment_size = min(16_344, size - len(joined), int(segment["end"]) - segment_start)
+                if segment_size <= 0:
+                    return None
+                joined.extend(data[segment_start:segment_start + segment_size])
+                if len(joined) == size:
+                    break
+            return bytes(joined) if len(joined) == size else None
+        start += 4 if legacy_11 else 0
+        end = min(cell_end, start + size)
+        return data[start:end] if end - start == size else None
+
+    type_names = {
+        0: "REG_NONE", 1: "REG_SZ", 2: "REG_EXPAND_SZ", 3: "REG_BINARY",
+        4: "REG_DWORD", 5: "REG_DWORD_BIG_ENDIAN", 6: "REG_LINK", 7: "REG_MULTI_SZ",
+        8: "REG_RESOURCE_LIST", 9: "REG_FULL_RESOURCE_DESCRIPTOR",
+        10: "REG_RESOURCE_REQUIREMENTS_LIST", 11: "REG_QWORD",
+    }
+    associated_values: set[int] = set()
+    lines: list[str] = []
+    rendered_characters = 0
+    rendered_values = 0
+    userassist_records = 0
+
+    def add_line(line: str) -> None:
+        nonlocal rendered_characters
+        if rendered_characters + len(line) <= 4_000_000:
+            lines.append(line)
+            rendered_characters += len(line)
+
+    for key_relative, key in key_cells.items():
+        if rendered_values >= maximum_values or time.monotonic() > deadline:
+            timed_out = timed_out or time.monotonic() > deadline
+            break
+        path = key_path(key_relative)
+        state = "allocated" if key["allocated"] else "deleted"
+        add_line(f"key={path} state={state} last_write_utc={key['last_write'] or ''}")
+        count = min(int(key["value_count"]), maximum_values - rendered_values)
+        value_list = cells.get(int(key["value_list"]))
+        if not value_list or count <= 0:
+            continue
+        list_start = int(value_list["start"])
+        if legacy_11:
+            list_start += 4
+        available = (int(value_list["end"]) - list_start) // 4
+        for index in range(min(count, available)):
+            value_relative = int.from_bytes(data[list_start + index * 4:list_start + index * 4 + 4], "little")
+            value = value_cells.get(value_relative)
+            if not value:
+                malformed_cells += 1
+                continue
+            associated_values.add(value_relative)
+            raw = value_data(value)
+            name = str(value["name"] or "(Default)")
+            userassist = "userassist" in path.casefold() and path.casefold().endswith("count")
+            if userassist and name != "(Default)":
+                try:
+                    name = codecs.decode(name, "rot_13")
+                except (TypeError, UnicodeError):
+                    pass
+            rendered = _registry_value_text(int(value["value_type"]), raw) if raw is not None else "<unavailable-or-oversized>"
+            value_state = "allocated" if value["allocated"] else "deleted"
+            details = ""
+            if userassist and raw is not None and len(raw) >= 16:
+                run_count = int.from_bytes(raw[4:8], "little")
+                focus_count = int.from_bytes(raw[8:12], "little")
+                focus_time_ms = int.from_bytes(raw[12:16], "little")
+                last_run_offset = 60 if len(raw) >= 68 else 8
+                last_run = _registry_filetime(int.from_bytes(raw[last_run_offset:last_run_offset + 8], "little"))
+                details = f" userassist_run_count={run_count} focus_count={focus_count} focus_time_ms={focus_time_ms} last_run_utc={last_run or ''}"
+                userassist_records += 1
+            add_line(
+                f"key={path} value={name} type={type_names.get(int(value['value_type']), str(value['value_type']))} "
+                f"state={value_state} data={rendered}{details}"
+            )
+            rendered_values += 1
+            if rendered_values >= maximum_values:
+                break
+
+    # Unallocated VK cells often retain CTF-relevant deleted values even when their
+    # parent list has been replaced. Surface them with no guessed parent path.
+    for value_relative, value in value_cells.items():
+        if value_relative in associated_values or rendered_values >= maximum_values:
+            continue
+        raw = value_data(value)
+        rendered = _registry_value_text(int(value["value_type"]), raw) if raw is not None else "<unavailable-or-oversized>"
+        state = "allocated-orphan" if value["allocated"] else "deleted-orphan"
+        add_line(
+            f"key=<orphan> value={value['name'] or '(Default)'} "
+            f"type={type_names.get(int(value['value_type']), str(value['value_type']))} state={state} data={rendered}"
+        )
+        rendered_values += 1
+
     result["properties"].update({
         "primary_sequence": int.from_bytes(data[4:8], "little"),
         "secondary_sequence": int.from_bytes(data[8:12], "little"),
+        "format_version": f"{format_major}.{format_minor}",
         "root_cell_offset": int.from_bytes(data[36:40], "little"),
-        "hive_bins_size": int.from_bytes(data[40:44], "little"),
+        "hive_bins_size": hive_bins_size,
         "checksum": int.from_bytes(data[508:512], "little"),
+        "hbins_scanned": hbins,
+        "cells_scanned": len(cells),
+        "key_cells": len(key_cells),
+        "value_cells": len(value_cells),
+        "values_rendered": rendered_values,
+        "userassist_records": userassist_records,
+        "malformed_cells_or_references": malformed_cells,
+        "bytes_scanned": scan_limit,
+        "timed_out": timed_out,
+        "truncated": len(data) > scan_limit or len(cells) >= maximum_cells or rendered_values >= maximum_values or timed_out,
     })
-    result["findings"].append(_finding("info", "registry", "Windows registry hive detected", "Deep scans can enumerate keys and values with the optional read-only reglookup adapter."))
+    if lines:
+        result["text_records"].append({
+            "encoding": "windows-registry-records", "offset": None,
+            "text": display_text("\n".join(lines), 4_000_000),
+            "source": "REGF key/value cells and UserAssist records", "confidence_hint": 9,
+        })
+    if userassist_records:
+        result["findings"].append(_finding(
+            "info", "execution", "UserAssist execution records decoded",
+            "ROT13 value names, execution counts, focus metrics, and last-run FILETIME values were decoded from bounded registry cells.",
+            records=userassist_records,
+        ))
+    result["findings"].append(_finding(
+        "info", "registry", "Windows registry hive inspected",
+        "Allocated and recoverable stale key/value cells were read directly; the optional reglookup adapter remains an independent read-only cross-check.",
+        keys=len(key_cells), values=len(value_cells),
+    ))
     return result
 
 
@@ -3724,6 +5012,359 @@ def _valid_png_ihdr(data: bytes) -> bool:
 
 def _png_crc(raw_type: bytes, payload: bytes) -> int:
     return binascii.crc32(raw_type + payload) & 0xFFFFFFFF
+
+
+_PNG_UNCROP_COMPRESSED_LIMIT = 32 * 1024 * 1024
+_PNG_UNCROP_OUTPUT_LIMIT = 128 * 1024 * 1024
+_PNG_UNCROP_PIXEL_LIMIT = 64_000_000
+
+
+def _png_chunk(raw_type: bytes, payload: bytes) -> bytes:
+    """Build one PNG chunk from trusted, already-bounded inputs."""
+
+    return len(payload).to_bytes(4, "big") + raw_type + payload + _png_crc(raw_type, payload).to_bytes(4, "big")
+
+
+def _png_channel_count(color_type: int | None) -> int | None:
+    return {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color_type)
+
+
+def _png_row_size(width: int, bit_depth: int | None, color_type: int | None) -> int | None:
+    channels = _png_channel_count(color_type)
+    if width <= 0 or not channels or bit_depth not in {1, 2, 4, 8, 16}:
+        return None
+    return 1 + (width * channels * bit_depth + 7) // 8
+
+
+def _bounded_png_inflate(parts: list[bytes]) -> bytes | None:
+    """Inflate PNG image data while enforcing compressed and output caps."""
+
+    compressed_size = sum(len(part) for part in parts)
+    if not parts or compressed_size > _PNG_UNCROP_COMPRESSED_LIMIT:
+        return None
+    decoder = zlib.decompressobj()
+    output = bytearray()
+    try:
+        for part in parts:
+            remaining = _PNG_UNCROP_OUTPUT_LIMIT + 1 - len(output)
+            if remaining <= 0:
+                return None
+            output.extend(decoder.decompress(part, remaining))
+            if decoder.unconsumed_tail or len(output) > _PNG_UNCROP_OUTPUT_LIMIT:
+                return None
+        remaining = _PNG_UNCROP_OUTPUT_LIMIT + 1 - len(output)
+        output.extend(decoder.flush(max(1, remaining)))
+    except zlib.error:
+        return None
+    if not decoder.eof or decoder.unused_data or len(output) > _PNG_UNCROP_OUTPUT_LIMIT:
+        return None
+    return bytes(output)
+
+
+def _png_filters_are_valid(raw: bytes, row_size: int, rows: int) -> bool:
+    if row_size <= 1 or rows <= 0 or len(raw) != row_size * rows:
+        return False
+    return all(raw[row * row_size] <= 4 for row in range(rows))
+
+
+def _png_dimension_uncrop_repairs(
+    data: bytes,
+    *,
+    idat_parts: list[bytes],
+    width: int | None,
+    height: int | None,
+    bit_depth: int | None,
+    color_type: int | None,
+    interlace: int | None,
+) -> list[dict[str, Any]]:
+    """Recover scanlines/columns still present behind falsified IHDR dimensions.
+
+    The repair is deliberately proof-based: the complete zlib stream must
+    inflate within a fixed cap, its length must imply one unique changed
+    dimension, and every inferred row must begin with a valid PNG filter byte.
+    """
+
+    if (
+        len(data) < 33
+        or width is None
+        or height is None
+        or width <= 0
+        or height <= 0
+        or interlace != 0
+        or bit_depth is None
+        or color_type is None
+        or width * height > _PNG_UNCROP_PIXEL_LIMIT
+    ):
+        return []
+    raw = _bounded_png_inflate(idat_parts)
+    channels = _png_channel_count(color_type)
+    row_size = _png_row_size(width, bit_depth, color_type)
+    if raw is None or channels is None or row_size is None:
+        return []
+
+    dimensions: list[tuple[int, int, str]] = []
+    if len(raw) % row_size == 0:
+        recovered_height = len(raw) // row_size
+        if (
+            recovered_height > height
+            and recovered_height <= 100_000
+            and width * recovered_height <= _PNG_UNCROP_PIXEL_LIMIT
+            and _png_filters_are_valid(raw, row_size, recovered_height)
+        ):
+            dimensions.append((width, recovered_height, "height"))
+
+    if len(raw) % height == 0:
+        inferred_row_size = len(raw) // height
+        payload_bits = max(0, inferred_row_size - 1) * 8
+        bits_per_pixel = channels * bit_depth
+        if bits_per_pixel and payload_bits % bits_per_pixel == 0:
+            recovered_width = payload_bits // bits_per_pixel
+            if (
+                recovered_width > width
+                and recovered_width <= 100_000
+                and recovered_width * height <= _PNG_UNCROP_PIXEL_LIMIT
+                and _png_filters_are_valid(raw, inferred_row_size, height)
+            ):
+                dimensions.append((recovered_width, height, "width"))
+
+    repairs: list[dict[str, Any]] = []
+    for recovered_width, recovered_height, changed in dimensions:
+        ihdr = bytearray(data[16:29])
+        ihdr[:4] = recovered_width.to_bytes(4, "big")
+        ihdr[4:8] = recovered_height.to_bytes(4, "big")
+        fixed = bytearray(data)
+        fixed[16:29] = ihdr
+        fixed[29:33] = _png_crc(b"IHDR", bytes(ihdr)).to_bytes(4, "big")
+        repairs.append({
+            "label": f"png_hidden_{'columns' if changed == 'width' else 'scanlines'}_uncropped",
+            "data": bytes(fixed),
+            "kind": "png",
+            "producer": "png-uncrop",
+            "transformation": f"restore PNG IHDR {changed} proved by the complete filtered scanline stream",
+            "reason": "The existing IDAT stream contains more complete, validly filtered image data than the declared canvas exposes; only the IHDR dimension and its CRC were changed.",
+            "details": {
+                "recovery_method": "png-hidden-scanlines",
+                "old_width": width,
+                "old_height": height,
+                "recovered_width": recovered_width,
+                "recovered_height": recovered_height,
+                "inflated_scanline_bytes": len(raw),
+                "unknown_pixels_filled": False,
+            },
+        })
+    return repairs
+
+
+def _png_trailer_deflate_fragment(trailer: bytes) -> bytes | None:
+    """Reassemble CRC-valid old IDAT chunks left in an aCropalypse trailer."""
+
+    if len(trailer) < 64 or len(trailer) > _PNG_UNCROP_COMPRESSED_LIMIT:
+        return None
+    marker = trailer.find(b"IDAT", 12)
+    while marker >= 0:
+        first_chunk = marker - 4
+        parsed = _valid_png_chunk_at(trailer, first_chunk)
+        if parsed is None or parsed[1] != b"IDAT":
+            marker = trailer.find(b"IDAT", marker + 1)
+            continue
+        cursor = first_chunk
+        complete_idat = bytearray()
+        saw_iend = False
+        while cursor + 12 <= len(trailer):
+            chunk = _valid_png_chunk_at(trailer, cursor)
+            if chunk is None:
+                break
+            end, raw_type, length = chunk
+            if raw_type == b"IDAT":
+                complete_idat.extend(trailer[cursor + 8:cursor + 8 + length])
+            elif raw_type == b"IEND":
+                saw_iend = True
+                break
+            elif raw_type[0] < ord("a"):
+                break
+            cursor = end
+        # The first twelve trailer bytes are the overwritten remainder of the
+        # old IDAT length/type/payload/CRC boundary.  The eight bytes before
+        # the next complete IDAT type are the prior CRC and next chunk length,
+        # not DEFLATE data.
+        partial_end = marker - 8
+        if saw_iend and partial_end > 12 and complete_idat:
+            fragment = trailer[12:partial_end] + bytes(complete_idat)
+            # A complete zlib stream ends with Adler-32; raw DEFLATE recovery
+            # must omit that checksum because its beginning was overwritten.
+            if len(fragment) > 8:
+                return fragment[:-4]
+        marker = trailer.find(b"IDAT", marker + 1)
+    return None
+
+
+def _shift_lsb_deflate(data: bytes, shift: int) -> bytes:
+    """Shift an LSB-first DEFLATE bitstream by zero to seven bits."""
+
+    if shift == 0:
+        return data
+    if not data:
+        return b""
+    # Treating the LSB-first byte sequence as one bounded little-endian integer
+    # performs the same cross-byte shift in native code.  This avoids a
+    # user-controlled Python loop over every byte for every possible bit
+    # alignment while retaining the exact PoC bit ordering.
+    return (int.from_bytes(data, "little") >> shift).to_bytes(len(data), "little")
+
+
+def _recover_truncated_deflate_tail(fragment: bytes) -> bytes | None:
+    """Recover a bounded DEFLATE tail beginning at a dynamic block boundary.
+
+    This implements the public aCropalypse technique without guessing pixels:
+    a known 32-KiB dictionary is supplied through a preceding stored block,
+    then only candidates that reach a real DEFLATE end marker are accepted.
+    """
+
+    fragment = fragment[:_PNG_UNCROP_COMPRESSED_LIMIT]
+    if len(fragment) < 32:
+        return None
+    dictionary_size = 32 * 1024
+    prefix = b"\x00" + dictionary_size.to_bytes(2, "little") + (0xFFFF - dictionary_size).to_bytes(2, "little") + b"X" * dictionary_size
+    max_attempts_per_shift = 4_096
+    max_scan = min(len(fragment), 8 * 1024 * 1024)
+    for shift in range(8):
+        shifted = _shift_lsb_deflate(fragment, shift)
+        view = memoryview(shifted)
+        shift_attempts = 0
+        for offset in range(max_scan):
+            # 100b is a non-final dynamic-Huffman DEFLATE block header when
+            # read least-significant bit first.
+            if shifted[offset] & 0x07 != 0x04:
+                continue
+            shift_attempts += 1
+            if shift_attempts > max_attempts_per_shift:
+                break
+            decoder = zlib.decompressobj(wbits=-15)
+            try:
+                output = bytearray(decoder.decompress(prefix, _PNG_UNCROP_OUTPUT_LIMIT + dictionary_size + 1))
+                remaining = _PNG_UNCROP_OUTPUT_LIMIT + dictionary_size + 1 - len(output)
+                if remaining <= 0:
+                    continue
+                output.extend(decoder.decompress(view[offset:], remaining))
+                if decoder.unconsumed_tail or len(output) > _PNG_UNCROP_OUTPUT_LIMIT + dictionary_size:
+                    continue
+                remaining = _PNG_UNCROP_OUTPUT_LIMIT + dictionary_size + 1 - len(output)
+                output.extend(decoder.flush(max(1, remaining)))
+            except (zlib.error, ValueError):
+                continue
+            if not decoder.eof or decoder.unconsumed_tail:
+                continue
+            if decoder.unused_data and (len(decoder.unused_data) > 1 or any(decoder.unused_data)):
+                continue
+            recovered = bytes(output[dictionary_size:])
+            if 64 <= len(recovered) <= _PNG_UNCROP_OUTPUT_LIMIT:
+                return recovered
+    return None
+
+
+def _acropalypse_canvas_width(recovered: bytes, *, current_width: int, current_height: int, channels: int) -> tuple[int, int, int] | None:
+    """Infer a unique likely screenshot width from recovered filter bytes."""
+
+    candidates: list[tuple[int, int, int, int]] = []
+    max_width = min(8_192, _PNG_UNCROP_PIXEL_LIMIT // max(1, current_height))
+    for width in range(max(1, current_width), max_width + 1):
+        row_size = 1 + width * channels
+        recovered_height = max(current_height, (len(recovered) + row_size - 1) // row_size)
+        if recovered_height > 100_000 or width * recovered_height > _PNG_UNCROP_PIXEL_LIMIT:
+            continue
+        canvas_size = row_size * recovered_height
+        recovered_start = canvas_size - len(recovered)
+        first_row_start = ((recovered_start + row_size - 1) // row_size) * row_size
+        observed = 0
+        valid = True
+        for row_start in range(first_row_start, canvas_size, row_size):
+            value = recovered[row_start - recovered_start]
+            observed += 1
+            if value > 4 and value != ord("X"):
+                valid = False
+                break
+        if valid and observed >= 3:
+            common_width = width in {320, 360, 375, 393, 412, 720, 768, 1080, 1200, 1280, 1440, 1536, 1600, 1920, 2160, 2560, 2880, 3200, 3840, 4096}
+            candidates.append((observed, int(common_width), -width, recovered_height))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    best = candidates[0]
+    best_width = -best[2]
+    # Accidental filter-byte alignments are possible.  Require the best width
+    # to have strictly more evidence unless the runner-up observes fewer rows.
+    if len(candidates) > 1 and candidates[1][0] == best[0] and candidates[1][1] == best[1]:
+        return None
+    return best_width, best[3], best[0]
+
+
+def _png_acropalypse_repair(
+    *,
+    trailer: bytes,
+    width: int | None,
+    height: int | None,
+    bit_depth: int | None,
+    color_type: int | None,
+    interlace: int | None,
+) -> dict[str, Any] | None:
+    """Produce a forensic partial-canvas artifact from validated residue."""
+
+    channels = _png_channel_count(color_type)
+    if (
+        width is None
+        or height is None
+        or width <= 0
+        or height <= 0
+        or bit_depth != 8
+        or color_type not in {2, 6}
+        or channels not in {3, 4}
+        or interlace != 0
+    ):
+        return None
+    fragment = _png_trailer_deflate_fragment(trailer)
+    if fragment is None:
+        return None
+    recovered = _recover_truncated_deflate_tail(fragment)
+    if recovered is None:
+        return None
+    dimensions = _acropalypse_canvas_width(recovered, current_width=width, current_height=height, channels=channels)
+    if dimensions is None:
+        return None
+    recovered_width, recovered_height, filter_rows = dimensions
+    row_size = 1 + recovered_width * channels
+    canvas_size = row_size * recovered_height
+    pixel = b"\xff\x00\xff" if channels == 3 else b"\xff\x00\xff\xff"
+    placeholder_row = b"\x00" + pixel * recovered_width
+    raw = bytearray(placeholder_row * recovered_height)
+    recovered_start = canvas_size - len(recovered)
+    raw[recovered_start:] = recovered
+    # Unknown dictionary references emerge as X.  Only row filter slots are
+    # normalized; unknown pixel bytes remain conspicuous magenta/X evidence.
+    for row_start in range(0, canvas_size, row_size):
+        if raw[row_start] > 4:
+            raw[row_start] = 0
+    ihdr = struct.pack(">IIBBBBB", recovered_width, recovered_height, 8, color_type, 0, 0, 0)
+    recovered_png = b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + _png_chunk(b"IEND", b"")
+    return {
+        "label": "png_acropalypse_partial_uncrop",
+        "data": recovered_png,
+        "kind": "png",
+        "producer": "png-uncrop",
+        "transformation": "recover the surviving aCropalypse DEFLATE tail and place it on an inferred screenshot canvas",
+        "reason": "CRC-valid old IDAT chunks remain after IEND, a truncated DEFLATE tail reaches a valid end marker, and repeated PNG filter bytes prove the inferred row width. Missing pixels are marked rather than invented.",
+        "details": {
+            "recovery_method": "acropalypse-deflate-tail",
+            "old_width": width,
+            "old_height": height,
+            "recovered_width": recovered_width,
+            "recovered_height": recovered_height,
+            "surviving_scanline_bytes": len(recovered),
+            "validated_filter_rows": filter_rows,
+            "unknown_pixels_filled": True,
+            "placeholder": "opaque magenta; unresolved dictionary bytes may remain as X",
+            "partial_recovery": True,
+        },
+    }
 
 
 def _png_chunk_layout_at(data: bytes, offset: int, *, max_length: int = _PNG_RECOVERY_CHUNK_LIMIT) -> tuple[int, bytes, int] | None:
@@ -4111,6 +5752,7 @@ def parse_png(data: bytes, profile: str = "balanced") -> dict[str, Any]:
     animated_frames = None
     sequence_errors = 0
     previous_sequence = -1
+    idat_parts: list[bytes] = []
     safe_types = {"IHDR", "PLTE", "IDAT", "IEND", "tRNS", "gAMA", "cHRM", "sRGB", "iCCP", "pHYs", "sBIT", "bKGD", "hIST", "tIME", "eXIf", "acTL", "fcTL", "fdAT", "tEXt", "zTXt", "iTXt", "sPLT"}
     repaired = bytearray(data)
 
@@ -4152,6 +5794,8 @@ def parse_png(data: bytes, profile: str = "balanced") -> dict[str, Any]:
                 "color_type": color_type, "compression_method": compression,
                 "filter_method": filtering, "interlace_method": interlace,
             })
+        elif chunk_type == "IDAT":
+            idat_parts.append(payload)
         elif chunk_type == "acTL" and length == 8:
             animated_frames, plays = struct.unpack(">II", payload)
             result["properties"].update({"animation_frames_declared": animated_frames, "animation_plays": plays})
@@ -4212,6 +5856,24 @@ def parse_png(data: bytes, profile: str = "balanced") -> dict[str, Any]:
             })
     if sequence_errors:
         result["findings"].append(_finding("warning", "integrity", "APNG sequence discontinuity", "APNG frame sequence numbers are not consecutive.", count=sequence_errors))
+
+    dimension_repairs = _png_dimension_uncrop_repairs(
+        data,
+        idat_parts=idat_parts,
+        width=width,
+        height=height,
+        bit_depth=bit_depth,
+        color_type=color_type,
+        interlace=interlace,
+    )
+    if dimension_repairs:
+        result["findings"].append(_finding(
+            "warning", "forensic-recovery", "PNG canvas hides encoded pixels",
+            "The complete IDAT stream proves that filtered rows or columns extend beyond the declared IHDR canvas. A copy-only uncropped artifact was generated.",
+            candidates=len(dimension_repairs), recovery_method="png-hidden-scanlines",
+        ))
+        result["repairs"].extend(dimension_repairs)
+
     if iend_end is not None and iend_end < len(data):
         trailer = data[iend_end:]
         result["findings"].append(_finding(
@@ -4223,6 +5885,25 @@ def parse_png(data: bytes, profile: str = "balanced") -> dict[str, Any]:
             "label": "png_trailer", "data": trailer, "producer": "png-parser",
             "transformation": "extract bytes after IEND", "offset": iend_end, "kind": sniff_kind(trailer),
         })
+        if profile != "quick":
+            acropalypse_repair = _png_acropalypse_repair(
+                trailer=trailer,
+                width=width,
+                height=height,
+                bit_depth=bit_depth,
+                color_type=color_type,
+                interlace=interlace,
+            )
+            if acropalypse_repair is not None:
+                result["findings"].append(_finding(
+                    "warning", "forensic-recovery", "Recoverable cropped screenshot residue",
+                    "Old CRC-valid PNG chunks and a recoverable truncated DEFLATE stream remain after IEND. A partial uncropped canvas was generated without inventing missing pixels.",
+                    recovery_method="acropalypse-deflate-tail",
+                    partial_recovery=True,
+                    recovered_width=acropalypse_repair["details"]["recovered_width"],
+                    recovered_height=acropalypse_repair["details"]["recovered_height"],
+                ))
+                result["repairs"].append(acropalypse_repair)
     elif iend_end is None and cursor == len(data) and counts.get("IHDR") == 1:
         iend = b"\x00\x00\x00\x00IEND\xaeB`\x82"
         result["findings"].append(_finding("warning", "integrity", "PNG IEND is missing", "The parsed chunk stream ends without an IEND chunk."))
@@ -4510,6 +6191,37 @@ def _bounded_pdf_flate(payload: bytes) -> bytes | None:
         return None
 
 
+def _pdf_content_text_sequences(payload: bytes) -> list[str]:
+    """Join literal/hex operands inside bounded PDF text objects."""
+
+    sequences: list[str] = []
+    for block in re.finditer(rb"(?<![A-Za-z])BT(?![A-Za-z])(.{0,2000000}?)(?<![A-Za-z])ET(?![A-Za-z])", payload, re.DOTALL):
+        body = block.group(1)
+        if b"Tj" not in body and b"TJ" not in body and b"'" not in body and b'"' not in body:
+            continue
+        fragments: list[bytes] = []
+        index = 0
+        while index < len(body) and len(fragments) < 1_000:
+            if body[index] == 0x28:
+                parsed = _pdf_literal_at(body, index)
+                if parsed is not None:
+                    value, index = parsed
+                    fragments.append(value)
+                    continue
+            index += 1
+        for match in re.finditer(rb"(?<!<)<([0-9A-Fa-f\s]{4,2000000})>(?!>)", body):
+            try:
+                fragments.append(bytes.fromhex(re.sub(rb"\s+", b"", match.group(1)).decode("ascii")))
+            except (ValueError, UnicodeDecodeError):
+                continue
+        combined = _pdf_textual(b"".join(fragments))
+        if combined and len(combined.strip()) >= 4:
+            sequences.append(combined)
+        if len(sequences) >= 128:
+            break
+    return sequences
+
+
 def parse_pdf(data: bytes, profile: str = "balanced") -> dict[str, Any]:
     """Perform bounded PDF triage without rendering or executing document code.
 
@@ -4567,6 +6279,13 @@ def parse_pdf(data: bytes, profile: str = "balanced") -> dict[str, Any]:
                 seen_text.add(text)
                 result["text_records"].append({"source": f"PDF metadata:{key.decode()}", "offset": match.start(1), "text": text, "confidence_hint": 9})
                 result["metadata"][f"pdf:{key.decode().lower()}"] = text
+    for sequence in _pdf_content_text_sequences(data):
+        if sequence not in seen_text:
+            seen_text.add(sequence)
+            result["text_records"].append({
+                "source": "PDF page text sequence", "offset": None, "text": sequence, "confidence_hint": 9,
+                "transform_chain": ["locate PDF BT/ET text object", "join literal and hex text operands"],
+            })
     # Recover visible literal strings, including flag text in ordinary page or
     # object content streams, while keeping dictionary names out of results.
     literal_attempts = 0
@@ -4632,6 +6351,14 @@ def parse_pdf(data: bytes, profile: str = "balanced") -> dict[str, Any]:
                 if text and text not in seen_text:
                     seen_text.add(text)
                     result["text_records"].append({"source": "PDF stream", "offset": stream_start, "text": text, "confidence_hint": 5})
+            for sequence in _pdf_content_text_sequences(payload):
+                if sequence not in seen_text:
+                    seen_text.add(sequence)
+                    result["text_records"].append({
+                        "source": f"PDF {transformation} text sequence", "offset": stream_start, "text": sequence,
+                        "confidence_hint": 9,
+                        "transform_chain": ["extract bounded PDF stream", "locate BT/ET text object", "join literal and hex text operands"],
+                    })
         stream_number += 1
         cursor = end + len(b"endstream")
 
@@ -4666,6 +6393,8 @@ def parse_gif(data: bytes, profile: str = "balanced") -> dict[str, Any]:
     trailer_end: int | None = None
     malformed = False
     extension_counts: dict[str, int] = {}
+    max_frame_right = 0
+    max_frame_bottom = 0
 
     while cursor < len(data):
         introducer = data[cursor]
@@ -4678,6 +6407,9 @@ def parse_gif(data: bytes, profile: str = "balanced") -> dict[str, Any]:
                 break
             descriptor = data[cursor + 1:cursor + 10]
             left, top, frame_width, frame_height, frame_packed = struct.unpack("<HHHHB", descriptor)
+            if frame_width and frame_height:
+                max_frame_right = max(max_frame_right, left + frame_width)
+                max_frame_bottom = max(max_frame_bottom, top + frame_height)
             cursor += 10
             if frame_packed & 0x80:
                 cursor += 3 * (2 ** ((frame_packed & 0x07) + 1))
@@ -4733,7 +6465,41 @@ def parse_gif(data: bytes, profile: str = "balanced") -> dict[str, Any]:
         "pixel_aspect_byte": aspect, "frame_count": frames, "comment_count": comments,
         "applications": applications, "extension_counts": extension_counts,
         "trailer_present": trailer_end is not None, "malformed_block_stream": malformed,
+        "maximum_frame_right": max_frame_right, "maximum_frame_bottom": max_frame_bottom,
     })
+    recovered_width = max(width, max_frame_right)
+    recovered_height = max(height, max_frame_bottom)
+    if (
+        frames
+        and not malformed
+        and (recovered_width > width or recovered_height > height)
+        and recovered_width <= 0xFFFF
+        and recovered_height <= 0xFFFF
+        and recovered_width * recovered_height <= _PNG_UNCROP_PIXEL_LIMIT
+    ):
+        fixed = bytearray(data)
+        fixed[6:10] = struct.pack("<HH", recovered_width, recovered_height)
+        result["findings"].append(_finding(
+            "warning", "forensic-recovery", "GIF frames extend outside the logical canvas",
+            "One or more encoded image frames lie beyond the logical screen descriptor. A copy-only artifact expands the canvas to expose them.",
+            old_width=width, old_height=height, recovered_width=recovered_width, recovered_height=recovered_height,
+        ))
+        result["repairs"].append({
+            "label": "gif_hidden_canvas_uncropped",
+            "data": bytes(fixed),
+            "kind": "gif",
+            "producer": "gif-uncrop",
+            "transformation": "expand the GIF logical screen to the maximum encoded frame extent",
+            "reason": "Parsed image descriptors prove that encoded frames extend beyond the declared logical screen; only the two canvas dimensions were changed.",
+            "details": {
+                "recovery_method": "gif-frame-extents",
+                "old_width": width,
+                "old_height": height,
+                "recovered_width": recovered_width,
+                "recovered_height": recovered_height,
+                "unknown_pixels_filled": False,
+            },
+        })
     if trailer_end is not None and trailer_end < len(data):
         trailer = data[trailer_end:]
         result["findings"].append(_finding("warning", "embedded-data", "Data follows GIF trailer", f"{len(trailer)} byte(s) occur after the GIF trailer.", offset=trailer_end, size=len(trailer), detected_kind=sniff_kind(trailer)))
@@ -4865,7 +6631,7 @@ def parse_bmp(data: bytes, profile: str = "balanced") -> dict[str, Any]:
     reserved2 = int.from_bytes(data[8:10], "little")
     pixel_offset = int.from_bytes(data[10:14], "little")
     dib_size = int.from_bytes(data[14:18], "little")
-    width = height = planes = bpp = compression = image_size = colors_used = None
+    width = height = signed_height = planes = bpp = compression = image_size = colors_used = None
     top_down = False
     if dib_size == 12 and len(data) >= 26:
         width, height, planes, bpp = struct.unpack_from("<HHHH", data, 18)
@@ -4913,6 +6679,45 @@ def parse_bmp(data: bytes, profile: str = "balanced") -> dict[str, Any]:
         padding_size = row_stride - row_payload
         expected_end = pixel_offset + row_stride * height
         result["properties"].update({"row_stride": row_stride, "row_padding_bytes": padding_size, "expected_pixel_end": expected_end})
+        available_pixels = len(data) - pixel_offset
+        if (
+            dib_size >= 40
+            and signed_height is not None
+            and image_size
+            and image_size == available_pixels
+            and available_pixels % row_stride == 0
+        ):
+            recovered_height = available_pixels // row_stride
+            if (
+                recovered_height > height
+                and recovered_height <= 100_000
+                and abs(width) * recovered_height <= _PNG_UNCROP_PIXEL_LIMIT
+            ):
+                fixed = bytearray(data)
+                fixed_height = -recovered_height if signed_height < 0 else recovered_height
+                fixed[22:26] = fixed_height.to_bytes(4, "little", signed=True)
+                result["findings"].append(_finding(
+                    "warning", "forensic-recovery", "BMP header hides complete pixel rows",
+                    "The declared image-data size and exact row stride prove that complete rows continue beyond the stored height. A copy-only uncropped artifact was generated.",
+                    old_height=height, recovered_height=recovered_height, row_stride=row_stride,
+                ))
+                result["repairs"].append({
+                    "label": "bmp_hidden_rows_uncropped",
+                    "data": bytes(fixed),
+                    "kind": "bmp",
+                    "producer": "bmp-uncrop",
+                    "transformation": "restore BMP height from the declared complete pixel-array size and exact row stride",
+                    "reason": "biSizeImage equals all bytes available from bfOffBits and contains an exact larger number of complete rows; only the DIB height was changed.",
+                    "details": {
+                        "recovery_method": "bmp-hidden-rows",
+                        "old_width": width,
+                        "old_height": height,
+                        "recovered_width": abs(width),
+                        "recovered_height": recovered_height,
+                        "row_stride": row_stride,
+                        "unknown_pixels_filled": False,
+                    },
+                })
         if masks:
             result["findings"].append(_finding(
                 "info", "structure", "BMP bitfield channel masks",

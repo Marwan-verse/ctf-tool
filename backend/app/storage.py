@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -238,17 +238,25 @@ class Storage:
         limit: int,
         offset: int,
         status: str | None = None,
+        include_result: bool = True,
     ) -> tuple[list[dict[str, Any]], int]:
+        columns = "*" if include_result else """
+            id, status, profile, original_filename, content_type, size_bytes,
+            sha256, flag_prefix, options_json, input_relative_path,
+            output_relative_path, progress, current_stage, cancel_requested,
+            created_at, updated_at, started_at, completed_at,
+            error_code, error_message
+        """
         with self._connect() as connection:
             if status is None:
                 rows = connection.execute(
-                    "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    f"SELECT {columns} FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?",
                     (limit, offset),
                 ).fetchall()
                 total = int(connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
             else:
                 rows = connection.execute(
-                    "SELECT * FROM jobs WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    f"SELECT {columns} FROM jobs WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
                     (status, limit, offset),
                 ).fetchall()
                 total = int(
@@ -312,24 +320,57 @@ class Storage:
     def update_progress(self, job_id: str, *, progress: float | None, stage: str | None) -> None:
         timestamp = utc_now()
         with self._connect() as connection, connection:
-            if progress is None:
-                connection.execute(
-                    """
-                    UPDATE jobs SET current_stage = COALESCE(?, current_stage), updated_at = ?
-                    WHERE id = ? AND status IN ('running','cancelling')
-                    """,
-                    (stage, timestamp, job_id),
-                )
-            else:
-                normalized = max(0.0, min(1.0, float(progress)))
-                connection.execute(
-                    """
-                    UPDATE jobs
-                    SET progress = MAX(progress, ?), current_stage = COALESCE(?, current_stage), updated_at = ?
-                    WHERE id = ? AND status IN ('running','cancelling')
-                    """,
-                    (normalized, stage, timestamp, job_id),
-                )
+            self._update_progress_row(connection, job_id, progress=progress, stage=stage, timestamp=timestamp)
+
+    @staticmethod
+    def _update_progress_row(
+        connection: sqlite3.Connection,
+        job_id: str,
+        *,
+        progress: float | None,
+        stage: str | None,
+        timestamp: str,
+    ) -> None:
+        if progress is None:
+            connection.execute(
+                """
+                UPDATE jobs SET current_stage = COALESCE(?, current_stage), updated_at = ?
+                WHERE id = ? AND status IN ('running','cancelling')
+                """,
+                (stage, timestamp, job_id),
+            )
+            return
+        normalized = max(0.0, min(1.0, float(progress)))
+        connection.execute(
+            """
+            UPDATE jobs
+            SET progress = MAX(progress, ?), current_stage = COALESCE(?, current_stage), updated_at = ?
+            WHERE id = ? AND status IN ('running','cancelling')
+            """,
+            (normalized, stage, timestamp, job_id),
+        )
+
+    def update_progress_and_append_event(
+        self,
+        job_id: str,
+        *,
+        progress: float | None,
+        stage: str | None,
+        event_type: str,
+        payload: Mapping[str, Any],
+    ) -> int:
+        """Persist one progress callback with a single connection and commit."""
+
+        timestamp = utc_now()
+        with self._connect() as connection, connection:
+            self._update_progress_row(connection, job_id, progress=progress, stage=stage, timestamp=timestamp)
+            return self._insert_event(
+                connection,
+                job_id,
+                event_type,
+                payload,
+                created_at=timestamp,
+            )
 
     def request_cancel(self, job_id: str) -> dict[str, Any] | None:
         timestamp = utc_now()
@@ -368,6 +409,7 @@ class Storage:
         result: Mapping[str, Any] | None,
         error_code: str | None = None,
         error_message: str | None = None,
+        return_job: bool = True,
     ) -> dict[str, Any] | None:
         if status not in TERMINAL_STATUSES:
             raise ValueError("finish_job requires a terminal status")
@@ -378,7 +420,7 @@ class Storage:
             if current is None:
                 return None
             if str(current["status"]) in TERMINAL_STATUSES:
-                return self._job_from_row(current)
+                return self._job_from_row(current) if return_job else None
             progress = 1.0 if status == "completed" else float(current["progress"])
             stage = {
                 "completed": "Analysis complete",
@@ -413,8 +455,12 @@ class Storage:
             if error_code:
                 terminal_payload["error"] = {"code": error_code, "message": error_message or "Analysis failed"}
             self._insert_event(connection, job_id, "terminal", terminal_payload, created_at=timestamp)
-            row = connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-        return self._job_from_row(row)
+            row = (
+                connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                if return_job
+                else None
+            )
+        return self._job_from_row(row) if return_job else None
 
     def recover_interrupted_jobs(self) -> list[str]:
         with self._connect() as connection:
@@ -444,39 +490,8 @@ class Storage:
         return recovered
 
     def upsert_artifact(self, values: Mapping[str, Any]) -> dict[str, Any]:
-        created_at = str(values.get("created_at") or utc_now())
         with self._connect() as connection, connection:
-            connection.execute(
-                """
-                INSERT INTO artifacts(
-                    id, job_id, parent_id, name, kind, relative_path, media_type,
-                    size_bytes, sha256, previewable, metadata_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(job_id, relative_path) DO UPDATE SET
-                    parent_id = excluded.parent_id,
-                    name = excluded.name,
-                    kind = excluded.kind,
-                    media_type = excluded.media_type,
-                    size_bytes = excluded.size_bytes,
-                    sha256 = excluded.sha256,
-                    previewable = excluded.previewable,
-                    metadata_json = excluded.metadata_json
-                """,
-                (
-                    values["id"],
-                    values["job_id"],
-                    values.get("parent_id"),
-                    values["name"],
-                    values.get("kind", "artifact"),
-                    values["relative_path"],
-                    values.get("media_type", "application/octet-stream"),
-                    int(values["size_bytes"]),
-                    values["sha256"],
-                    int(bool(values.get("previewable"))),
-                    _json_dump(dict(values.get("metadata") or {})),
-                    created_at,
-                ),
-            )
+            self._upsert_artifact_row(connection, values)
             row = connection.execute(
                 "SELECT * FROM artifacts WHERE job_id = ? AND relative_path = ?",
                 (values["job_id"], values["relative_path"]),
@@ -484,6 +499,51 @@ class Storage:
         result = self._artifact_from_row(row)
         assert result is not None
         return result
+
+    @staticmethod
+    def _upsert_artifact_row(connection: sqlite3.Connection, values: Mapping[str, Any]) -> None:
+        created_at = str(values.get("created_at") or utc_now())
+        connection.execute(
+            """
+            INSERT INTO artifacts(
+                id, job_id, parent_id, name, kind, relative_path, media_type,
+                size_bytes, sha256, previewable, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id, relative_path) DO UPDATE SET
+                parent_id = excluded.parent_id,
+                name = excluded.name,
+                kind = excluded.kind,
+                media_type = excluded.media_type,
+                size_bytes = excluded.size_bytes,
+                sha256 = excluded.sha256,
+                previewable = excluded.previewable,
+                metadata_json = excluded.metadata_json
+            """,
+            (
+                values["id"],
+                values["job_id"],
+                values.get("parent_id"),
+                values["name"],
+                values.get("kind", "artifact"),
+                values["relative_path"],
+                values.get("media_type", "application/octet-stream"),
+                int(values["size_bytes"]),
+                values["sha256"],
+                int(bool(values.get("previewable"))),
+                _json_dump(dict(values.get("metadata") or {})),
+                created_at,
+            ),
+        )
+
+    def upsert_artifacts(self, values: Iterable[Mapping[str, Any]]) -> int:
+        """Index a collection of artifacts in one SQLite transaction."""
+
+        count = 0
+        with self._connect() as connection, connection:
+            for item in values:
+                self._upsert_artifact_row(connection, item)
+                count += 1
+        return count
 
     def list_artifacts(self, job_id: str) -> list[dict[str, Any]]:
         with self._connect() as connection:

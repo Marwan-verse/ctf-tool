@@ -8,8 +8,8 @@ type Screen = 'setup' | 'running' | 'results';
 type FileDetection = { label: string; source: 'content' | 'browser' | 'extension' | 'scanning' };
 type ColorTheme = 'light' | 'dark';
 type UiPreferences = { theme: ColorTheme; zoom: number };
-type ResultTab = 'overview' | 'traffic' | 'repairs' | 'audio' | 'candidates' | 'artifacts' | 'visual' | 'metadata' | 'hex' | 'tools' | 'methods';
-type TrafficPane = 'packets' | 'protocols' | 'endpoints' | 'conversations' | 'streams' | 'objects' | 'events';
+type ResultTab = 'overview' | 'solve' | 'traffic' | 'repairs' | 'audio' | 'document' | 'candidates' | 'artifacts' | 'visual' | 'metadata' | 'hex' | 'tools' | 'methods';
+type TrafficPane = 'packets' | 'protocols' | 'endpoints' | 'conversations' | 'streams' | 'objects' | 'events' | 'analysis';
 type MethodFilter = 'all' | 'completed' | 'missing' | 'skipped' | 'failed';
 type BooleanOptionKey = 'structure_analysis' | 'visual_analysis' | 'lsb_analysis' | 'ocr' | 'barcodes' | 'recursive_extraction' | 'decoders' | 'crypto_analysis' | 'repairs' | 'external_tools' | 'external_extraction' | 'audio_spectrogram' | 'audio_signal_decoders' | 'audio_sstv' | 'audio_channel_exports' | 'audio_audacity_bundle';
 
@@ -95,6 +95,19 @@ type Artifact = {
   preview_url?: string;
   download_url?: string;
   metadata?: Record<string, unknown>;
+};
+
+type TextPreview = {
+  artifact_id?: string;
+  sha256?: string;
+  name?: string;
+  kind?: string;
+  encoding?: string;
+  text: string;
+  character_count?: number;
+  line_count?: number;
+  truncated?: boolean;
+  sources?: string[];
 };
 
 type MethodRun = {
@@ -192,6 +205,38 @@ type VisualView = {
   parameters?: Record<string, unknown>;
 };
 
+type SolveNode = {
+  id: string;
+  type?: 'artifact' | 'method' | 'finding' | 'candidate' | string;
+  label?: string;
+  status?: string;
+  kind?: string;
+  category?: string;
+  depth?: number;
+  score?: unknown;
+};
+
+type SolveRecommendation = {
+  id: string;
+  priority?: number;
+  title?: string;
+  reason?: string;
+  action?: string;
+  target_tab?: string;
+  method_ids?: string[];
+  tool_ids?: string[];
+};
+
+type SolveGuidance = {
+  version?: number;
+  summary?: string;
+  nodes?: SolveNode[];
+  edges?: Array<{ source: string; target: string; relation?: string }>;
+  recommendations?: SolveRecommendation[];
+  coverage_gaps?: { missing_tools?: string[]; limited_methods?: string[] };
+  safety?: { evidence_driven_commands?: boolean; network_access?: boolean; original_mutated?: boolean };
+};
+
 type AnalysisResult = {
   summary?: Record<string, unknown>;
   input?: Record<string, unknown>;
@@ -206,6 +251,7 @@ type AnalysisResult = {
   metadata?: Record<string, unknown> | Array<Record<string, unknown>>;
   structure?: unknown;
   logs?: unknown[];
+  solve_guidance?: SolveGuidance;
   section?: EvidenceSection;
   source?: {
     artifact_id?: string;
@@ -306,7 +352,7 @@ const configurableMethods: Array<{ key: BooleanOptionKey; title: string; copy: s
   { key: 'recursive_extraction', title: 'Carving & recursion', copy: 'Embedded signatures, archives and nested image structures.' },
   { key: 'decoders', title: 'Encoding decoders', copy: 'Base encodings and bounded compression chains.' },
   { key: 'crypto_analysis', title: 'Encrypted payload recovery', copy: 'Detect ciphertext signals and try a supplied passphrase on bounded payloads.' },
-  { key: 'repairs', title: 'Repair candidates', copy: 'Hashed repair copies while preserving the original.' },
+  { key: 'repairs', title: 'Repair & uncrop candidates', copy: 'Recover hidden canvases and write hashed repair copies while preserving the original.' },
   { key: 'external_tools', title: 'External CLI tools', copy: 'Run installed command-line analyzers in bounded subprocesses.' },
   { key: 'external_extraction', title: 'External payload extraction', copy: 'Allow password-gated stego tools to write bounded child artifacts.' },
 ];
@@ -342,7 +388,7 @@ const repairConfigurableMethods: Array<{ key: BooleanOptionKey; title: string; c
   { key: 'recursive_extraction', title: 'Carving & recursion', copy: 'Recover embedded signatures, archive members and nested child files.' },
   { key: 'decoders', title: 'Encoding recovery', copy: 'Expand bounded Base encodings and compressed transform chains.' },
   { key: 'crypto_analysis', title: 'Encrypted payload recovery', copy: 'Inspect carved data and try a supplied passphrase on bounded payloads.' },
-  { key: 'repairs', title: 'Non-destructive repairs', copy: 'Write separate, hashed repair candidates without changing the source.' },
+  { key: 'repairs', title: 'Non-destructive repair & uncrop', copy: 'Recover encoded hidden canvas data and write separate hashed candidates without changing the source.' },
   { key: 'external_tools', title: 'Recovery tool adapters', copy: 'Run applicable validators, carvers and format tools in bounded subprocesses.' },
   { key: 'external_extraction', title: 'Recovered file output', copy: 'Allow tools to retain bounded child files and normalized copies.' },
 ];
@@ -403,9 +449,11 @@ const profiles: Array<{ id: Profile; symbol: string; name: string; copy: string;
 ];
 const resultTabs: Array<{ id: ResultTab; label: string }> = [
   { id: 'overview', label: 'Overview' },
+  { id: 'solve', label: 'Solve guide' },
   { id: 'traffic', label: 'Traffic lab' },
   { id: 'repairs', label: 'Repair lab' },
   { id: 'audio', label: 'Audio lab' },
+  { id: 'document', label: 'Document text' },
   { id: 'candidates', label: 'Flag candidates' },
   { id: 'artifacts', label: 'Artifacts' },
   { id: 'visual', label: 'Visual lab' },
@@ -418,6 +466,7 @@ const resultTabs: Array<{ id: ResultTab; label: string }> = [
 function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
   const startsWith = (...values: number[]) => values.every((value, index) => bytes[index] === value);
   const ascii = (offset = 0, length = 64) => new TextDecoder().decode(bytes.slice(offset, offset + length));
+  const bigEndian16 = (offset: number) => ((bytes[offset] || 0) << 8) | (bytes[offset + 1] || 0);
   const extension = file.name.includes('.') ? file.name.split('.').pop()?.toLowerCase() : '';
   const extensionLabels: Record<string, string> = {
     jpg: 'JPEG image', jpeg: 'JPEG image', png: 'PNG image', apng: 'APNG image', gif: 'GIF image',
@@ -426,10 +475,19 @@ function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
     m4a: 'M4A / AAC audio', aac: 'AAC audio', aif: 'AIFF audio', aiff: 'AIFF audio', au: 'AU audio', snd: 'AU audio',
     wma: 'WMA audio', amr: 'AMR audio', caf: 'CAF audio', mid: 'MIDI file', midi: 'MIDI file',
     pdf: 'PDF document', zip: 'ZIP archive', docx: 'ZIP / Office container', xlsx: 'ZIP / Office container', pptx: 'ZIP / Office container',
+    txt: 'Plain text document', text: 'Plain text document', md: 'Markdown document', markdown: 'Markdown document', rst: 'reStructuredText document', log: 'Text log', csv: 'CSV text data', tsv: 'TSV text data', json: 'JSON document', jsonl: 'JSON Lines document', xml: 'XML document', yaml: 'YAML document', yml: 'YAML document', ini: 'Configuration text', cfg: 'Configuration text', conf: 'Configuration text', toml: 'TOML document', html: 'HTML document', htm: 'HTML document',
+    doc: 'Legacy Office document', xls: 'Legacy Office spreadsheet', ppt: 'Legacy Office presentation', odt: 'OpenDocument text', ods: 'OpenDocument spreadsheet', odp: 'OpenDocument presentation', epub: 'EPUB document',
     '7z': '7-Zip archive', rar: 'RAR archive', tar: 'TAR archive', gz: 'GZip stream', bz2: 'BZip2 stream', xz: 'XZ stream', zst: 'Zstandard stream',
     pcap: 'PCAP capture', pcapng: 'PCAPNG capture', db: 'SQLite database', sqlite: 'SQLite database', sqlite3: 'SQLite database',
     eml: 'RFC 5322 email', rtf: 'RTF document', evtx: 'Windows EVTX log', pst: 'Outlook PST store', ost: 'Outlook OST store',
     e01: 'EWF / E01 disk image', raw: 'Raw disk or memory image', img: 'Raw disk image', dd: 'Raw disk image', vmem: 'Memory dump', dmp: 'Memory or crash dump',
+    mp4: 'MP4 video', mov: 'QuickTime video', mkv: 'Matroska video', webm: 'WebM video', avi: 'AVI video',
+    exe: 'Windows PE executable', dll: 'Windows PE library', sys: 'Windows PE driver', elf: 'ELF executable', so: 'ELF shared object', dylib: 'Mach-O library',
+    wasm: 'WebAssembly module', dex: 'Android DEX program', class: 'Java class file',
+    torrent: 'BitTorrent / bencode data', bencode: 'Bencode data',
+    cbor: 'CBOR structured data', cborseq: 'CBOR sequence', cose: 'COSE / CBOR data',
+    msgpack: 'MessagePack structured data', mpk: 'MessagePack structured data',
+    pb: 'Protocol Buffers data', protobuf: 'Protocol Buffers data',
   };
 
   if (startsWith(0x89, 0x50, 0x4e, 0x47)) return { label: 'PNG image', source: 'content' };
@@ -438,6 +496,9 @@ function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
   if (startsWith(0x42, 0x4d)) return { label: 'BMP image', source: 'content' };
   if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP') return { label: 'WebP image', source: 'content' };
   if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WAVE') return { label: 'WAV audio', source: 'content' };
+  if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'AVI ') return { label: 'AVI video', source: 'content' };
+  if (ascii(4, 4) === 'ftyp') return { label: ascii(8, 4) === 'qt  ' ? 'QuickTime video' : extension === 'm4a' ? 'M4A / AAC audio' : 'MP4 video', source: 'content' };
+  if (startsWith(0x1a, 0x45, 0xdf, 0xa3)) return { label: ascii(0, 4096).toLowerCase().includes('webm') ? 'WebM video' : 'Matroska video', source: 'content' };
   if (startsWith(0x49, 0x44, 0x33) || (bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0)) return { label: 'MP3 audio', source: 'content' };
   if (ascii(0, 4) === 'fLaC') return { label: 'FLAC audio', source: 'content' };
   if (ascii(0, 4) === 'OggS') return { label: 'Ogg audio', source: 'content' };
@@ -460,9 +521,17 @@ function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
   if (ascii(0, 4) === '!BDN') return { label: 'Outlook PST / OST store', source: 'content' };
   if (startsWith(0x7f, 0x45, 0x4c, 0x46)) return { label: 'ELF executable', source: 'content' };
   if (startsWith(0x4d, 0x5a)) return { label: 'Windows PE executable', source: 'content' };
+  if (startsWith(0x00, 0x61, 0x73, 0x6d)) return { label: 'WebAssembly module', source: 'content' };
+  if (ascii(0, 4) === 'dex\n' && bytes[7] === 0) return { label: 'Android DEX program', source: 'content' };
+  if (startsWith(0xca, 0xfe, 0xba, 0xbe) && bigEndian16(6) >= 45 && bigEndian16(6) <= 100) return { label: 'Java class file', source: 'content' };
+  if (startsWith(0xce, 0xfa, 0xed, 0xfe) || startsWith(0xcf, 0xfa, 0xed, 0xfe) || startsWith(0xfe, 0xed, 0xfa, 0xce) || startsWith(0xfe, 0xed, 0xfa, 0xcf) || startsWith(0xca, 0xfe, 0xba, 0xbf)) return { label: 'Mach-O executable', source: 'content' };
+  if (startsWith(0xd9, 0xd9, 0xf7)) return { label: 'Self-described CBOR data', source: 'content' };
+  if (ascii(0, 11) === 'd8:announce') return { label: 'BitTorrent / bencode data', source: 'content' };
   if (ascii(0, 4) === 'MThd') return { label: 'MIDI file', source: 'content' };
   if (ascii(0, 5).trimStart().startsWith('<svg')) return { label: 'SVG image', source: 'content' };
   if (/^(From:|Received:|MIME-Version:|Subject:)/m.test(ascii(0, 1024))) return { label: 'RFC 5322 email', source: 'content' };
+  if (extension && ['torrent', 'bencode', 'cbor', 'cborseq', 'cose', 'msgpack', 'mpk', 'pb', 'protobuf'].includes(extension)) return { label: extensionLabels[extension], source: 'extension' };
+  if (file.type.startsWith('text/')) return { label: 'Plain text document', source: 'browser' };
   if (file.type) return { label: file.type, source: 'browser' };
   if (extension && extensionLabels[extension]) return { label: extensionLabels[extension], source: 'extension' };
   return { label: 'Unknown binary / text file', source: 'content' };
@@ -526,6 +595,22 @@ function artifactRepairDetails(artifact: Artifact) {
     transformation: typeof entry.transformation === 'string' ? entry.transformation : 'Create a separate normalized recovery copy',
     reason: typeof entry.reason === 'string' ? entry.reason : 'The analyzer produced a bounded candidate that may restore a damaged structure.',
   };
+}
+function artifactRepairParameters(artifact: Artifact) {
+  const lineage = artifact.metadata?.lineage;
+  const entry = Array.isArray(lineage) && lineage[0] && typeof lineage[0] === 'object'
+    ? lineage[0] as Record<string, unknown>
+    : {};
+  return entry.parameters && typeof entry.parameters === 'object'
+    ? entry.parameters as Record<string, unknown>
+    : {};
+}
+function isUncropArtifact(artifact: Artifact) {
+  const details = artifactRepairDetails(artifact);
+  const parameters = artifactRepairParameters(artifact);
+  return /(?:uncrop|hidden (?:canvas|rows|columns|scanlines)|acropalypse|frame extents)/i.test(
+    `${artifactName(artifact)} ${details.producer} ${details.transformation} ${details.reason} ${String(parameters.recovery_method || '')}`,
+  );
 }
 function isRepairArtifact(artifact: Artifact) {
   if (artifact.kind === 'repair' || artifact.metadata?.repair_candidate === true) return true;
@@ -650,6 +735,23 @@ function normalizeUrl(url?: string) {
 }
 const SAFE_PREVIEW_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp']);
 const SAFE_AUDIO_MIME_TYPES = new Set(['audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/ogg', 'audio/flac', 'audio/mp4', 'audio/aac']);
+const TEXT_DOCUMENT_EXTENSIONS = new Set([
+  'txt', 'text', 'md', 'markdown', 'rst', 'log', 'csv', 'tsv', 'json', 'jsonl', 'ndjson', 'xml', 'yaml', 'yml', 'ini', 'cfg', 'conf', 'properties', 'toml', 'html', 'htm', 'xhtml', 'tex',
+  'pdf', 'rtf', 'doc', 'xls', 'ppt', 'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp', 'epub', 'eml',
+]);
+const TEXT_DOCUMENT_MEDIA_TYPES = new Set([
+  'application/pdf', 'application/rtf', 'text/rtf', 'message/rfc822', 'application/msword', 'application/vnd.ms-excel', 'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/vnd.oasis.opendocument.text', 'application/vnd.oasis.opendocument.spreadsheet', 'application/vnd.oasis.opendocument.presentation', 'application/epub+zip',
+]);
+function artifactSupportsTextPreview(artifact: Artifact) {
+  const extension = artifactName(artifact).split('.').pop()?.toLowerCase() || '';
+  const mediaType = artifactMediaType(artifact).split(';', 1)[0].trim().toLowerCase();
+  return TEXT_DOCUMENT_EXTENSIONS.has(extension)
+    || mediaType.startsWith('text/')
+    || TEXT_DOCUMENT_MEDIA_TYPES.has(mediaType)
+    || ['text', 'pdf', 'rtf', 'ole', 'eml'].includes(String(artifact.kind || artifact.detected_type || '').toLowerCase());
+}
 function artifactPreviewUrl(artifact: Artifact) {
   const raw = artifact.preview_url;
   const mediaType = artifactMediaType(artifact).split(';', 1)[0].trim().toLowerCase();
@@ -861,12 +963,23 @@ function PcapTrafficWorkspace({ inspection, findings, artifacts, jobId, sourceTy
   const [displayFilter, setDisplayFilter] = useState('');
   const [packetPage, setPacketPage] = useState(0);
   const [selectedPacketIndex, setSelectedPacketIndex] = useState<number | null>(null);
-  const packetRows = useMemo(() => trafficArray(inspection, 'packet_rows', 'packets', 'frames'), [inspection]);
+  const [wiresharkPacketRows, setWiresharkPacketRows] = useState<TrafficRecord[] | null>(null);
+  const [workbenchBusy, setWorkbenchBusy] = useState<'filter' | 'follow' | 'statistics' | null>(null);
+  const [workbenchError, setWorkbenchError] = useState('');
+  const [workbenchStatus, setWorkbenchStatus] = useState('');
+  const [followOutput, setFollowOutput] = useState('');
+  const [followLabel, setFollowLabel] = useState('');
+  const [statisticsOutput, setStatisticsOutput] = useState('');
+  const [selectedStatistic, setSelectedStatistic] = useState('protocol_hierarchy');
+  const [keylogArtifactId, setKeylogArtifactId] = useState('');
+  const suppliedPacketRows = useMemo(() => trafficArray(inspection, 'packet_rows', 'packets', 'frames'), [inspection]);
+  const packetRows = wiresharkPacketRows ?? suppliedPacketRows;
   const suppliedProtocols = useMemo(() => trafficArray(inspection, 'protocol_hierarchy', 'protocols'), [inspection]);
   const suppliedEndpoints = useMemo(() => trafficArray(inspection, 'endpoints', 'hosts'), [inspection]);
   const suppliedConversations = useMemo(() => trafficArray(inspection, 'conversations', 'flows'), [inspection]);
   const suppliedStreams = useMemo(() => trafficArray(inspection, 'streams', 'tcp_streams', 'udp_streams'), [inspection]);
   const suppliedObjects = useMemo(() => trafficArray(inspection, 'objects', 'exported_objects', 'transferred_objects'), [inspection]);
+  const keylogArtifacts = useMemo(() => artifacts.filter((artifact) => artifact.kind !== 'original' && (artifactMediaType(artifact).startsWith('text/') || /(?:ssl|tls|keylog|secret).*(?:\.log|\.txt|\.keys?)$/i.test(artifactName(artifact)))), [artifacts]);
   const dnsRows = useMemo(() => trafficArray(inspection, 'dns', 'dns_records', 'dns_messages'), [inspection]);
   const httpRows = useMemo(() => trafficArray(inspection, 'http', 'http_messages', 'http_requests'), [inspection]);
   const tlsRows = useMemo(() => trafficArray(inspection, 'tls', 'tls_records', 'tls_handshakes'), [inspection]);
@@ -934,8 +1047,56 @@ function PcapTrafficWorkspace({ inspection, findings, artifacts, jobId, sourceTy
     return artifacts.filter((artifact) => artifact.kind !== 'original').map((artifact) => ({ artifact_id: artifactId(artifact), name: artifactName(artifact), protocol: artifactOrigin(artifact), size: artifactSize(artifact), media_type: artifactMediaType(artifact), sha256: artifact.sha256, download_url: artifact.download_url }));
   }, [artifacts, suppliedObjects]);
 
-  const filteredPackets = useMemo(() => packetRows.filter((packet) => packetMatchesDisplayFilter(packet, displayFilter)), [displayFilter, packetRows]);
-  useEffect(() => { setPacketPage(0); setSelectedPacketIndex(null); }, [displayFilter]);
+  function changeDisplayFilter(value: string) {
+    setDisplayFilter(value);
+    setWiresharkPacketRows(null);
+    setWorkbenchError('');
+    setWorkbenchStatus('');
+    setPacketPage(0);
+    setSelectedPacketIndex(null);
+  }
+
+  async function trafficQuery(body: TrafficRecord) {
+    return await readJson<TrafficRecord>(await fetch(`${API_BASE}/api/jobs/${jobId}/traffic/query`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(keylogArtifactId ? { ...body, keylog_artifact_id: keylogArtifactId } : body), cache: 'no-store',
+    }));
+  }
+
+  async function runWiresharkFilter() {
+    setWorkbenchBusy('filter'); setWorkbenchError(''); setWorkbenchStatus('');
+    try {
+      const result = await trafficQuery({ action: 'packets', display_filter: displayFilter, packet_limit: 500, include_raw_bytes: false });
+      const rows = Array.isArray(result.packet_rows) ? result.packet_rows.filter((row): row is TrafficRecord => Boolean(row) && typeof row === 'object' && !Array.isArray(row)) : [];
+      setWiresharkPacketRows(rows); setPacketPage(0); setSelectedPacketIndex(null);
+      setWorkbenchStatus(`TShark decoded ${rows.length.toLocaleString()} matching packet${rows.length === 1 ? '' : 's'} with the genuine Wireshark display-filter engine.`);
+    } catch (error) { setWorkbenchError(error instanceof Error ? error.message : 'TShark could not run this filter.'); }
+    finally { setWorkbenchBusy(null); }
+  }
+
+  async function runFollowStream(row: TrafficRecord, index: number) {
+    const streamIndex = Math.max(0, Math.trunc(Number(trafficValue(row, ['stream_id', 'stream', 'id'], String(index))))) || 0;
+    const namedProtocol = trafficValue(row, ['protocol', 'transport'], 'tcp').toLowerCase();
+    const protocol = namedProtocol.includes('udp') ? 'udp' : namedProtocol.includes('tls') ? 'tls' : namedProtocol.includes('http2') ? 'http2' : namedProtocol === 'http' ? 'http' : 'tcp';
+    setWorkbenchBusy('follow'); setWorkbenchError(''); setFollowOutput('');
+    try {
+      const result = await trafficQuery({ action: 'follow', follow_protocol: protocol, stream_index: streamIndex, follow_mode: 'ascii' });
+      setFollowOutput(typeof result.output === 'string' ? result.output : 'No stream bytes were returned.');
+      setFollowLabel(`${protocol.toUpperCase()} stream ${streamIndex}`);
+    } catch (error) { setWorkbenchError(error instanceof Error ? error.message : 'TShark could not follow this stream.'); }
+    finally { setWorkbenchBusy(null); }
+  }
+
+  async function runStatistic(statistic: string, label: string) {
+    setSelectedStatistic(statistic); setWorkbenchBusy('statistics'); setWorkbenchError(''); setStatisticsOutput('');
+    try {
+      const result = await trafficQuery({ action: 'statistics', statistic });
+      setStatisticsOutput(typeof result.output === 'string' ? result.output : 'No statistics output was returned.');
+      setWorkbenchStatus(`${label} generated by TShark's official statistics tap.`);
+    } catch (error) { setWorkbenchError(error instanceof Error ? error.message : 'TShark could not generate these statistics.'); }
+    finally { setWorkbenchBusy(null); }
+  }
+
+  const filteredPackets = useMemo(() => wiresharkPacketRows === null ? packetRows.filter((packet) => packetMatchesDisplayFilter(packet, displayFilter)) : packetRows, [displayFilter, packetRows, wiresharkPacketRows]);
   const pageSize = 100;
   const pageCount = Math.max(1, Math.ceil(filteredPackets.length / pageSize));
   const pagePackets = filteredPackets.slice(packetPage * pageSize, (packetPage + 1) * pageSize);
@@ -954,15 +1115,22 @@ function PcapTrafficWorkspace({ inspection, findings, artifacts, jobId, sourceTy
   const protocolNames = protocols.slice(0, 8).map((row) => trafficValue(row, ['protocol', 'name', 'label'], 'OTHER'));
   const selectedPayloadHex = selectedPacket ? trafficValue(selectedPacket, ['payload_hex', 'data_hex', 'hex'], '') : '';
   const selectedPayloadText = selectedPacket ? trafficValue(selectedPacket, ['payload_ascii', 'payload_text', 'ascii', 'text'], '') : '';
+  const statisticItems = [
+    ['protocol_hierarchy', 'Protocol hierarchy'], ['io_graph', 'I/O by second'], ['packet_lengths', 'Packet lengths'], ['flow_graph', 'Flow graph'],
+    ['endpoints', 'All endpoints'], ['conversations', 'All conversations'], ['dns', 'DNS tree'], ['http', 'HTTP statistics'],
+    ['http_requests', 'HTTP requests'], ['http2', 'HTTP/2 statistics'], ['icmp', 'ICMP response times'], ['sip', 'SIP statistics'],
+    ['rtp', 'RTP streams'], ['smb2', 'SMB2 response times'], ['expert', 'Expert information'], ['credentials', 'Credentials'],
+  ] as const;
 
   const paneItems: Array<{ id: TrafficPane; label: string; count: number }> = [
     { id: 'packets', label: 'Packets', count: packetRows.length }, { id: 'protocols', label: 'Protocols', count: protocols.length },
     { id: 'endpoints', label: 'Endpoints', count: endpoints.length }, { id: 'conversations', label: 'Conversations', count: conversations.length },
     { id: 'streams', label: 'Streams', count: streams.length }, { id: 'objects', label: 'Objects', count: objects.length }, { id: 'events', label: 'Protocol events', count: eventGroups.length },
+    { id: 'analysis', label: 'TShark analysis', count: statisticItems.length },
   ];
 
   return <section className="tab-panel pcap-workspace">
-    <header className="pcap-heading"><div><p className="eyebrow">Packet investigation</p><h2>Traffic laboratory</h2><p>Wireshark-style inspection with display filters, packet details, flow pivots, stream recovery and exported objects.</p></div><div className="pcap-live-badge"><span />{sourceType.toUpperCase()} · read-only</div></header>
+    <header className="pcap-heading"><div><p className="eyebrow">Packet investigation</p><h2>Traffic laboratory</h2><p>Offline Wireshark/TShark inspection with genuine display filters, decoded fields, flow pivots, stream recovery, statistics and exported objects.</p></div><div className="pcap-live-badge"><span />{sourceType.toUpperCase()} · read-only</div></header>
     <div className="pcap-stat-grid">
       <div><span>Packets</span><strong>{packetCount.toLocaleString()}</strong><small>{packetRows.length.toLocaleString()} indexed rows</small></div>
       <div><span>Captured</span><strong>{formatBytes(totalBytes)}</strong><small>bounded evidence bytes</small></div>
@@ -974,8 +1142,9 @@ function PcapTrafficWorkspace({ inspection, findings, artifacts, jobId, sourceTy
     <nav className="pcap-nav" aria-label="Traffic analysis views">{paneItems.map((item) => <button key={item.id} className={pane === item.id ? 'active' : ''} onClick={() => setPane(item.id)}><span>{item.label}</span><em>{item.count.toLocaleString()}</em></button>)}</nav>
 
     {pane === 'packets' && <div className="pcap-packet-pane">
-      <div className="pcap-filter-bar"><span>⌕</span><label className="sr-only" htmlFor="pcap-display-filter">Packet display filter</label><input id="pcap-display-filter" value={displayFilter} onChange={(event) => setDisplayFilter(event.target.value.slice(0, 512))} placeholder="Display filter: tcp && ip.addr == 10.0.0.5, udp.port == 53, info contains flag…" spellCheck={false} />{displayFilter ? <button onClick={() => setDisplayFilter('')}>Clear</button> : <kbd>Ctrl + /</kbd>}<small>{filteredPackets.length.toLocaleString()} shown</small></div>
-      <div className="pcap-filter-chips"><span>Quick filters</span>{protocolNames.map((protocol) => <button key={protocol} onClick={() => setDisplayFilter(protocol.toLowerCase())}>{protocol}</button>)}<button onClick={() => setDisplayFilter('info contains flag')}>Flag text</button><button onClick={() => setDisplayFilter('tcp.port == 80 || tcp.port == 443')}>Web</button></div>
+      <div className="pcap-filter-bar"><span>⌕</span><label className="sr-only" htmlFor="pcap-display-filter">Packet display filter</label><input id="pcap-display-filter" value={displayFilter} onChange={(event) => changeDisplayFilter(event.target.value.slice(0, 512))} onKeyDown={(event) => { if (event.key === 'Enter' && !workbenchBusy) void runWiresharkFilter(); }} placeholder="Wireshark filter: tcp && ip.addr == 10.0.0.5, udp.port == 53, http.request…" spellCheck={false} />{displayFilter ? <button onClick={() => changeDisplayFilter('')}>Clear</button> : <kbd>Enter</kbd>}<button className="pcap-tshark-run" disabled={Boolean(workbenchBusy)} onClick={() => void runWiresharkFilter()}>{workbenchBusy === 'filter' ? 'Decoding…' : 'Run TShark'}</button><small>{filteredPackets.length.toLocaleString()} shown</small></div>
+      {(workbenchError || workbenchStatus) && <div className={`pcap-workbench-message ${workbenchError ? 'error' : 'success'}`}>{workbenchError || workbenchStatus}</div>}
+      <div className="pcap-filter-chips"><span>Quick filters</span>{protocolNames.map((protocol) => <button key={protocol} onClick={() => changeDisplayFilter(protocol.toLowerCase())}>{protocol}</button>)}<button onClick={() => changeDisplayFilter('frame contains "flag"')}>Flag bytes</button><button onClick={() => changeDisplayFilter('tcp.port == 80 || tcp.port == 443')}>Web</button></div>
       <div className={`pcap-packet-layout ${selectedPacket ? 'has-inspector' : ''}`}>
         <div className="pcap-table-wrap"><div className="pcap-packet-table" role="table" aria-label="Capture packets"><div className="pcap-packet-head" role="row"><span>No.</span><span>Time</span><span>Source</span><span>Destination</span><span>Protocol</span><span>Length</span><span>Info</span></div>{pagePackets.map((packet, pageIndex) => {
           const absoluteIndex = packetPage * pageSize + pageIndex; const protocol = trafficValue(packet, ['protocol', 'highest_protocol', '_ws_col_protocol'], 'OTHER');
@@ -992,11 +1161,13 @@ function PcapTrafficWorkspace({ inspection, findings, artifacts, jobId, sourceTy
 
     {pane === 'conversations' && <div className="pcap-data-pane"><div className="pcap-pane-heading"><div><p className="eyebrow">Flow statistics</p><h3>Conversations</h3></div><span>Bidirectional endpoint pairs</span></div><div className="pcap-generic-table conversations"><div className="pcap-generic-head"><span>Protocol</span><span>Endpoint A</span><span>Endpoint B</span><span>Packets</span><span>Bytes</span><span>Duration</span></div>{conversations.map((row, index) => <article key={`${trafficValue(row, ['endpoint_a', 'source', 'src'], String(index))}-${index}`}><span><em>{trafficValue(row, ['protocol', 'transport'], 'FLOW')}</em></span><strong className="mono">{trafficValue(row, ['endpoint_a', 'source', 'src'])}</strong><strong className="mono">{trafficValue(row, ['endpoint_b', 'destination', 'dst'])}</strong><span>{trafficNumber(row, ['packets', 'packet_count']).toLocaleString()}</span><span>{formatBytes(trafficNumber(row, ['bytes', 'byte_count']))}</span><span>{trafficValue(row, ['duration', 'duration_seconds'], '—')}</span></article>)}</div></div>}
 
-    {pane === 'streams' && <div className="pcap-data-pane"><div className="pcap-pane-heading"><div><p className="eyebrow">Reassembly</p><h3>Follow streams</h3></div><span>Contiguous TCP/UDP payload views and recovered channels</span></div><div className="pcap-stream-grid">{streams.map((row, index) => <article key={`${trafficValue(row, ['stream_id', 'stream', 'id'], String(index))}-${index}`}><header><span>{trafficValue(row, ['protocol', 'transport'], 'STREAM')}</span><strong>Stream {trafficValue(row, ['stream_id', 'stream', 'id'], String(index))}</strong><em>{formatBytes(trafficNumber(row, ['bytes', 'byte_count']))}</em></header><p><code>{trafficValue(row, ['source', 'endpoint_a', 'src'])}</code><span>⇄</span><code>{trafficValue(row, ['destination', 'endpoint_b', 'dst'])}</code></p><small>{trafficNumber(row, ['packets', 'packet_count']).toLocaleString()} packets{trafficNumber(row, ['gaps', 'gap_count']) ? ` · ${trafficNumber(row, ['gaps', 'gap_count'])} gaps` : ''}{trafficNumber(row, ['overlaps', 'overlap_count']) ? ` · ${trafficNumber(row, ['overlaps', 'overlap_count'])} overlaps` : ''}</small>{trafficValue(row, ['preview', 'text', 'ascii'], '') && <pre>{boundedDisplay(trafficValue(row, ['preview', 'text', 'ascii']), 3000)}</pre>}<details className="raw-details"><summary>Stream metadata</summary><pre>{JSON.stringify(row, null, 2)}</pre></details></article>)}{!streams.length && <div className="pcap-empty"><span>⇄</span><strong>No numbered transport streams were exposed</strong><p>Recovered stream content can still appear in Findings and Artifacts.</p></div>}</div></div>}
+    {pane === 'streams' && <div className="pcap-data-pane"><div className="pcap-pane-heading"><div><p className="eyebrow">Reassembly</p><h3>Follow streams</h3></div><span>Native previews plus Wireshark&apos;s protocol-aware follow-stream taps</span></div>{workbenchError && <div className="pcap-workbench-message error">{workbenchError}</div>}{followOutput && <section className="pcap-follow-output"><header><strong>{followLabel}</strong><button onClick={() => setFollowOutput('')}>Close</button></header><pre>{boundedDisplay(followOutput, 250000)}</pre></section>}<div className="pcap-stream-grid">{streams.map((row, index) => <article key={`${trafficValue(row, ['stream_id', 'stream', 'id'], String(index))}-${index}`}><header><span>{trafficValue(row, ['protocol', 'transport'], 'STREAM')}</span><strong>Stream {trafficValue(row, ['stream_id', 'stream', 'id'], String(index))}</strong><em>{formatBytes(trafficNumber(row, ['bytes', 'byte_count']))}</em></header><p><code>{trafficValue(row, ['source', 'endpoint_a', 'src'])}</code><span>⇄</span><code>{trafficValue(row, ['destination', 'endpoint_b', 'dst'])}</code></p><small>{trafficNumber(row, ['packets', 'packet_count']).toLocaleString()} packets{trafficNumber(row, ['gaps', 'gap_count']) ? ` · ${trafficNumber(row, ['gaps', 'gap_count'])} gaps` : ''}{trafficNumber(row, ['overlaps', 'overlap_count']) ? ` · ${trafficNumber(row, ['overlaps', 'overlap_count'])} overlaps` : ''}</small>{trafficValue(row, ['preview', 'text', 'ascii'], '') && <pre>{boundedDisplay(trafficValue(row, ['preview', 'text', 'ascii']), 3000)}</pre>}<button className="pcap-follow-button" disabled={Boolean(workbenchBusy)} onClick={() => void runFollowStream(row, index)}>{workbenchBusy === 'follow' ? 'Following…' : 'Follow with TShark'}</button><details className="raw-details"><summary>Stream metadata</summary><pre>{JSON.stringify(row, null, 2)}</pre></details></article>)}{!streams.length && <div className="pcap-empty"><span>⇄</span><strong>No numbered transport streams were exposed</strong><p>Recovered stream content can still appear in Findings and Artifacts.</p></div>}</div></div>}
 
     {pane === 'objects' && <div className="pcap-data-pane"><div className="pcap-pane-heading"><div><p className="eyebrow">Export objects</p><h3>Transferred files</h3></div><span>HTTP, SMB, TFTP, IMF and carved payloads</span></div><div className="pcap-object-list">{objects.map((row, index) => { const publicId = trafficValue(row, ['artifact_id', 'id'], ''); const artifact = artifacts.find((item) => artifactId(item) === publicId); const rawDownload = trafficValue(row, ['download_url'], '') || artifact?.download_url || ''; const download = normalizeUrl(rawDownload) || (publicId ? `${API_BASE}/api/jobs/${jobId}/artifacts/${publicId}/download` : ''); return <article key={`${publicId}-${trafficValue(row, ['name', 'filename', 'logical_name'], String(index))}`}><span>⇩</span><div><strong>{trafficValue(row, ['name', 'filename', 'logical_name'], `Object ${index + 1}`)}</strong><small>{trafficValue(row, ['protocol', 'producer', 'source'], 'Network payload')} · {trafficValue(row, ['media_type', 'mime_type', 'kind'], 'binary')} · {formatBytes(trafficNumber(row, ['size', 'size_bytes', 'bytes']))}</small><code>{trafficValue(row, ['sha256', 'hash'], '')}</code></div>{download ? <a href={download}>Download ↓</a> : <em>Recorded</em>}</article>; })}{!objects.length && <div className="pcap-empty"><span>⇩</span><strong>No transferable objects were reconstructed</strong><p>Object extraction results appear here when protocol data yields a bounded file.</p></div>}</div></div>}
 
     {pane === 'events' && <div className="pcap-data-pane"><div className="pcap-pane-heading"><div><p className="eyebrow">Protocol intelligence</p><h3>DNS, HTTP, TLS &amp; expert events</h3></div><span>{dnsRows.length} DNS · {httpRows.length} HTTP · {tlsRows.length} TLS · {eventRows.length} expert</span></div><div className="pcap-event-list">{eventGroups.map((row, index) => <article key={`${trafficValue(row, ['event_kind'], 'Event')}-${index}`}><span className={`event-${trafficValue(row, ['event_kind'], 'expert').toLowerCase()}`}>{trafficValue(row, ['event_kind'], 'Expert')}</span><div><strong>{trafficValue(row, ['name', 'query', 'host', 'method', 'server_name', 'title', 'summary'], `Protocol event ${index + 1}`)}</strong><p>{trafficValue(row, ['info', 'description', 'answer', 'target', 'uri', 'subject', 'details'], 'Structured protocol evidence')}</p><small>{trafficValue(row, ['source', 'src'], '')}{trafficValue(row, ['destination', 'dst'], '') ? ` → ${trafficValue(row, ['destination', 'dst'])}` : ''}{trafficValue(row, ['time', 'timestamp', 'frame_number'], '') ? ` · ${trafficValue(row, ['time', 'timestamp', 'frame_number'])}` : ''}</small></div><details className="raw-details"><summary>Fields</summary><pre>{JSON.stringify(row, null, 2)}</pre></details></article>)}{!eventGroups.length && <div className="pcap-empty"><span>◇</span><strong>No structured service events were returned</strong><p>Packet rows and stream reconstruction remain available.</p></div>}</div></div>}
+
+    {pane === 'analysis' && <div className="pcap-data-pane pcap-tshark-pane"><div className="pcap-pane-heading"><div><p className="eyebrow">Wireshark statistics</p><h3>TShark analysis workbench</h3></div><span>Official dissectors and statistics taps · uploaded capture only</span></div><div className="pcap-tshark-intro"><p>Run protocol hierarchy, timing, flow, service, telephony and expert analysis on demand. Commands are fixed, read-only and bounded; live capture, packet injection and capture-supplied plugin loading are unavailable. Embedded PCAPNG secrets are used automatically.</p>{keylogArtifacts.length ? <label><span>Optional TLS key-log artifact</span><select value={keylogArtifactId} onChange={(event) => { setKeylogArtifactId(event.target.value); setWorkbenchStatus(''); setStatisticsOutput(''); }}><option value="">Use embedded secrets only</option>{keylogArtifacts.map((artifact) => <option key={artifactId(artifact)} value={artifactId(artifact)}>{artifactName(artifact)}</option>)}</select><small>The server validates NSS key-log syntax and never copies key material into workbench results.</small></label> : <small>To decrypt a separate TLS session, include an NSS key-log text artifact in this job; the workbench does not copy its key material into results.</small>}</div><div className="pcap-statistic-grid">{statisticItems.map(([id, label]) => <button key={id} className={selectedStatistic === id ? 'active' : ''} disabled={Boolean(workbenchBusy)} onClick={() => void runStatistic(id, label)}><span>{label}</span><small>{workbenchBusy === 'statistics' && selectedStatistic === id ? 'Running…' : id.replaceAll('_', ' ')}</small></button>)}</div>{workbenchError && <div className="pcap-workbench-message error">{workbenchError}</div>}{workbenchStatus && !workbenchError && <div className="pcap-workbench-message success">{workbenchStatus}</div>}{statisticsOutput ? <section className="pcap-statistics-output"><header><strong>{statisticItems.find(([id]) => id === selectedStatistic)?.[1] || 'Statistics'}</strong><button onClick={() => setStatisticsOutput('')}>Clear</button></header><pre>{boundedDisplay(statisticsOutput, 500000)}</pre></section> : <div className="pcap-empty"><span>⌁</span><strong>Select a statistics family</strong><p>TShark output will appear here without altering the evidence file.</p></div>}</div>}
   </section>;
 }
 
@@ -1069,6 +1240,10 @@ function HomeWorkbench() {
   const [fullscreenSkewX, setFullscreenSkewX] = useState(0);
   const [fullscreenSkewY, setFullscreenSkewY] = useState(0);
   const [selectedArtifact, setSelectedArtifact] = useState<Artifact | null>(null);
+  const [textPreviewArtifactId, setTextPreviewArtifactId] = useState('');
+  const [textPreview, setTextPreview] = useState<TextPreview | null>(null);
+  const [textPreviewLoading, setTextPreviewLoading] = useState(false);
+  const [textPreviewError, setTextPreviewError] = useState('');
   const [hexArtifactId, setHexArtifactId] = useState('');
   const [hexOffset, setHexOffset] = useState(0);
   const [hexOffsetInput, setHexOffsetInput] = useState('0');
@@ -1106,7 +1281,7 @@ function HomeWorkbench() {
 
   const refreshRecent = useCallback(async () => {
     try {
-      const payload = await readJson<unknown>(await fetch(`${API_BASE}/api/jobs`, { cache: 'no-store' }));
+      const payload = await readJson<unknown>(await fetch(`${API_BASE}/api/jobs?detail=summary&limit=5`, { cache: 'no-store' }));
       const record = payload && typeof payload === 'object' ? payload as { items?: Job[]; jobs?: Job[] } : {};
       setRecentJobs(Array.isArray(payload) ? payload as Job[] : record.items || record.jobs || []);
     } catch { /* the engine indicator already explains offline state */ }
@@ -1223,7 +1398,6 @@ function HomeWorkbench() {
         if (!polling) polling = setInterval(poll, 1200);
       };
     } catch { polling = setInterval(poll, 1200); }
-    polling ||= setInterval(poll, 2500);
     return () => { events?.close(); if (polling) clearInterval(polling); };
   }, [activeJobId, screen, refreshJob]);
 
@@ -1246,7 +1420,16 @@ function HomeWorkbench() {
   const isRecoveryResult = result?.section === 'corrupted' || job?.options?.evidence_type === 'corrupted' || evidenceSection === 'corrupted';
   const candidates = useMemo(() => getCandidates(result).slice().sort((a, b) => scoreOf(b) - scoreOf(a)), [result]);
   const artifacts = useMemo(() => job?.artifacts?.length ? job.artifacts : getArtifacts(result), [job, result]);
+  const sourceDetectedKind = String(result?.source?.detected_type || '').toLowerCase();
+  const textPreviewArtifacts = useMemo(() => artifacts.filter((artifact) => artifactSupportsTextPreview(artifact) || (
+    artifact.kind === 'original' && ['text', 'pdf', 'rtf', 'ole', 'eml', 'zip'].includes(sourceDetectedKind)
+  )), [artifacts, sourceDetectedKind]);
+  const selectedTextPreviewArtifact = useMemo(() => {
+    const selected = textPreviewArtifacts.find((artifact) => artifactId(artifact) === textPreviewArtifactId);
+    return selected || textPreviewArtifacts.find((artifact) => artifact.kind === 'original') || textPreviewArtifacts[0] || null;
+  }, [textPreviewArtifactId, textPreviewArtifacts]);
   const repairArtifacts = useMemo(() => artifacts.filter(isRepairArtifact), [artifacts]);
+  const uncropArtifacts = useMemo(() => repairArtifacts.filter(isUncropArtifact), [repairArtifacts]);
   const hexArtifactChoices = useMemo(() => artifacts.filter((artifact) => artifactId(artifact)), [artifacts]);
   const defaultHexArtifactId = artifactId(hexArtifactChoices.find((artifact) => artifact.kind === 'original') || hexArtifactChoices[0] || {});
   const effectiveHexArtifactId = hexArtifactChoices.some((artifact) => artifactId(artifact) === hexArtifactId) ? hexArtifactId : defaultHexArtifactId;
@@ -1331,6 +1514,29 @@ function HomeWorkbench() {
     }, 320);
     return () => { window.clearTimeout(timer); controller.abort(); };
   }, [activeHexArtifact, activeJobId, activeTab, hexEdits, replaceHexPreviewUrl]);
+  useEffect(() => {
+    if (activeTab !== 'document' || !activeJobId || !selectedTextPreviewArtifact) return;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setTextPreviewLoading(true);
+      setTextPreviewError('');
+      setTextPreview(null);
+      void (async () => {
+        try {
+          const preview = await readJson<TextPreview>(await fetch(
+            `${API_BASE}/api/jobs/${activeJobId}/artifacts/${artifactId(selectedTextPreviewArtifact)}/text-preview`,
+            { cache: 'no-store', signal: controller.signal },
+          ));
+          if (!controller.signal.aborted) setTextPreview(preview);
+        } catch (caught) {
+          if (!controller.signal.aborted) setTextPreviewError(caught instanceof Error ? caught.message : 'The document text preview could not be loaded.');
+        } finally {
+          if (!controller.signal.aborted) setTextPreviewLoading(false);
+        }
+      })();
+    }, 0);
+    return () => { window.clearTimeout(timer); controller.abort(); };
+  }, [activeJobId, activeTab, selectedTextPreviewArtifact]);
   const methods = useMemo(() => getMethods(result), [result]);
   const publicArtifactsByEngineId = useMemo(() => {
     const map = new Map<string, Artifact>();
@@ -1359,10 +1565,15 @@ function HomeWorkbench() {
   const declaredExternalToolIds = useMemo(() => new Set(capabilities.map((capability) => capability.id).filter((id): id is string => Boolean(id))), [capabilities]);
   const capabilitiesById = useMemo(() => new Map(capabilities.map((capability) => [capability.id || capability.executable || '', capability])), [capabilities]);
   const findings = useMemo(() => result?.findings || [], [result]);
-  const recoveryFindings = useMemo(() => findings.filter((finding) => ['identity', 'integrity', 'structure', 'repair', 'embedded-data', 'resource-limit'].includes((finding.category || '').toLowerCase())), [findings]);
+  const recoveryFindings = useMemo(() => findings.filter((finding) => ['identity', 'integrity', 'structure', 'repair', 'forensic-recovery', 'embedded-data', 'resource-limit'].includes((finding.category || '').toLowerCase())), [findings]);
   const damageFindings = useMemo(() => recoveryFindings.filter((finding) => (finding.category || '').toLowerCase() !== 'repair'), [recoveryFindings]);
   const recoveryMethods = useMemo(() => methods.filter((method) => ['identity', 'structure', 'repair', 'embedded-data'].includes((method.category || '').toLowerCase()) || ['built-in-core', 'built-in-structure', 'pcrt', 'jpegtran', 'binwalk', 'foremost', '7z'].includes(method.id || method.tool_id || '')), [methods]);
   const metadataRows = useMemo(() => flattenMetadata(Array.isArray(result?.metadata) ? result?.metadata[0] || {} : result?.metadata || {}), [result]);
+  const solveGuidance = result?.solve_guidance;
+  const solveNodes = useMemo(() => solveGuidance?.nodes || [], [solveGuidance]);
+  const solveEdges = useMemo(() => solveGuidance?.edges || [], [solveGuidance]);
+  const solveRecommendations = useMemo(() => solveGuidance?.recommendations || [], [solveGuidance]);
+  const solveNodeMap = useMemo(() => new Map(solveNodes.map((node) => [node.id, node])), [solveNodes]);
   const normalizedQuery = resultQuery.trim().toLowerCase();
   const queryMatches = useCallback((...values: unknown[]) => !normalizedQuery || searchable(...values).includes(normalizedQuery), [normalizedQuery]);
   const filteredCandidates = candidates.filter((candidate) =>
@@ -1381,6 +1592,12 @@ function HomeWorkbench() {
   );
   const filteredMetadata = metadataRows.filter((row) => queryMatches(row.path, row.value));
   const filteredFindings = findings.filter((finding) => queryMatches(finding.title, finding.description, finding.summary, finding.category, finding.method_id));
+  const filteredSolveRecommendations = solveRecommendations.filter((item) => queryMatches(item.title, item.reason, item.action, item.method_ids, item.tool_ids));
+  const filteredSolveEdges = solveEdges.filter((edge) => {
+    const source = solveNodeMap.get(edge.source);
+    const target = solveNodeMap.get(edge.target);
+    return queryMatches(edge.relation, source?.label, source?.status, target?.label, target?.status);
+  });
   const filteredRecoveryFindings = recoveryFindings.filter((finding) => queryMatches(finding.title, finding.description, finding.summary, finding.category, finding.method_id));
   const filteredVisuals = visuals.filter((view) => queryMatches(view.title, view.name, view.kind, view.category));
   const audioKinds = new Set(['audio', 'wav', 'aiff', 'flac', 'ogg', 'mp3', 'aac', 'm4a', 'au', 'asf', 'amr', 'caf', 'midi']);
@@ -1398,6 +1615,7 @@ function HomeWorkbench() {
     if (tab.id === 'traffic') return isPcapResult;
     if (tab.id === 'audio') return isAudioResult;
     if (tab.id === 'repairs') return isRecoveryResult || repairArtifacts.length > 0;
+    if (tab.id === 'document') return textPreviewArtifacts.length > 0;
     return true;
   });
   const originalArtifact = artifacts.find((artifact) => artifact.kind === 'original');
@@ -1740,6 +1958,9 @@ function HomeWorkbench() {
     setSelectedVisual(null);
     setFullscreenVisual(null);
     setSelectedArtifact(null);
+    setTextPreviewArtifactId('');
+    setTextPreview(null);
+    setTextPreviewError('');
     setHexArtifactId('');
     setHexOffset(0);
     setHexOffsetInput('0');
@@ -1751,27 +1972,6 @@ function HomeWorkbench() {
     setHexDerivedName('');
     setResultQuery('');
     setMethodFilter('all');
-  }
-
-  function selectEvidenceSection(next: EvidenceSection) {
-    setEvidenceSection(next);
-    setScreen('setup');
-    setSelectedFile(null);
-    if (fileInput.current) fileInput.current.value = '';
-    setJob(null);
-    setError('');
-    setActivity([]);
-    setActiveTab('overview');
-    setSelectedVisual(null);
-    setFullscreenVisual(null);
-    setSelectedArtifact(null);
-    setHexView(null);
-    setHexError('');
-    discardHexEdits();
-    setHexDerivedName('');
-    setResultQuery('');
-    setToolInstallReport(null);
-    setScanOptions({ ...profileOptionDefaults[profile], evidence_type: next });
   }
 
   function openFullscreenVisual(view: VisualView) {
@@ -2157,7 +2357,7 @@ function HomeWorkbench() {
             )}
 
             <nav className="result-tabs" aria-label="Analysis result sections">
-              {activeResultTabs.map((tab) => <button key={tab.id} className={activeTab === tab.id ? 'active' : ''} onClick={() => setActiveTab(tab.id)}>{tab.label}{tab.id === 'traffic' && <span>{trafficPacketCount}</span>}{tab.id === 'repairs' && <span>{repairArtifacts.length}</span>}{tab.id === 'audio' && <span>{audioVisuals.length}</span>}{tab.id === 'candidates' && <span>{candidates.length}</span>}{tab.id === 'artifacts' && <span>{artifacts.length}</span>}{tab.id === 'metadata' && <span>{metadataRows.length}</span>}{tab.id === 'tools' && <span>{toolMethods.length}</span>}{tab.id === 'methods' && <span>{methods.length}</span>}</button>)}
+              {activeResultTabs.map((tab) => <button key={tab.id} className={activeTab === tab.id ? 'active' : ''} onClick={() => setActiveTab(tab.id)}>{tab.label}{tab.id === 'solve' && <span>{solveRecommendations.length}</span>}{tab.id === 'traffic' && <span>{trafficPacketCount}</span>}{tab.id === 'repairs' && <span>{repairArtifacts.length}</span>}{tab.id === 'audio' && <span>{audioVisuals.length}</span>}{tab.id === 'document' && <span>{textPreviewArtifacts.length}</span>}{tab.id === 'candidates' && <span>{candidates.length}</span>}{tab.id === 'artifacts' && <span>{artifacts.length}</span>}{tab.id === 'metadata' && <span>{metadataRows.length}</span>}{tab.id === 'tools' && <span>{toolMethods.length}</span>}{tab.id === 'methods' && <span>{methods.length}</span>}</button>)}
             </nav>
 
             {activeTab !== 'traffic' && <div className="result-search">
@@ -2199,6 +2399,48 @@ function HomeWorkbench() {
                 </div>
               )}
 
+              {activeTab === 'solve' && (
+                <section className="tab-panel solve-guide-panel">
+                  <div className="section-title"><div><p className="eyebrow">Evidence-directed workflow</p><h2>What to do next</h2></div><span>{solveNodes.length} nodes · {solveEdges.length} links</span></div>
+                  <p className="panel-lede">{solveGuidance?.summary || 'The solve graph will appear after the local engine finishes connecting methods, findings, candidates, and artifact lineage.'}</p>
+                  <div className="solve-safety-strip"><span>Read-only graph</span><span>No evidence-driven commands</span><span>Offline recommendations</span><span>Source hash preserved</span></div>
+                  <div className="solve-guide-grid">
+                    <section className="solve-recommendations">
+                      <div className="solve-subheading"><div><p className="eyebrow">Priority queue</p><h3>Recommended pivots</h3></div><span>{filteredSolveRecommendations.length}</span></div>
+                      <div className="solve-recommendation-list">
+                        {filteredSolveRecommendations.map((item, index) => {
+                          const target = resultTabs.some((tab) => tab.id === item.target_tab) ? item.target_tab as ResultTab : 'overview';
+                          const tools = [...(item.tool_ids || []), ...(item.method_ids || [])].slice(0, 8);
+                          return <article key={item.id || index}>
+                            <span>{String(index + 1).padStart(2, '0')}</span>
+                            <div><header><strong>{item.title || 'Review evidence'}</strong><em>{item.priority || 0}</em></header><p>{item.reason || 'Use the linked evidence to continue the investigation.'}</p>{tools.length ? <div>{tools.map((tool) => <code key={tool}>{tool}</code>)}</div> : null}</div>
+                            <button onClick={() => setActiveTab(target)}>{item.action || 'Review'} <span>→</span></button>
+                          </article>;
+                        })}
+                        {!filteredSolveRecommendations.length && <div className="empty-state"><span>◇</span><div><strong>{resultQuery ? 'No recommendations match this search' : 'No recommendation queue is available'}</strong><p>Clear the search or inspect the coverage report directly.</p></div></div>}
+                      </div>
+                    </section>
+                    <section className="solve-graph">
+                      <div className="solve-subheading"><div><p className="eyebrow">Provenance map</p><h3>Evidence connections</h3></div><span>{filteredSolveEdges.length}</span></div>
+                      <div className="solve-node-summary">{(['artifact', 'method', 'finding', 'candidate'] as const).map((type) => <div key={type}><strong>{solveNodes.filter((node) => node.type === type).length}</strong><span>{type}{solveNodes.filter((node) => node.type === type).length === 1 ? '' : 's'}</span></div>)}</div>
+                      <div className="solve-edge-list">
+                        {filteredSolveEdges.slice(0, 80).map((edge, index) => {
+                          const source = solveNodeMap.get(edge.source);
+                          const target = solveNodeMap.get(edge.target);
+                          return <article key={`${edge.source}-${edge.target}-${index}`}>
+                            <div className={`solve-node ${source?.type || 'unknown'}`}><small>{source?.type || 'evidence'}</small><strong>{source?.label || edge.source}</strong></div>
+                            <div className="solve-relation"><span>→</span><em>{edge.relation || 'links'}</em></div>
+                            <div className={`solve-node ${target?.type || 'unknown'}`}><small>{target?.type || 'evidence'}</small><strong>{target?.label || edge.target}</strong></div>
+                          </article>;
+                        })}
+                        {!filteredSolveEdges.length && <div className="empty-state"><span>⌁</span><div><strong>{resultQuery ? 'No graph links match this search' : 'No derived links were recorded'}</strong><p>The source node is still preserved in the artifact table.</p></div></div>}
+                      </div>
+                      {filteredSolveEdges.length > 80 && <p className="solve-limit-note">Showing the first 80 matching links of {filteredSolveEdges.length}; use search to narrow the graph.</p>}
+                    </section>
+                  </div>
+                </section>
+              )}
+
               {activeTab === 'traffic' && isPcapResult && (
                 <PcapTrafficWorkspace
                   inspection={trafficInspection || {}}
@@ -2213,6 +2455,11 @@ function HomeWorkbench() {
                 <section className="tab-panel repair-lab-panel">
                   <div className="section-title"><div><p className="eyebrow">Non-destructive recovery</p><h2>Repair laboratory</h2></div><span>{repairArtifacts.length} candidate{repairArtifacts.length === 1 ? '' : 's'} · source preserved</span></div>
                   <p className="panel-lede">Forenscope records only bounded, derived copies. Download a candidate for review; it never replaces the uploaded evidence or changes its original hash.</p>
+
+                  {uncropArtifacts.length > 0 && <section className="uncrop-recovery-banner">
+                    <span>▣</span>
+                    <div><p>Hidden-canvas recovery</p><strong>{uncropArtifacts.length} uncropped image candidate{uncropArtifacts.length === 1 ? '' : 's'} ready to preview</strong><small>Only pixels still present in the file are recovered. Partial aCropalypse output marks unknown areas instead of generating replacement content.</small></div>
+                  </section>}
 
                   <section className={`repair-verdict ${repairArtifacts.length ? 'recoverable' : damageFindings.length ? 'attention' : 'clean'}`}>
                     <span>{repairArtifacts.length ? '✓' : damageFindings.length ? '!' : '◇'}</span>
@@ -2232,11 +2479,18 @@ function HomeWorkbench() {
                     <div className="repair-candidate-list">
                       {filteredRepairArtifacts.map((artifact, index) => {
                         const details = artifactRepairDetails(artifact);
+                        const parameters = artifactRepairParameters(artifact);
+                        const uncrop = isUncropArtifact(artifact);
+                        const preview = artifactPreviewUrl(artifact);
                         const id = artifactId(artifact);
                         const download = normalizeUrl(artifact.download_url) || `${API_BASE}/api/jobs/${jobId}/artifacts/${id}/download`;
                         return <article key={id || `${artifactName(artifact)}-${index}`}>
                           <header><span>{String(index + 1).padStart(2, '0')}</span><div><strong>{artifactName(artifact)}</strong><small>{artifactMediaType(artifact)} · {formatBytes(artifactSize(artifact))} · {details.producer}</small></div><em>Separate copy</em></header>
                           <p>{details.reason}</p>
+                          {uncrop && preview && <button type="button" className="repair-image-preview" onClick={() => { setSelectedArtifact(artifact); setActiveTab('artifacts'); }}>
+                            <SafePreviewImage src={preview} alt={`Preview of uncropped candidate ${artifactName(artifact)}`} />
+                            <span><strong>Recovered canvas preview</strong><small>{parameters.partial_recovery === true ? 'Partial recovery · unknown pixels visibly marked' : 'Exact recovery from encoded pixels'}{parameters.recovered_width && parameters.recovered_height ? ` · ${String(parameters.recovered_width)} × ${String(parameters.recovered_height)}` : ''}</small></span>
+                          </button>}
                           <dl><div><dt>Transformation</dt><dd>{details.transformation}</dd></div><div><dt>Candidate SHA-256</dt><dd className="mono">{artifact.sha256 || 'Unavailable'}</dd></div></dl>
                           <footer><span>Source hash remains {String(sourceDetails?.sha256 || job?.sha256 || 'preserved').slice(0, 16)}{sourceDetails?.sha256 || job?.sha256 ? '…' : ''}</span><a href={download}>Download candidate ↓</a></footer>
                         </article>;
@@ -2317,6 +2571,20 @@ function HomeWorkbench() {
                       {!artifacts.some((artifact) => /audacity|audio_(?:mono|left|right|stereo)/i.test(artifactName(artifact))) && <div className="empty-state"><span>⌁</span><strong>No review bundle was generated</strong><p>Enable Audacity handoff or channel isolation before the next scan.</p></div>}
                     </div>
                   </section>
+                </section>
+              )}
+
+              {activeTab === 'document' && selectedTextPreviewArtifact && (
+                <section className="tab-panel document-preview-panel">
+                  <div className="section-title"><div><p className="eyebrow">Read-only extracted evidence</p><h2>Document text</h2></div><span>{textPreview ? `${textPreview.character_count?.toLocaleString() || 0} characters · ${textPreview.line_count?.toLocaleString() || 0} lines` : 'Loading bounded preview'}</span></div>
+                  <p className="panel-lede">This view extracts readable text locally from text files, PDF, RTF, mail, and supported Office document packages. It never renders document HTML, opens Office, or runs embedded code.</p>
+                  <div className="document-preview-toolbar">
+                    <label><span>Artifact</span><select value={artifactId(selectedTextPreviewArtifact)} onChange={(event) => setTextPreviewArtifactId(event.target.value)}>{textPreviewArtifacts.map((artifact) => <option key={artifactId(artifact)} value={artifactId(artifact)}>{artifactName(artifact)} · {formatBytes(artifactSize(artifact))}</option>)}</select></label>
+                    <a href={normalizeUrl(selectedTextPreviewArtifact.download_url) || `${API_BASE}/api/jobs/${jobId}/artifacts/${artifactId(selectedTextPreviewArtifact)}/download`}>Download original ↓</a>
+                  </div>
+                  {textPreviewLoading && <div className="document-preview-loading"><span className="spinner" />Extracting readable text…</div>}
+                  {!textPreviewLoading && textPreviewError && <div className="error-banner" role="alert"><span>!</span><p>{textPreviewError}</p><button onClick={() => setTextPreviewError('')} aria-label="Dismiss error">×</button></div>}
+                  {!textPreviewLoading && textPreview && <section className="document-preview-content"><header><div><strong>{textPreview.name || artifactName(selectedTextPreviewArtifact)}</strong><small>{textPreview.kind || 'document'} · {textPreview.encoding || 'extracted text'}{textPreview.truncated ? ' · preview bounded for safety' : ''}</small></div>{textPreview.sources?.length ? <span>{textPreview.sources.length} source{textPreview.sources.length === 1 ? '' : 's'}</span> : null}</header><pre>{textPreview.text}</pre></section>}
                 </section>
               )}
 

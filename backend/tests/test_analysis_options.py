@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import binascii
 from pathlib import Path
 
 import pytest
@@ -152,6 +153,45 @@ def test_engine_replays_recovered_png_for_pixel_analysis(clean_png: Path, tmp_pa
     assert repairs and repairs[0]["detected_type"] == "png"
     assert report["visual_views"]
     assert source.read_bytes() == bytes(damaged)
+
+
+def test_engine_persists_uncrop_dimensions_and_preserves_source(clean_png: Path, tmp_path: Path) -> None:
+    source = tmp_path / "hidden-rows.png"
+    hidden = bytearray(clean_png.read_bytes())
+    original_width = int.from_bytes(hidden[16:20], "big")
+    original_height = int.from_bytes(hidden[20:24], "big")
+    ihdr = bytearray(hidden[16:29])
+    ihdr[4:8] = (1).to_bytes(4, "big")
+    hidden[16:29] = ihdr
+    hidden[29:33] = (binascii.crc32(b"IHDR" + ihdr) & 0xFFFFFFFF).to_bytes(4, "big")
+    source.write_bytes(bytes(hidden))
+
+    report = AnalysisEngine().run(
+        input_path=source,
+        output_dir=tmp_path / "output",
+        profile="quick",
+        flag_prefix=None,
+        password=None,
+        progress_callback=None,
+        is_cancelled=lambda: False,
+        options={
+            "external_tools": False,
+            "lsb_analysis": False,
+            "ocr": False,
+            "barcodes": False,
+            "recursive_extraction": False,
+            "decoders": False,
+            "crypto_analysis": False,
+        },
+    )
+
+    [repair] = [artifact for artifact in report["artifacts"] if artifact.get("name") == "png_hidden_scanlines_uncropped"]
+    parameters = repair["lineage"][0]["parameters"]
+    assert repair["repair_candidate"] is True
+    assert parameters["recovered_width"] == original_width
+    assert parameters["recovered_height"] == original_height
+    assert parameters["unknown_pixels_filled"] is False
+    assert source.read_bytes() == bytes(hidden)
 
 
 def test_engine_honors_disabled_stages_and_custom_budgets(clean_png: Path, tmp_path: Path) -> None:

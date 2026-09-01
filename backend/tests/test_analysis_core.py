@@ -4,7 +4,7 @@ import base64
 import zlib
 
 from app.analyzers.core import BoundedDecoder, CandidateCollector, inspect_bytes
-from app.analyzers.common import sniff_kind
+from app.analyzers.common import iter_utf16_strings, sniff_kind
 
 
 def test_candidate_collector_prefers_configured_prefix_and_deduplicates() -> None:
@@ -38,6 +38,28 @@ def test_candidate_collector_does_not_promote_arbitrary_braces() -> None:
     )
 
     assert collector.results() == []
+
+
+def test_candidate_collector_can_reuse_preextracted_utf16_strings() -> None:
+    collector = CandidateCollector()
+    payload = "flag{utf16_reused}".encode("utf-16-le")
+
+    collector.scan_bytes(
+        payload,
+        source_artifact_id="source",
+        method="raw-bytes",
+        include_utf16=False,
+    )
+    assert collector.results() == []
+
+    for record in iter_utf16_strings(payload):
+        collector.scan_text(
+            record["text"],
+            source_artifact_id="source",
+            method=f"strings:{record['encoding']}",
+            offset=record["offset"],
+        )
+    assert collector.results()[0]["value"] == "flag{utf16_reused}"
 
 
 def test_bounded_decoder_finds_nested_base64_flag() -> None:

@@ -8,6 +8,7 @@ import gzip
 import html
 import io
 import lzma
+import math
 import re
 import urllib.parse
 import unicodedata
@@ -17,7 +18,6 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .common import (
-    byte_entropy,
     display_text,
     find_magic_offsets,
     iter_ascii_strings,
@@ -116,21 +116,23 @@ class CandidateCollector:
         base_offset: int = 0,
         transform_chain: list[str] | None = None,
         confidence_hint: int = 0,
+        include_utf16: bool = True,
     ) -> int:
         total = 0
         # Latin-1 preserves byte-to-character offsets for printable ASCII flags.
         total += self.scan_text(
-            data.decode("latin-1", "ignore"), source_artifact_id=source_artifact_id,
+            data[:2_000_000].decode("latin-1", "ignore"), source_artifact_id=source_artifact_id,
             method=method, offset=base_offset, transform_chain=transform_chain,
             confidence_hint=confidence_hint,
         )
         # UTF-16 strings need their explicit byte offsets.
-        for record in iter_utf16_strings(data, minimum=4, limit=2_000):
-            total += self.scan_text(
-                record["text"], source_artifact_id=source_artifact_id,
-                method=f"{method}:{record['encoding']}", offset=base_offset + record["offset"],
-                transform_chain=transform_chain, confidence_hint=confidence_hint,
-            )
+        if include_utf16:
+            for record in iter_utf16_strings(data, minimum=4, limit=2_000):
+                total += self.scan_text(
+                    record["text"], source_artifact_id=source_artifact_id,
+                    method=f"{method}:{record['encoding']}", offset=base_offset + record["offset"],
+                    transform_chain=transform_chain, confidence_hint=confidence_hint,
+                )
         return total
 
     def results(self) -> list[dict[str, Any]]:
@@ -204,8 +206,14 @@ def inspect_bytes(data: bytes, *, max_strings: int) -> dict[str, Any]:
     byte_counts = [0] * 256
     for byte in data:
         byte_counts[byte] += 1
+    length = len(data)
+    entropy = -sum(
+        (count / length) * math.log2(count / length)
+        for count in byte_counts
+        if count and length
+    )
     return {
-        "entropy": round(byte_entropy(data), 5),
+        "entropy": round(entropy, 5),
         "byte_frequency": byte_counts,
         "magic_offsets": find_magic_offsets(data),
         "strings": records,

@@ -132,6 +132,22 @@ def test_extended_forensics_tools_are_allowlisted_to_fixed_packages() -> None:
     assert tool_installation.WINGET_PACKAGE_IDS["tshark_http2_ranges"] == "WiresharkFoundation.Wireshark"
 
 
+def test_endpoint_and_virtual_disk_tools_use_fixed_wsl_packages() -> None:
+    expected = {
+        "lnkinfo": "liblnk-utils",
+        "sccainfo": "libscca-utils",
+        "plistutil": "libplist-utils",
+        "esedbinfo": "libesedb-utils",
+        "qemu_img_info": "qemu-utils",
+        "bulk_extractor": "bulk-extractor",
+        "journalctl": "systemd",
+    }
+    for tool_id, package in expected.items():
+        assert tool_installation.WSL_APT_PACKAGES[tool_id] == (package,)
+        assert tool_id in tool_installation.INSTALLABLE_TOOL_IDS
+        assert tool_installation.install_strategy(tool_id) == "Kali WSL package"
+
+
 def test_shared_winget_audio_package_is_installed_once(monkeypatch: pytest.MonkeyPatch) -> None:
     tool_ids = ["ffprobe", "ffmpeg_spectrogram", "ffmpeg_pcm"]
     winget = Path("C:/Windows/System32/winget.exe")

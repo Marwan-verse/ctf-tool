@@ -7,6 +7,7 @@ import json
 import lzma
 import os
 import re
+import shlex
 import tarfile
 import time
 import uuid
@@ -19,6 +20,7 @@ from .analyzers.common import (
     AnalyzerCancelled,
     PROFILE_LIMITS,
     bounded_read,
+    bounded_read_and_sha256,
     cancel_requested,
     check_cancelled,
     display_text,
@@ -27,7 +29,6 @@ from .analyzers.common import (
     normalize_json,
     safe_label,
     sha256_bytes,
-    sha256_file,
     sniff_kind,
     utc_now,
 )
@@ -39,21 +40,96 @@ from .analyzers.crypto import analyze_encrypted_payloads
 from .analyzers.external import ExternalToolRunner, TOOL_SPECS
 from .analyzers.formats import analyze_format, propose_header_repairs
 from .analyzers.visual import analyze_visual
+from .solve_guidance import build_solve_guidance
 
 
 SUPPORTED_IMAGE_FORMATS = ["PNG/APNG", "JPEG/MPO", "GIF", "BMP", "WebP", "SVG text", "TIFF/BigTIFF", "ICO/CUR"]
 SUPPORTED_AUDIO_FORMATS = ["WAV/PCM", "AIFF/AIFC", "FLAC", "Ogg/Opus", "MP3", "AAC/M4A", "AU", "WMA/ASF", "AMR", "CAF", "MIDI"]
-SUPPORTED_DOCUMENT_FORMATS = ["PDF"]
+SUPPORTED_DOCUMENT_FORMATS = ["plain text", "Markdown/JSON/XML/CSV", "PDF", "RTF", "DOCX/XLSX/PPTX", "ODT/ODS/ODP", "EPUB", "legacy Office/OLE"]
 SUPPORTED_FORENSIC_FORMATS = [
-    "PCAP/PCAPNG", "SQLite", "OLE/RTF/EML", "TAR/7z/RAR", "shar/uuencode/ar", "LZIP/LZ4/LZMA/LZOP",
+    "PCAP/PCAPNG", "SQLite", "OLE/RTF/EML/MBOX", "TAR/7z/RAR", "shar/uuencode/ar", "LZIP/LZ4/LZMA/LZOP",
     "raw disk/ISO", "E01/EWF", "Windows registry hive", "memory/crash dump",
-    "Windows EVTX", "Outlook PST/OST",
+    "Windows EVTX", "Outlook PST/OST", "LNK/Jump Lists/Prefetch/Recycle Bin", "NTFS MFT/USN",
+    "SQLite WAL/rollback journals",
+    "Windows thumbnail cache", "Linux utmp/wtmp/btmp/systemd journal", "Apple plist/iOS MBDB", "Android ADB backup",
+    "Firefox MOZLZ4 sessions", "Chromium/Electron LevelDB", "macOS .DS_Store/Safari binary cookies",
+    "ESE/EDB", "QCOW/VMDK/VHDX/VDI/DMG/AFF",
+    "PE/ELF/Mach-O/WebAssembly/DEX/Java class", "MP4/MOV/Matroska/WebM/AVI",
+    "CBOR/MessagePack/bencode/BitTorrent/Protocol Buffers",
 ]
 BUILT_IN_STRUCTURE_KINDS = {
-    "png", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "pdf",
-    "pcap", "pcapng", "sqlite", "ole", "rtf", "eml", "disk", "ewf", "registry", "memory", "evtx", "pst",
+    "png", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "pdf", "text",
+    "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub",
+    "android_backup", "plist", "lnk", "jumplist", "prefetch", "mft", "usn", "recycle_bin_i", "ese",
+    "qcow", "vmdk", "vhdx", "vdi", "dmg", "aff",
+    "pcap", "pcapng", "sqlite", "sqlite_wal", "sqlite_journal", "ole", "rtf", "eml", "mbox", "systemd_journal", "disk", "ewf", "registry", "memory", "evtx", "pst",
+    "thumbcache", "utmp", "ios_mbdb",
+    "mozlz4", "leveldb", "ds_store", "binarycookies",
     "shar", "ar", "lzip", "lz4", "lzma", "lzop",
+    "mp4", "mov", "matroska", "webm", "avi",
+    "pe", "elf", "macho", "wasm", "dex", "java_class",
+    "bencode", "cbor", "msgpack", "protobuf",
 }
+ZIP_DOCUMENT_KINDS = {"docx", "xlsx", "pptx", "odt", "ods", "odp", "epub"}
+ARCHIVE_CONTAINER_KINDS = {"zip", "tar", "gzip", "bzip2", "xz", "lzip", "lz4", "lzma", "lzop"} | ZIP_DOCUMENT_KINDS
+
+
+_CAPTURE_OPENSSL_COMMAND = re.compile(r"(?i)\bopenssl(?:\.exe)?\s+(?P<arguments>[^\r\n]{0,512})")
+
+
+def _capture_openssl_passphrase_hints(records: Iterable[dict[str, Any]]) -> list[str]:
+    """Use literal passphrases from observed *PCAP* OpenSSL decrypt commands.
+
+    This supports a common CTF construction where one plaintext stream gives an
+    exact OpenSSL command and another carries its ``Salted__`` payload. It is
+    deliberately not a password list or a guessing stage: only a ``-k`` or
+    ``-pass* pass:`` value in a capture-derived command is used, values stay in
+    memory, and no file/network credential source is dereferenced.
+    """
+
+    hints: list[str] = []
+    seen: set[str] = set()
+    for record in records:
+        if not str(record.get("source") or "").startswith("pcap-"):
+            continue
+        text = str(record.get("text") or "")[:16 * 1024]
+        for match in _CAPTURE_OPENSSL_COMMAND.finditer(text):
+            command = f"openssl {match.group('arguments')}"
+            try:
+                tokens = shlex.split(command, posix=True)
+            except ValueError:
+                continue
+            lowered = [token.casefold() for token in tokens]
+            if not tokens or lowered[0] not in {"openssl", "openssl.exe"}:
+                continue
+            if not any(token in {"-d", "-decrypt"} for token in lowered):
+                continue
+            if not any("des" in token or token.startswith("aes-") for token in lowered[1:]):
+                continue
+            for index, token in enumerate(tokens[1:], start=1):
+                normalized = token.casefold()
+                candidate = ""
+                if normalized == "-k" and index + 1 < len(tokens):
+                    candidate = tokens[index + 1]
+                elif normalized.startswith("-k="):
+                    candidate = token[3:]
+                elif normalized in {"-pass", "-passin", "-passout"} and index + 1 < len(tokens):
+                    value = tokens[index + 1]
+                    if value.casefold().startswith("pass:"):
+                        candidate = value[5:]
+                elif normalized.startswith(("-pass=pass:", "-passin=pass:", "-passout=pass:")):
+                    candidate = token.split(":", 1)[1]
+                if (
+                    candidate
+                    and len(candidate) <= 256
+                    and not any(ord(character) < 32 or ord(character) == 127 for character in candidate)
+                    and candidate not in seen
+                ):
+                    seen.add(candidate)
+                    hints.append(candidate)
+                    if len(hints) >= 8:
+                        return hints
+    return hints
 
 
 class ArtifactStore:
@@ -237,10 +313,15 @@ class AnalysisEngine:
             limits["max_artifacts"] = max(25, min(500, int(analysis_options["max_artifacts"])))
         if isinstance(analysis_options.get("tool_timeout_seconds"), int):
             limits["tool_timeout"] = max(5, min(180, int(analysis_options["tool_timeout_seconds"])))
-        probe_data, _ = bounded_read(source_path, min(limits["read_bytes"], 1024 * 1024))
-        probe_kind = sniff_kind(probe_data, source_path.name)
+        self._emit(progress_callback, 1, "ingest", "Hashing immutable source evidence")
+        check_cancelled(is_cancelled)
+        source_data, read_truncated, source_sha, source_size = bounded_read_and_sha256(
+            source_path,
+            limits["read_bytes"],
+        )
+        source_kind = sniff_kind(source_data, source_path.name)
         evidence_type = str(analysis_options.get("evidence_type") or "auto")
-        if evidence_type == "audio" or (evidence_type != "corrupted" and probe_kind in AUDIO_KINDS):
+        if evidence_type == "audio" or (evidence_type != "corrupted" and source_kind in AUDIO_KINDS):
             return self._run_audio(
                 source_path=source_path,
                 destination=destination,
@@ -251,6 +332,11 @@ class AnalysisEngine:
                 is_cancelled=is_cancelled,
                 analysis_options=analysis_options,
                 limits=limits,
+                source_data=source_data,
+                source_size=source_size,
+                source_sha=source_sha,
+                read_truncated=read_truncated,
+                detected_source_kind=source_kind,
             )
         report_section = "corrupted" if evidence_type == "corrupted" else "image"
         job_id = f"analysis-{uuid.uuid4().hex[:12]}"
@@ -264,12 +350,6 @@ class AnalysisEngine:
         errors: list[dict[str, str]] = []
         collector = CandidateCollector(flag_prefix)
 
-        self._emit(progress_callback, 1, "ingest", "Hashing immutable source evidence")
-        check_cancelled(is_cancelled)
-        source_size = source_path.stat().st_size
-        source_sha = sha256_file(source_path)
-        source_data, read_truncated = bounded_read(source_path, limits["read_bytes"])
-        source_kind = sniff_kind(source_data, source_path.name)
         store = ArtifactStore(destination, job_id, limits, source_path, source_kind, source_sha)
         source_id = store.source_id
         report_status = "running"
@@ -329,7 +409,12 @@ class AnalysisEngine:
             check_cancelled(is_cancelled)
             core_start = time.monotonic()
             core_details = inspect_bytes(source_data, max_strings=limits["max_strings"])
-            collector.scan_bytes(source_data, source_artifact_id=source_id, method="raw-bytes")
+            collector.scan_bytes(
+                source_data,
+                source_artifact_id=source_id,
+                method="raw-bytes",
+                include_utf16=False,
+            )
             for record in core_details["strings"]:
                 encoding = str(record.get("encoding", ""))
                 record_method = (
@@ -440,7 +525,8 @@ class AnalysisEngine:
                         repair["data"], label=repair["label"], parent_id=source_id,
                         producer=repair.get("producer", "built-in-structure"),
                         transformation=repair.get("transformation", "create repair candidate"),
-                        kind=str(repair.get("kind") or analysis_kind), depth=1, repair_candidate=True, reason=repair.get("reason"),
+                        kind=str(repair.get("kind") or analysis_kind), depth=1, repair_candidate=True,
+                        reason=repair.get("reason"), parameters=repair.get("details"),
                     )
                     if artifact_id:
                         repair_artifact_ids.append(artifact_id)
@@ -525,7 +611,7 @@ class AnalysisEngine:
             if (
                 analysis_options["recursive_extraction"]
                 and not read_truncated
-                and source_kind in {"zip", "tar", "gzip", "bzip2", "xz", "lzip", "lz4", "lzma", "lzop"}
+                and source_kind in ARCHIVE_CONTAINER_KINDS
             ):
                 derived_queue.appendleft((source_id, source_data, source_kind, 0))
 
@@ -569,11 +655,11 @@ class AnalysisEngine:
                                 derived_queue.append((child_id, extracted["data"], extracted.get("kind") or sniff_kind(extracted["data"]), depth + 1))
                             elif reason:
                                 log("warning", f"Skipped nested artifact {extracted['label']}: {reason}", "recursive-structure")
-                if artifact_kind == "zip" and depth < limits["recursion_depth"]:
+                if artifact_kind in ({"zip"} | ZIP_DOCUMENT_KINDS) and depth < limits["recursion_depth"]:
                     zip_local_extra_artifacts += self._carve_zip_local_extras(
                         artifact_data, artifact_id, depth, store, derived_queue, log,
                     )
-                if artifact_kind in {"zip", "tar", "gzip", "bzip2", "xz", "lzip", "lz4", "lzma", "lzop"} and depth < limits["recursion_depth"]:
+                if artifact_kind in ARCHIVE_CONTAINER_KINDS and depth < limits["recursion_depth"]:
                     members = self._expand_archive(artifact_data, artifact_kind, artifact_id, depth, store, derived_queue, add_finding, log, password=password)
                     archive_members += members
             methods.append({
@@ -851,6 +937,11 @@ class AnalysisEngine:
             self._emit(progress_callback, 90, "crypto", "Detecting possible encrypted payloads and trying bounded recovery")
             check_cancelled(is_cancelled)
             crypto_start = time.monotonic()
+            capture_passphrase_hints = (
+                _capture_openssl_passphrase_hints(all_string_seeds)
+                if analysis_kind in {"pcap", "pcapng"}
+                else []
+            )
             crypto_inputs: list[dict[str, Any]] = ([{
                 "artifact_id": source_id, "label": "source", "kind": source_kind, "data": source_data,
             }] if analysis_options["crypto_analysis"] else [])
@@ -865,16 +956,10 @@ class AnalysisEngine:
             )
             known_artifact_ids = {str(artifact.get("id")) for artifact in store.artifacts}
             if analysis_options["crypto_analysis"]:
-                for seed in all_string_seeds[:2_000]:
-                    text_value = str(seed.get("text") or "").encode("utf-8", "replace")
-                    if not text_value or crypto_bytes + len(text_value) > crypto_budget:
-                        continue
-                    crypto_inputs.append({
-                        "artifact_id": seed.get("artifact_id") or source_id,
-                        "label": f"{seed.get('source') or 'extracted string'}",
-                        "kind": "text", "data": text_value,
-                    })
-                    crypto_bytes += len(text_value)
+                # Recovered binary objects are placed before strings because
+                # crypto analysis has an input-count guard. A busy PCAP can
+                # produce hundreds of harmless strings before the short
+                # encrypted transfer that the strings describe.
                 for artifact in store.artifacts[1:]:
                     if crypto_bytes >= crypto_budget:
                         break
@@ -897,19 +982,39 @@ class AnalysisEngine:
                         "kind": artifact.get("detected_type") or "binary", "data": artifact_data,
                     })
                     crypto_bytes += len(artifact_data)
+                for seed in all_string_seeds[:2_000]:
+                    text_value = str(seed.get("text") or "").encode("utf-8", "replace")
+                    if not text_value or crypto_bytes + len(text_value) > crypto_budget:
+                        continue
+                    crypto_inputs.append({
+                        "artifact_id": seed.get("artifact_id") or source_id,
+                        "label": f"{seed.get('source') or 'extracted string'}",
+                        "kind": "text", "data": text_value,
+                    })
+                    crypto_bytes += len(text_value)
             crypto_result = analyze_encrypted_payloads(
                 crypto_inputs,
                 passphrase=password,
+                passphrase_hints=capture_passphrase_hints,
                 enabled=bool(analysis_options["crypto_analysis"]),
             )
             crypto_detections = crypto_result.pop("detections", [])
             crypto_decryptions = crypto_result.pop("decryptions", [])
+            capture_command_decryptions = sum(
+                1 for item in crypto_decryptions if item.get("passphrase_source") == "observed-capture-command"
+            )
             crypto_artifact_ids: list[str] = []
             if crypto_detections:
                 add_finding({
                     "severity": "info", "category": "crypto", "title": "Possible encrypted payload detected",
                     "description": "One or more extracted payloads have ciphertext-like signals. Supply a passphrase in scan setup to attempt bounded recovery.",
                     "details": {"payload_count": len(crypto_detections), "decrypted_count": len(crypto_decryptions)},
+                }, source_id, "crypto-analysis")
+            if capture_command_decryptions:
+                add_finding({
+                    "severity": "high", "category": "network-crypto", "title": "OpenSSL payload decrypted from a capture command",
+                    "description": "A literal passphrase in a plaintext OpenSSL decrypt command was correlated with a recovered Salted__ payload from the same capture. The value was used only in memory; no password guessing or external access occurred.",
+                    "details": {"decryption_count": capture_command_decryptions},
                 }, source_id, "crypto-analysis")
             for decryption in crypto_decryptions:
                 plaintext = decryption.pop("data", b"")
@@ -955,6 +1060,7 @@ class AnalysisEngine:
                     "decryption_results": crypto_decryptions[:64],
                     "attempts": crypto_result.get("attempts", 0),
                     "dependency_missing": crypto_result.get("dependency_missing", False),
+                    "observed_capture_passphrase_hints": len(capture_passphrase_hints),
                     "input_count": len(crypto_inputs),
                     "input_bytes": crypto_bytes,
                 },
@@ -1057,6 +1163,7 @@ class AnalysisEngine:
             "coverage": normalize_json(coverage),
             "errors": errors,
         }
+        report["solve_guidance"] = normalize_json(build_solve_guidance(report))
         self._emit(progress_callback, 100, report_status, f"Analysis {report_status}", terminal=True)
         return report
 
@@ -1072,6 +1179,11 @@ class AnalysisEngine:
         is_cancelled: Callable[[], bool] | Any,
         analysis_options: dict[str, Any],
         limits: dict[str, int],
+        source_data: bytes,
+        source_size: int,
+        source_sha: str,
+        read_truncated: bool,
+        detected_source_kind: str,
     ) -> dict[str, Any]:
         """Run the bounded audio-specific pipeline while preserving shared evidence semantics."""
 
@@ -1086,12 +1198,6 @@ class AnalysisEngine:
         errors: list[dict[str, str]] = []
         collector = CandidateCollector(flag_prefix)
 
-        self._emit(progress_callback, 1, "audio-ingest", "Hashing immutable audio evidence")
-        check_cancelled(is_cancelled)
-        source_size = source_path.stat().st_size
-        source_sha = sha256_file(source_path)
-        source_data, read_truncated = bounded_read(source_path, limits["read_bytes"])
-        detected_source_kind = sniff_kind(source_data, source_path.name)
         source_kind = detected_source_kind if detected_source_kind in AUDIO_KINDS else "audio"
         store = ArtifactStore(destination, job_id, limits, source_path, source_kind, source_sha)
         source_id = store.source_id
@@ -1132,7 +1238,12 @@ class AnalysisEngine:
             check_cancelled(is_cancelled)
             core_started = time.monotonic()
             core = inspect_bytes(source_data, max_strings=limits["max_strings"])
-            collector.scan_bytes(source_data, source_artifact_id=source_id, method="audio-raw-bytes")
+            collector.scan_bytes(
+                source_data,
+                source_artifact_id=source_id,
+                method="audio-raw-bytes",
+                include_utf16=False,
+            )
             for record in core["strings"]:
                 collector.scan_text(
                     record["text"], source_artifact_id=source_id, method=f"audio-strings:{record['encoding']}",
@@ -1527,6 +1638,7 @@ class AnalysisEngine:
             "artifacts": normalize_json(store.artifacts), "visual_views": normalize_json(visual_views),
             "logs": normalize_json(logs), "coverage": normalize_json(coverage), "errors": errors,
         }
+        report["solve_guidance"] = normalize_json(build_solve_guidance(report))
         self._emit(progress_callback, 100, report_status, f"Audio analysis {report_status}", terminal=True)
         return report
 
@@ -1632,7 +1744,7 @@ class AnalysisEngine:
         *, password: str | None = None,
     ) -> int:
         count = 0
-        if kind == "zip":
+        if kind in ({"zip"} | ZIP_DOCUMENT_KINDS):
             try:
                 with zipfile.ZipFile(io.BytesIO(data)) as archive:
                     infos = archive.infolist()
@@ -1798,7 +1910,21 @@ def _kind_from_extension(extension: str) -> str | None:
         ".pdf": "pdf",
         ".pcap": "pcap", ".cap": "pcap", ".pcapng": "pcapng",
         ".sqlite": "sqlite", ".sqlite3": "sqlite", ".db": "sqlite",
+        ".sqlite-wal": "sqlite_wal", ".db-wal": "sqlite_wal",
+        ".sqlite-journal": "sqlite_journal", ".db-journal": "sqlite_journal",
+        ".mbdb": "ios_mbdb", ".binarycookies": "binarycookies", ".dsstore": "ds_store",
+        ".utmp": "utmp", ".wtmp": "utmp", ".btmp": "utmp",
+        ".jsonlz4": "mozlz4", ".baklz4": "mozlz4", ".mozlz4": "mozlz4",
+        ".ldb": "leveldb", ".sst": "leveldb",
         ".doc": "ole", ".xls": "ole", ".ppt": "ole", ".msg": "ole", ".rtf": "rtf", ".eml": "eml",
+        ".mbox": "mbox", ".mbx": "mbox", ".journal": "systemd_journal",
+        ".docx": "docx", ".xlsx": "xlsx", ".pptx": "pptx",
+        ".odt": "odt", ".ods": "ods", ".odp": "odp", ".epub": "epub",
+        ".lnk": "lnk", ".pf": "prefetch", ".plist": "plist", ".ab": "android_backup",
+        ".automaticdestinations-ms": "jumplist", ".customdestinations-ms": "jumplist",
+        ".mft": "mft", ".usn": "usn", ".usnjrnl": "usn", ".edb": "ese",
+        ".qcow": "qcow", ".qcow2": "qcow", ".vmdk": "vmdk", ".vhdx": "vhdx",
+        ".vdi": "vdi", ".dmg": "dmg", ".aff": "aff", ".aff4": "aff",
         ".img": "disk", ".dd": "disk", ".iso": "disk", ".vhd": "disk", ".vhdx": "disk", ".vmdk": "disk",
         ".e01": "ewf", ".ex01": "ewf", ".s01": "ewf", ".hive": "registry",
         ".vmem": "memory", ".mem": "memory", ".lime": "memory", ".dmp": "memory", ".raw": "memory",

@@ -29,7 +29,14 @@ from starlette.background import BackgroundTask
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import __version__
-from .analyzers.external import TOOL_SPECS, discover_wsl_tools, resolve_tool
+from .analyzers.common import bounded_read, display_text, sniff_kind
+from .analyzers.external import (
+    TOOL_SPECS,
+    TSharkWorkbenchError,
+    discover_wsl_tools,
+    resolve_tool,
+    run_tshark_workbench,
+)
 from .config import MEBIBYTE, Settings, settings as default_settings
 from .hexedit import (
     HexEditError,
@@ -70,6 +77,7 @@ from .schemas import (
     ScanProfile,
     TERMINAL_STATUSES,
     ToolInstallRequest,
+    TrafficQueryRequest,
 )
 from .security import (
     OriginValidationMiddleware,
@@ -83,6 +91,7 @@ from .security import (
     validate_short_text,
 )
 from .storage import Storage
+from .text_preview import TextPreviewUnavailableError, build_text_preview
 from .tool_installation import INSTALLABLE_TOOL_IDS, install_strategy, install_tools
 
 
@@ -115,6 +124,10 @@ def _settings(request: Request) -> Settings:
 
 def _present_job(storage: Storage, job: dict[str, Any]) -> dict[str, Any]:
     return job_public_record(job, storage.list_artifacts(str(job["id"])))
+
+
+def _present_job_summary(job: dict[str, Any]) -> dict[str, Any]:
+    return job_public_record(job, [])
 
 
 def _get_job_or_404(storage: Storage, job_id: str) -> dict[str, Any]:
@@ -559,6 +572,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         limit: int = Query(50, ge=1, le=200),
         offset: int = Query(0, ge=0),
         status_filter: JobStatus | None = Query(None, alias="status"),
+        detail: Literal["full", "summary"] = Query("full"),
     ) -> dict[str, Any]:
         storage = _storage(request)
         items, total = await anyio.to_thread.run_sync(
@@ -567,10 +581,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 limit=limit,
                 offset=offset,
                 status=status_filter.value if status_filter else None,
+                include_result=detail == "full",
             )
         )
         return {
-            "items": [_present_job(storage, item) for item in items],
+            "items": [
+                _present_job(storage, item) if detail == "full" else _present_job_summary(item)
+                for item in items
+            ],
             "total": total,
             "limit": limit,
             "offset": offset,
@@ -744,6 +762,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def preview_artifact(request: Request, job_id: UUID, artifact_id: UUID) -> FileResponse:
         return await artifact_file_response(request, job_id, artifact_id, inline=True)
 
+    @application.get("/api/jobs/{job_id}/artifacts/{artifact_id}/text-preview")
+    async def preview_artifact_text(request: Request, job_id: UUID, artifact_id: UUID) -> dict[str, Any]:
+        """Return a bounded, non-rendering text preview for supported documents."""
+
+        identifier = str(job_id)
+        storage = _storage(request)
+        _get_job_or_404(storage, identifier)
+        artifact = _get_artifact_or_404(storage, identifier, str(artifact_id))
+        path = _artifact_path(_settings(request), identifier, artifact)
+        try:
+            preview = await anyio.to_thread.run_sync(
+                partial(build_text_preview, path, filename=str(artifact.get("name") or path.name))
+            )
+        except TextPreviewUnavailableError as exc:
+            raise HTTPException(
+                status_code=415,
+                detail={"code": "text_preview_unavailable", "message": str(exc)},
+            ) from exc
+        preview["artifact_id"] = str(artifact["id"])
+        preview["sha256"] = str(artifact["sha256"])
+        return preview
+
     @application.get("/api/jobs/{job_id}/hex")
     async def hex_view(
         request: Request,
@@ -810,6 +850,95 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if artifact is None:
             raise _not_found("Artifact")
         return artifact
+
+    @application.post("/api/jobs/{job_id}/traffic/query")
+    async def query_capture(request: Request, job_id: UUID, payload: TrafficQueryRequest) -> dict[str, Any]:
+        """Run one bounded, read-only TShark operation against a stored capture."""
+
+        identifier = str(job_id)
+        storage = _storage(request)
+        job = _get_job_or_404(storage, identifier)
+        if str(job.get("status")) not in TERMINAL_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "job_active", "message": "Wait for capture analysis to finish before running the traffic workbench."},
+            )
+        artifact = resolve_hex_artifact(identifier, payload.artifact_id, storage)
+        path = _artifact_path(_settings(request), identifier, artifact)
+        try:
+            header, _ = await anyio.to_thread.run_sync(bounded_read, path, 64 * 1024)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=410,
+                detail={"code": "artifact_unavailable", "message": "This capture is no longer available on disk."},
+            ) from exc
+        kind = sniff_kind(header, str(artifact.get("name") or ""))
+        if kind not in {"pcap", "pcapng"}:
+            raise HTTPException(
+                status_code=415,
+                detail={"code": "capture_required", "message": "The Wireshark workbench only accepts verified PCAP or PCAPNG artifacts."},
+            )
+        keylog_path: Path | None = None
+        if payload.keylog_artifact_id is not None:
+            keylog_artifact = resolve_hex_artifact(identifier, payload.keylog_artifact_id, storage)
+            keylog_path = _artifact_path(_settings(request), identifier, keylog_artifact)
+            try:
+                keylog_size = keylog_path.stat().st_size
+                keylog_head, keylog_truncated = await anyio.to_thread.run_sync(bounded_read, keylog_path, 16 * MEBIBYTE)
+            except OSError as exc:
+                raise HTTPException(status_code=410, detail={"code": "keylog_unavailable", "message": "The selected TLS key-log artifact is unavailable."}) from exc
+            keylog_labels = (
+                b"CLIENT_RANDOM ", b"CLIENT_EARLY_TRAFFIC_SECRET ", b"EARLY_EXPORTER_SECRET ",
+                b"CLIENT_HANDSHAKE_TRAFFIC_SECRET ", b"SERVER_HANDSHAKE_TRAFFIC_SECRET ",
+                b"CLIENT_TRAFFIC_SECRET_0 ", b"SERVER_TRAFFIC_SECRET_0 ", b"EXPORTER_SECRET ",
+            )
+            keylog_lines = [line.strip() for line in keylog_head.splitlines() if line.strip() and not line.lstrip().startswith(b"#")]
+            if keylog_truncated or keylog_size > 16 * MEBIBYTE or b"\0" in keylog_head or not keylog_lines or not all(line.startswith(keylog_labels) for line in keylog_lines[:10_000]):
+                raise HTTPException(
+                    status_code=415,
+                    detail={"code": "invalid_tls_keylog", "message": "The selected artifact is not a bounded NSS-compatible TLS key log."},
+                )
+        options = job.get("options") if isinstance(job.get("options"), dict) else {}
+        timeout = max(5, min(int(options.get("tool_timeout_seconds", 30)), 60))
+        output_limit = max(64 * 1024, min(int(options.get("external_output_kib", 2048)) * 1024, 8 * 1024 * 1024))
+        try:
+            result = await anyio.to_thread.run_sync(
+                partial(
+                    run_tshark_workbench,
+                    path,
+                    keylog_path=keylog_path,
+                    action=payload.action,
+                    display_filter=payload.display_filter,
+                    packet_limit=payload.packet_limit,
+                    include_raw_bytes=payload.include_raw_bytes,
+                    follow_protocol=payload.follow_protocol,
+                    stream_index=payload.stream_index,
+                    follow_mode=payload.follow_mode,
+                    statistic=payload.statistic,
+                    timeout=timeout,
+                    output_limit=output_limit,
+                )
+            )
+        except TSharkWorkbenchError as exc:
+            message_text = str(exc).replace(str(path), "<capture>")
+            if keylog_path is not None:
+                message_text = message_text.replace(str(keylog_path), "<tls-keylog>")
+            message = display_text(message_text, 2_000)
+            lowered = message.casefold()
+            if "not installed" in lowered:
+                status_code, code = 503, "tshark_unavailable"
+            elif "timeout" in lowered:
+                status_code, code = 504, "tshark_timeout"
+            else:
+                status_code, code = 422, "tshark_rejected"
+            raise HTTPException(status_code=status_code, detail={"code": code, "message": message}) from exc
+        result["artifact"] = artifact_public_record(artifact)
+        result["read_only"] = True
+        if isinstance(result.get("stderr"), str):
+            result["stderr"] = result["stderr"].replace(str(path), "<capture>")
+            if keylog_path is not None:
+                result["stderr"] = result["stderr"].replace(str(keylog_path), "<tls-keylog>")
+        return result
 
     def validate_hex_request(
         request_model: HexEditRequest,

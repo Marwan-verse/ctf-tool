@@ -56,3 +56,49 @@ def test_interrupted_jobs_are_recovered_as_failed(tmp_path: Path) -> None:
         assert job["status"] == "failed"
         assert job["error_code"] == "server_restarted"
         assert job["result"]["partial"] is True
+
+
+def test_progress_event_summary_query_and_artifact_batch_are_persistent(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "forenscope.sqlite3")
+    storage.initialize()
+    storage.create_job(new_job())
+    storage.begin_job("job-1")
+
+    event_id = storage.update_progress_and_append_event(
+        "job-1",
+        progress=0.75,
+        stage="Fast path",
+        event_type="progress",
+        payload={"progress": 0.75, "stage": "Fast path"},
+    )
+    assert event_id > 0
+    assert storage.get_job("job-1")["progress"] == 0.75
+    assert storage.list_events("job-1")[-1]["data"]["stage"] == "Fast path"
+
+    artifacts = [
+        {
+            "id": f"artifact-{index}",
+            "job_id": "job-1",
+            "name": f"artifact-{index}.bin",
+            "kind": "derived",
+            "relative_path": f"output/artifact-{index}.bin",
+            "size_bytes": index + 1,
+            "sha256": str(index) * 64,
+            "metadata": {"index": index},
+        }
+        for index in range(3)
+    ]
+    assert storage.upsert_artifacts(artifacts) == 3
+    assert len(storage.list_artifacts("job-1")) == 3
+
+    assert storage.finish_job(
+        "job-1",
+        status="completed",
+        result={"large": ["value"] * 100},
+        return_job=False,
+    ) is None
+    summaries, total = storage.list_jobs(limit=10, offset=0, include_result=False)
+    assert total == 1
+    assert summaries[0]["result"] is None
+    assert summaries[0]["options"] == {"ocr": False, "max_artifacts": 45}
+    assert storage.get_job("job-1")["result"]["large"] == ["value"] * 100

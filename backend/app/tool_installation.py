@@ -74,6 +74,13 @@ WSL_APT_PACKAGES: dict[str, tuple[str, ...]] = {
     "hcxpcapngtool": ("hcxtools",),
     "pcapfix": ("pcapfix",),
     "sqlite3": ("sqlite3",),
+    "lnkinfo": ("liblnk-utils",),
+    "sccainfo": ("libscca-utils",),
+    "plistutil": ("libplist-utils",),
+    "esedbinfo": ("libesedb-utils",),
+    "qemu_img_info": ("qemu-utils",),
+    "bulk_extractor": ("bulk-extractor",),
+    "journalctl": ("systemd",),
     "oleid": ("oletools",),
     "olevba": ("oletools",),
     "oleobj": ("oletools",),
@@ -89,6 +96,7 @@ WSL_APT_PACKAGES: dict[str, tuple[str, ...]] = {
     "tesseract": ("tesseract-ocr",),
     "zbarimg": ("zbar-tools",),
     "ffprobe": ("ffmpeg",),
+    "ffmpeg_frames": ("ffmpeg",),
     "ffmpeg_spectrogram": ("ffmpeg",),
     "ffmpeg_pcm": ("ffmpeg",),
     "sox_stats": ("sox", "libsox-fmt-all"),
@@ -97,6 +105,8 @@ WSL_APT_PACKAGES: dict[str, tuple[str, ...]] = {
     "multimon_ng": ("multimon-ng",),
     "minimodem": ("minimodem",),
     "minimodem_300": ("minimodem",),
+    "zeek": ("zeek",),
+    "plaso_timeline": ("plaso",),
 }
 
 # These identifiers are fixed package-manager coordinates. No package name or
@@ -111,6 +121,7 @@ WINGET_PACKAGE_IDS: dict[str, str] = {
     "7z": "7zip.7zip",
     "tesseract": "tesseract-ocr.tesseract",
     "ffprobe": "Gyan.FFmpeg",
+    "ffmpeg_frames": "Gyan.FFmpeg",
     "ffmpeg_spectrogram": "Gyan.FFmpeg",
     "ffmpeg_pcm": "Gyan.FFmpeg",
     "sox_stats": "ChrisBagwell.SoX",

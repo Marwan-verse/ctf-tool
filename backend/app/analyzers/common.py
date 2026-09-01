@@ -71,7 +71,29 @@ MIME_BY_KIND = {
     "amr": "audio/amr",
     "caf": "audio/x-caf",
     "midi": "audio/midi",
+    "mp4": "video/mp4",
+    "mov": "video/quicktime",
+    "matroska": "video/x-matroska",
+    "webm": "video/webm",
+    "avi": "video/x-msvideo",
+    "pe": "application/vnd.microsoft.portable-executable",
+    "elf": "application/x-elf",
+    "macho": "application/x-mach-binary",
+    "wasm": "application/wasm",
+    "dex": "application/vnd.android.dex",
+    "java_class": "application/java-vm",
+    "bencode": "application/x-bittorrent",
+    "cbor": "application/cbor",
+    "msgpack": "application/msgpack",
+    "protobuf": "application/x-protobuf",
     "zip": "application/zip",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "odt": "application/vnd.oasis.opendocument.text",
+    "ods": "application/vnd.oasis.opendocument.spreadsheet",
+    "odp": "application/vnd.oasis.opendocument.presentation",
+    "epub": "application/epub+zip",
     "gzip": "application/gzip",
     "zlib": "application/zlib",
     "bzip2": "application/x-bzip2",
@@ -84,15 +106,41 @@ MIME_BY_KIND = {
     "pcap": "application/vnd.tcpdump.pcap",
     "pcapng": "application/x-pcapng",
     "sqlite": "application/vnd.sqlite3",
+    "sqlite_wal": "application/x-sqlite3-wal",
+    "sqlite_journal": "application/x-sqlite3-journal",
+    "thumbcache": "application/x-windows-thumbnail-cache",
+    "utmp": "application/x-linux-utmp",
+    "ios_mbdb": "application/x-ios-backup-manifest",
+    "mozlz4": "application/x-mozilla-jsonlz4",
+    "leveldb": "application/x-leveldb",
+    "ds_store": "application/x-apple-ds-store",
+    "binarycookies": "application/x-apple-binarycookies",
     "ole": "application/x-ole-storage",
     "rtf": "application/rtf",
     "eml": "message/rfc822",
+    "mbox": "application/mbox",
+    "systemd_journal": "application/x-systemd-journal",
     "disk": "application/x-raw-disk-image",
     "ewf": "application/x-ewf",
     "registry": "application/x-windows-registry-hive",
     "memory": "application/x-memory-dump",
     "evtx": "application/x-windows-event-log",
     "pst": "application/vnd.ms-outlook",
+    "lnk": "application/x-ms-shortcut",
+    "jumplist": "application/x-ms-jumplist",
+    "prefetch": "application/x-windows-prefetch",
+    "plist": "application/x-plist",
+    "android_backup": "application/x-android-backup",
+    "mft": "application/x-ntfs-mft",
+    "usn": "application/x-ntfs-usn-journal",
+    "recycle_bin_i": "application/x-windows-recycle-bin-metadata",
+    "ese": "application/x-esedb",
+    "qcow": "application/x-qemu-disk",
+    "vmdk": "application/x-vmdk",
+    "vhdx": "application/x-vhdx",
+    "vdi": "application/x-virtualbox-vdi",
+    "dmg": "application/x-apple-diskimage",
+    "aff": "application/x-aff",
     "shar": "application/x-shar",
     "ar": "application/x-archive",
     "lzip": "application/x-lzip",
@@ -153,8 +201,94 @@ def bounded_read(path: os.PathLike[str] | str, maximum: int) -> tuple[bytes, boo
     return data[:maximum], len(data) > maximum
 
 
+def bounded_read_and_sha256(
+    path: os.PathLike[str] | str,
+    maximum: int,
+    chunk_size: int = 1024 * 1024,
+) -> tuple[bytes, bool, str, int]:
+    """Read a bounded prefix while hashing and sizing the complete file once."""
+
+    if maximum < 0:
+        raise ValueError("maximum must be non-negative")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    digest = hashlib.sha256()
+    retained = bytearray()
+    total = 0
+    with open(path, "rb") as handle:
+        while block := handle.read(chunk_size):
+            digest.update(block)
+            total += len(block)
+            if len(retained) < maximum:
+                retained.extend(block[: maximum - len(retained)])
+    return bytes(retained), total > maximum, digest.hexdigest(), total
+
+
 def sniff_kind(data: bytes, filename: str = "") -> str:
     extension = Path(filename).suffix.lower()
+    basename = Path(filename).name.casefold()
+    if basename.endswith((".automaticdestinations-ms", ".customdestinations-ms")):
+        return "jumplist"
+    if data.startswith(b"mbdb\x05\x00"):
+        return "ios_mbdb"
+    if data.startswith(b"\0\0\0\x01Bud1") or data.startswith(b"Bud1"):
+        return "ds_store"
+    if data.startswith(b"cook") and len(data) >= 12:
+        cookie_pages = int.from_bytes(data[4:8], "big")
+        if cookie_pages <= 20_000 and 8 + cookie_pages * 4 <= len(data):
+            return "binarycookies"
+    if data.startswith(b"LPKSHHRH"):
+        return "systemd_journal"
+    if data.startswith(b"mozLz40\0"):
+        return "mozlz4"
+    if data.startswith((b"CMMM", b"IMMM")) or (len(data) >= 8 and data[4:8] == b"IMMM"):
+        return "thumbcache"
+    if re.fullmatch(r"(?:u|w|b)tmpx?(?:\.\d+)?", basename) or extension in {".utmp", ".wtmp", ".btmp"}:
+        return "utmp"
+    leveldb_table_magic = b"\x57\xfb\x80\x8b\x24\x75\x47\xdb"
+    if data.endswith(leveldb_table_magic) or extension in {".ldb", ".sst"}:
+        return "leveldb"
+    if (basename.startswith("manifest-") or extension == ".log") and len(data) >= 7:
+        first_length = int.from_bytes(data[4:6], "little")
+        if data[6] in {1, 2, 3, 4} and first_length <= min(len(data) - 7, 32_761):
+            return "leveldb"
+    if data.startswith(b"ANDROID BACKUP\n"):
+        return "android_backup"
+    if data.startswith(b"bplist00"):
+        return "plist"
+    plist_head = data[:8192].lstrip(b"\xef\xbb\xbf\x00\t\r\n ")
+    if plist_head.startswith(b"<?xml") and b"<plist" in plist_head.lower():
+        return "plist"
+    if (
+        len(data) >= 76
+        and data[:4] == b"L\0\0\0"
+        and data[4:20] == bytes.fromhex("0114020000000000c000000000000046")
+    ):
+        return "lnk"
+    if data.startswith(b"MAM\x04") and extension == ".pf":
+        return "prefetch"
+    if len(data) >= 8 and data[4:8] == b"SCCA":
+        return "prefetch"
+    if len(data) >= 8 and data[4:8] == b"\xef\xcd\xab\x89":
+        return "ese"
+    if data.startswith(b"QFI\xfb"):
+        return "qcow"
+    if data.startswith(b"KDMV") or data.startswith(b"# Disk DescriptorFile"):
+        return "vmdk"
+    if data.startswith(b"vhdxfile"):
+        return "vhdx"
+    if data.startswith(b"<<< Oracle VM VirtualBox Disk Image >>>"):
+        return "vdi"
+    if data.startswith(b"AFF10") or extension in {".aff", ".aff4"}:
+        return "aff"
+    if (extension == ".dmg" and data) or len(data) >= 512 and data[-512:-508] == b"koly":
+        return "dmg"
+    if (basename == "$mft" or extension == ".mft") and data[:4] in {b"FILE", b"BAAD"}:
+        return "mft"
+    if basename in {"$j", "$usnjrnl", "$usnjrnl:$j"} or extension in {".usn", ".usnjrnl"}:
+        return "usn"
+    if basename.startswith("$i") and len(data) >= 24 and int.from_bytes(data[:8], "little") in {1, 2}:
+        return "recycle_bin_i"
     if data.startswith(b"#!/bin/sh") and b"begin " in data[:64 * 1024] and b"uudecode" in data[:64 * 1024]:
         return "shar"
     if data.startswith(b"!<arch>\n"):
@@ -171,6 +305,8 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "webp"
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
         return "wav"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"AVI ":
+        return "avi"
     if len(data) >= 12 and data[:4] == b"FORM" and data[8:12] in {b"AIFF", b"AIFC"}:
         return "aiff"
     if data.startswith(b"fLaC"):
@@ -182,7 +318,12 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
     if len(data) >= 2 and data[0] == 0xFF and data[1] & 0xF6 == 0xF0:
         return "aac"
     if len(data) >= 12 and data[4:8] == b"ftyp":
-        return "m4a"
+        brand = data[8:12]
+        if extension in {".m4a", ".m4b", ".m4p"}:
+            return "m4a"
+        if extension == ".mov" or brand == b"qt  ":
+            return "mov"
+        return "mp4"
     if data.startswith(b".snd"):
         return "au"
     if data.startswith(b"\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xce\x6c"):
@@ -193,12 +334,46 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "caf"
     if data.startswith(b"MThd"):
         return "midi"
+    if data.startswith(b"\x1aE\xdf\xa3"):
+        header = data[:4096].lower()
+        if extension == ".webm" or b"webm" in header:
+            return "webm"
+        return "matroska"
+    if data.startswith(b"MZ") and len(data) >= 64:
+        pe_offset = int.from_bytes(data[0x3C:0x40], "little")
+        if 0x40 <= pe_offset <= min(len(data) - 4, 16 * 1024 * 1024) and data[pe_offset:pe_offset + 4] == b"PE\x00\x00":
+            return "pe"
+    if data.startswith(b"\x7fELF"):
+        return "elf"
+    if (
+        data.startswith(b"\xca\xfe\xba\xbe")
+        and len(data) >= 10
+        and 45 <= int.from_bytes(data[6:8], "big") <= 100
+        and int.from_bytes(data[8:10], "big") > 0
+    ):
+        return "java_class"
+    if data[:4] in {
+        b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf",
+        b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf",
+    }:
+        return "macho"
+    if data.startswith(b"\x00asm"):
+        return "wasm"
+    if data.startswith(b"dex\n") and len(data) >= 8 and data[7] == 0:
+        return "dex"
+    if data.startswith(b"\xd9\xd9\xf7"):
+        return "cbor"
+    if data.startswith(b"d8:announce"):
+        return "bencode"
     if data.startswith((b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")):
         return "tiff"
     if data.startswith(b"\x00\x00\x01\x00") or data.startswith(b"\x00\x00\x02\x00"):
         return "ico"
     if data.startswith(b"PK\x03\x04") or data.startswith(b"PK\x05\x06"):
-        return "zip"
+        return {
+            ".docx": "docx", ".xlsx": "xlsx", ".pptx": "pptx",
+            ".odt": "odt", ".ods": "ods", ".odp": "odp", ".epub": "epub",
+        }.get(extension, "zip")
     if data.startswith(b"7z\xbc\xaf'\x1c"):
         return "7z"
     if data.startswith(b"Rar!\x1a\x07"):
@@ -229,6 +404,10 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "pdf"
     if data.startswith(b"SQLite format 3\x00"):
         return "sqlite"
+    if data[:4] in {b"7\x7f\x06\x82", b"7\x7f\x06\x83"}:
+        return "sqlite_wal"
+    if data.startswith(b"\xd9\xd5\x05\xf9 \xa1c\xd7"):
+        return "sqlite_journal"
     if data.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
         return "ole"
     if data.startswith(b"{\\rtf"):
@@ -252,11 +431,21 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "memory"
     if _looks_like_disk_image(data):
         return "disk"
+    if extension in {".mbox", ".mbx"} or _looks_like_mbox(data[:64 * 1024]):
+        return "mbox"
     if extension == ".eml" or _looks_like_email(data[:64 * 1024]):
         return "eml"
     markup_head = data[:8192].lstrip(b"\xef\xbb\xbf\x00\t\r\n ").lower()
     if b"<svg" in markup_head and (markup_head.startswith((b"<svg", b"<?xml", b"<!--"))):
         return "svg"
+    if data and extension in {".torrent", ".bencode"} and data[:1] in b"dli0123456789":
+        return "bencode"
+    if extension in {".cbor", ".cborseq", ".cose"}:
+        return "cbor"
+    if extension in {".msgpack", ".mpk"}:
+        return "msgpack"
+    if extension in {".pb", ".protobuf"}:
+        return "protobuf"
     if data and _looks_textual(data[:8192]):
         return "text"
     return {
@@ -265,7 +454,8 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         ".tif": "tiff", ".tiff": "tiff", ".ico": "ico", ".cur": "ico",
         ".wav": "wav", ".wave": "wav", ".aif": "aiff", ".aiff": "aiff", ".aifc": "aiff",
         ".flac": "flac", ".ogg": "ogg", ".oga": "ogg", ".opus": "ogg",
-        ".mp3": "mp3", ".aac": "aac", ".m4a": "m4a", ".mp4": "m4a",
+        ".mp3": "mp3", ".aac": "aac", ".m4a": "m4a", ".m4b": "m4a",
+        ".mp4": "mp4", ".mov": "mov", ".mkv": "matroska", ".webm": "webm", ".avi": "avi",
         ".au": "au", ".snd": "au", ".wma": "asf", ".amr": "amr", ".caf": "caf",
         ".mid": "midi", ".midi": "midi",
         ".7z": "7z", ".rar": "rar", ".tar": "tar",
@@ -273,13 +463,31 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         ".tgz": "gzip", ".tbz": "bzip2", ".tbz2": "bzip2", ".txz": "xz",
         ".pcap": "pcap", ".cap": "pcap", ".pcapng": "pcapng",
         ".sqlite": "sqlite", ".sqlite3": "sqlite", ".db": "sqlite",
+        ".sqlite-wal": "sqlite_wal", ".db-wal": "sqlite_wal",
+        ".sqlite-journal": "sqlite_journal", ".db-journal": "sqlite_journal",
+        ".mbdb": "ios_mbdb", ".binarycookies": "binarycookies", ".dsstore": "ds_store",
+        ".utmp": "utmp", ".wtmp": "utmp", ".btmp": "utmp",
+        ".jsonlz4": "mozlz4", ".baklz4": "mozlz4", ".mozlz4": "mozlz4",
+        ".ldb": "leveldb", ".sst": "leveldb",
         ".doc": "ole", ".xls": "ole", ".ppt": "ole", ".msg": "ole",
-        ".rtf": "rtf", ".eml": "eml",
-        ".img": "disk", ".dd": "disk", ".iso": "disk", ".vhd": "disk", ".vhdx": "disk", ".vmdk": "disk",
+        ".rtf": "rtf", ".eml": "eml", ".mbox": "mbox", ".mbx": "mbox", ".journal": "systemd_journal",
+        ".lnk": "lnk", ".pf": "prefetch", ".plist": "plist", ".ab": "android_backup",
+        ".automaticdestinations-ms": "jumplist", ".customdestinations-ms": "jumplist",
+        ".mft": "mft", ".usn": "usn", ".usnjrnl": "usn", ".edb": "ese",
+        ".img": "disk", ".dd": "disk", ".iso": "disk", ".vhd": "disk",
+        ".vhdx": "vhdx", ".vmdk": "vmdk", ".qcow": "qcow", ".qcow2": "qcow",
+        ".vdi": "vdi", ".dmg": "dmg", ".aff": "aff", ".aff4": "aff",
         ".e01": "ewf", ".ex01": "ewf", ".s01": "ewf",
         ".dat": "binary", ".hive": "registry",
         ".vmem": "memory", ".mem": "memory", ".lime": "memory", ".dmp": "memory", ".raw": "memory",
         ".evtx": "evtx", ".pst": "pst", ".ost": "pst",
+        ".exe": "pe", ".dll": "pe", ".sys": "pe", ".efi": "pe",
+        ".elf": "elf", ".so": "elf", ".o": "elf", ".dylib": "macho", ".wasm": "wasm",
+        ".dex": "dex", ".class": "java_class",
+        ".torrent": "bencode", ".bencode": "bencode",
+        ".cbor": "cbor", ".cborseq": "cbor", ".cose": "cbor",
+        ".msgpack": "msgpack", ".mpk": "msgpack",
+        ".pb": "protobuf", ".protobuf": "protobuf",
     }.get(extension, "binary")
 
 
@@ -299,6 +507,17 @@ def _looks_like_email(data: bytes) -> bool:
     return bool({b"from", b"to", b"subject", b"date", b"message-id"} & names) and (
         b"mime-version" in names or b"content-type" in names or len(names) >= 4
     )
+
+
+def _looks_like_mbox(data: bytes) -> bool:
+    """Recognize an MBOX From_ envelope followed by an RFC-style message."""
+
+    if not data.startswith(b"From "):
+        return False
+    line_end = data.find(b"\n")
+    if line_end < 6 or line_end > 1000:
+        return False
+    return _looks_like_email(data[line_end + 1:])
 
 
 def _looks_like_disk_image(data: bytes) -> bool:
@@ -338,16 +557,32 @@ def extension_for(kind: str) -> str:
     return {
         "png": ".png", "jpeg": ".jpg", "gif": ".gif", "bmp": ".bmp",
         "webp": ".webp", "svg": ".svg", "tiff": ".tiff", "ico": ".ico", "zip": ".zip",
+        "docx": ".docx", "xlsx": ".xlsx", "pptx": ".pptx",
+        "odt": ".odt", "ods": ".ods", "odp": ".odp", "epub": ".epub",
         "wav": ".wav", "aiff": ".aiff", "flac": ".flac", "ogg": ".ogg",
         "mp3": ".mp3", "aac": ".aac", "m4a": ".m4a", "au": ".au",
         "asf": ".wma", "amr": ".amr", "caf": ".caf", "midi": ".mid",
+        "mp4": ".mp4", "mov": ".mov", "matroska": ".mkv", "webm": ".webm", "avi": ".avi",
+        "pe": ".exe", "elf": ".elf", "macho": ".macho", "wasm": ".wasm",
+        "dex": ".dex", "java_class": ".class",
+        "bencode": ".torrent", "cbor": ".cbor", "msgpack": ".msgpack", "protobuf": ".pb",
         "gzip": ".gz", "zlib": ".zlib", "bzip2": ".bz2", "xz": ".xz", "zstd": ".zst",
         "7z": ".7z", "rar": ".rar", "tar": ".tar", "shar": ".shar", "ar": ".a",
         "lzip": ".lz", "lz4": ".lz4", "lzma": ".lzma", "lzop": ".lzo",
         "pdf": ".pdf", "pcap": ".pcap", "pcapng": ".pcapng", "sqlite": ".sqlite",
-        "ole": ".ole", "rtf": ".rtf", "eml": ".eml", "disk": ".img", "ewf": ".E01",
+        "sqlite_wal": ".sqlite-wal", "sqlite_journal": ".sqlite-journal",
+        "thumbcache": ".db", "utmp": ".wtmp", "ios_mbdb": ".mbdb",
+        "mozlz4": ".jsonlz4", "leveldb": ".ldb", "ds_store": ".DS_Store",
+        "binarycookies": ".binarycookies",
+        "ole": ".ole", "rtf": ".rtf", "eml": ".eml", "mbox": ".mbox",
+        "systemd_journal": ".journal", "disk": ".img", "ewf": ".E01",
         "registry": ".hive", "memory": ".mem", "text": ".txt",
         "evtx": ".evtx", "pst": ".pst",
+        "lnk": ".lnk", "prefetch": ".pf", "plist": ".plist", "android_backup": ".ab",
+        "jumplist": ".automaticDestinations-ms",
+        "mft": ".mft", "usn": ".usn", "ese": ".edb", "qcow": ".qcow2",
+        "recycle_bin_i": ".recycle-bin-i",
+        "vmdk": ".vmdk", "vhdx": ".vhdx", "vdi": ".vdi", "dmg": ".dmg", "aff": ".aff4",
     }.get(kind, ".bin")
 
 
@@ -383,56 +618,34 @@ def _looks_textual(data: bytes) -> bool:
 
 
 def iter_ascii_strings(data: bytes, minimum: int = 4, limit: int = 10_000) -> Iterator[dict[str, Any]]:
-    emitted = 0
-    start: int | None = None
-    for index, byte in enumerate(data + b"\x00"):
-        if 32 <= byte <= 126 or byte == 9:
-            if start is None:
-                start = index
-        elif start is not None:
-            if index - start >= minimum:
-                yield {"encoding": "ascii", "offset": start, "text": data[start:index].decode("ascii", "replace")}
-                emitted += 1
-                if emitted >= limit:
-                    return
-            start = None
+    if limit <= 0:
+        return
+    pattern = re.compile(rb"[\x09\x20-\x7e]{%d,}" % max(1, minimum))
+    for emitted, match in enumerate(pattern.finditer(data), 1):
+        yield {"encoding": "ascii", "offset": match.start(), "text": match.group().decode("ascii", "replace")}
+        if emitted >= limit:
+            return
 
 
 def iter_utf16_strings(data: bytes, minimum: int = 4, limit: int = 5_000) -> Iterator[dict[str, Any]]:
+    if limit <= 0:
+        return
+    minimum = max(1, minimum)
+    patterns = (
+        ("utf-16-le", re.compile(rb"(?:[\x09\x20-\x7e]\x00){%d,}" % minimum), slice(None, None, 2)),
+        ("utf-16-be", re.compile(rb"(?:\x00[\x09\x20-\x7e]){%d,}" % minimum), slice(1, None, 2)),
+    )
     emitted = 0
-    for endian in ("little", "big"):
-        for parity in (0, 1):
-            index = parity
-            start: int | None = None
-            chars: list[str] = []
-            while index + 1 < len(data):
-                code = int.from_bytes(data[index:index + 2], endian)
-                if 32 <= code <= 126 or code == 9:
-                    if start is None:
-                        start = index
-                    chars.append(chr(code))
-                else:
-                    if start is not None and len(chars) >= minimum:
-                        yield {
-                            "encoding": "utf-16-le" if endian == "little" else "utf-16-be",
-                            "offset": start,
-                            "text": "".join(chars),
-                        }
-                        emitted += 1
-                        if emitted >= limit:
-                            return
-                    start = None
-                    chars = []
-                index += 2
-            if start is not None and len(chars) >= minimum:
-                yield {
-                    "encoding": "utf-16-le" if endian == "little" else "utf-16-be",
-                    "offset": start,
-                    "text": "".join(chars),
-                }
-                emitted += 1
-                if emitted >= limit:
-                    return
+    for encoding, pattern, text_slice in patterns:
+        for match in pattern.finditer(data):
+            yield {
+                "encoding": encoding,
+                "offset": match.start(),
+                "text": match.group()[text_slice].decode("ascii", "replace"),
+            }
+            emitted += 1
+            if emitted >= limit:
+                return
 
 
 def find_magic_offsets(data: bytes, maximum_per_kind: int = 20) -> list[dict[str, Any]]:

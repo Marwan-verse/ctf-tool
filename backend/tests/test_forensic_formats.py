@@ -148,6 +148,28 @@ def test_pcap_dns_base64_fragments_are_ordered_and_decoded() -> None:
     assert any("picoCTF{dns_fixture}" in finding["details"]["flags"] for finding in report["findings"] if finding["title"] == "Flag-like text recovered from network payload")
 
 
+def test_pcap_http_basic_authorization_is_decoded_and_scanned_without_storing_secret() -> None:
+    flag = b"picoCTF{http_basic_authorization_fixture}"
+    secret = base64.b64encode(flag)
+    authorization = base64.b64encode(b"analyst:" + secret)
+    payload = (
+        b"GET /protected HTTP/1.1\r\nHost: ctf.example\r\nAuthorization: Basic "
+        + authorization + b"\r\n\r\n"
+    )
+
+    report = analyze_format("pcap", _raw_pcap([
+        _raw_ipv4_packet("10.0.0.1", "10.0.0.2", 6, payload, source_port=4242, destination_port=80),
+    ]))
+
+    assert report["properties"]["http_basic_credentials"] == [{
+        "packet": 1, "source": "10.0.0.1", "destination": "10.0.0.2",
+        "host": "ctf.example", "target": "/protected", "username": "analyst",
+    }]
+    assert secret.decode() not in repr(report["properties"]["http_basic_credentials"])
+    assert any(record["text"] == f"analyst:{secret.decode()}" for record in report["text_records"])
+    assert any(flag.decode() in finding["details"]["flags"] for finding in report["findings"] if finding["title"] == "Flag-like text recovered from network payload")
+
+
 def test_pcap_tftp_data_is_reassembled_as_child_object() -> None:
     request = b"\x00\x01flag.txt\x00octet\x00"
     data_block = struct.pack("!HH", 3, 1) + b"picoCTF{tftp_fixture}"

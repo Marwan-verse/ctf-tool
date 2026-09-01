@@ -168,6 +168,20 @@ def decompress_lz4(data: bytes, maximum: int = 16 * 1024 * 1024) -> bytes:
     return bytes(output)
 
 
+def decompress_mozlz4(data: bytes, maximum: int = 64 * 1024 * 1024) -> bytes:
+    """Decompress Firefox's mozLz40 + size + raw-LZ4-block container."""
+
+    if len(data) < 12 or not data.startswith(b"mozLz40\0"):
+        raise CompressionError("invalid Mozilla JSONLZ4 header")
+    expected_size = int.from_bytes(data[8:12], "little")
+    if expected_size > maximum:
+        raise CompressionError("Mozilla JSONLZ4 output limit exceeded")
+    output = _decompress_lz4_block(data[12:], bytearray(), maximum)
+    if len(output) != expected_size:
+        raise CompressionError("Mozilla JSONLZ4 uncompressed size mismatch")
+    return output
+
+
 def decompress_lzma_alone(data: bytes, maximum: int = 16 * 1024 * 1024) -> bytes:
     """Decompress the legacy 13-byte-header LZMA-alone format."""
 
@@ -239,6 +253,7 @@ def decompress_lzop(data: bytes, maximum: int = 16 * 1024 * 1024) -> bytes:
 DECODERS: dict[str, Callable[[bytes, int], bytes]] = {
     "lzip": decompress_lzip,
     "lz4": decompress_lz4,
+    "mozlz4": decompress_mozlz4,
     "lzma": decompress_lzma_alone,
     "lzop": decompress_lzop,
 }

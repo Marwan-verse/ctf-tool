@@ -206,6 +206,45 @@ class ToolInstallRequest(BaseModel):
         return normalized
 
 
+class TrafficQueryRequest(BaseModel):
+    """Bounded, read-only Wireshark/TShark operation on a stored capture."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    action: Literal["packets", "follow", "statistics"] = "packets"
+    artifact_id: str | None = Field(
+        default=None,
+        min_length=36,
+        max_length=36,
+        pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
+    )
+    keylog_artifact_id: str | None = Field(
+        default=None,
+        min_length=36,
+        max_length=36,
+        pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
+    )
+    display_filter: str = Field(default="", max_length=512)
+    packet_limit: int = Field(default=500, ge=1, le=2000)
+    include_raw_bytes: bool = False
+    follow_protocol: Literal["tcp", "udp", "dccp", "tls", "dtls", "http", "http2", "quic", "mp2t", "mpeg-pes"] = "tcp"
+    stream_index: int = Field(default=0, ge=0, le=1_000_000)
+    follow_mode: Literal["ascii", "hex", "raw", "yaml"] = "ascii"
+    statistic: Literal[
+        "protocol_hierarchy", "io_graph", "packet_lengths", "flow_graph",
+        "endpoints", "conversations", "dns", "http", "http_requests",
+        "http2", "icmp", "sip", "rtp", "smb2", "expert", "credentials",
+    ] = "protocol_hierarchy"
+
+    @field_validator("display_filter")
+    @classmethod
+    def safe_display_filter(cls, value: str) -> str:
+        normalized = value.strip()
+        if any(ord(character) < 32 or ord(character) == 127 for character in normalized):
+            raise ValueError("Display filters cannot contain control characters.")
+        return normalized
+
+
 class HexByteEdit(BaseModel):
     """One fixed-size byte replacement in the immutable source."""
 

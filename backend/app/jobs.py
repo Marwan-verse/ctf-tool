@@ -201,8 +201,13 @@ class JobManager:
                     payload["progress"] = progress
                 if stage is not None:
                     payload["stage"] = stage
-                self.storage.update_progress(job_id, progress=progress, stage=stage)
-                self.storage.append_event(job_id, event_type, payload)
+                self.storage.update_progress_and_append_event(
+                    job_id,
+                    progress=progress,
+                    stage=stage,
+                    event_type=event_type,
+                    payload=payload,
+                )
             except Exception:
                 # Progress telemetry must never abort the forensic analysis.
                 logger.debug("Unable to persist progress for job %s", job_id, exc_info=True)
@@ -284,6 +289,7 @@ class JobManager:
             result=report,
             error_code=error_code,
             error_message=error_message,
+            return_job=False,
         )
 
     def _index_artifacts(
@@ -304,9 +310,7 @@ class JobManager:
                 maximum=self.settings.max_artifacts,
                 is_cancelled=is_cancelled,
             )
-            for artifact in artifacts:
-                self.storage.upsert_artifact(artifact)
-            return len(artifacts)
+            return self.storage.upsert_artifacts(artifacts)
         except Exception:
             logger.exception("Unable to index all artifacts for job %s", job_id)
             try:

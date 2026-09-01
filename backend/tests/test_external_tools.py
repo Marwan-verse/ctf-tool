@@ -1,13 +1,129 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import struct
 import sys
 from pathlib import Path
 
 import pytest
 
-from app.analyzers.external import ExternalToolRunner, ResolvedTool, TOOL_SPECS, resolve_executable
+from app.analyzers.external import (
+    ExternalToolRunner,
+    ResolvedTool,
+    TOOL_SPECS,
+    resolve_executable,
+    resolve_tool,
+    run_tshark_workbench,
+)
+
+
+def _completed_tool_output(stdout: str) -> dict[str, object]:
+    return {
+        "status": "completed",
+        "return_code": 0,
+        "stdout": stdout,
+        "stderr": "",
+        "output_truncated": False,
+    }
+
+
+def test_tshark_workbench_passes_display_filter_as_one_non_shell_argument(monkeypatch, tmp_path: Path) -> None:
+    capture = tmp_path / "hostile capture;name.pcap"
+    capture.write_bytes(b"\xd4\xc3\xb2\xa1" + b"\0" * 20)
+    keylog = tmp_path / "tls keys.txt"
+    keylog.write_text("CLIENT_RANDOM deadbeef cafe\n", encoding="ascii")
+    resolution = ResolvedTool(source="native", launcher=Path("C:/Wireshark/tshark.exe"), executable="tshark")
+    launched: list[list[str]] = []
+    packet_json = json.dumps([{
+        "_source": {"layers": {
+            "frame": {"frame.number": "7", "frame.time_epoch": "1.25", "frame.protocols": "eth:ip:tcp:http", "frame.len": "90"},
+            "ip": {"ip.src": "10.0.0.1", "ip.dst": "10.0.0.2"},
+            "tcp": {"tcp.srcport": "31337", "tcp.dstport": "80", "tcp.stream": "4"},
+            "http": {"http.request.full_uri": "http://example.test/flag"},
+        }}
+    }])
+
+    monkeypatch.setattr("app.analyzers.external.resolve_tool", lambda _name: resolution)
+
+    def fake_execute(_runner, argv, *, cwd, timeout=None, stdin_data=None):
+        launched.append(argv)
+        assert cwd == tmp_path
+        assert timeout == 30
+        assert stdin_data is None
+        return _completed_tool_output(packet_json)
+
+    monkeypatch.setattr(ExternalToolRunner, "_execute", fake_execute)
+    display_filter = 'http.host == "x;$(touch pwn)"'
+    result = run_tshark_workbench(capture, action="packets", keylog_path=keylog, display_filter=display_filter, packet_limit=25)
+
+    assert launched and launched[0][launched[0].index("-Y") + 1] == display_filter
+    assert launched[0][launched[0].index("-r") + 1] == str(capture)
+    assert launched[0][launched[0].index("-o") + 1] == f"tls.keylog_file:{keylog}"
+    assert result["packet_rows"][0]["protocol"] == "HTTP"
+    assert result["packet_rows"][0]["stream_id"] == "4"
+
+
+def test_tshark_workbench_uses_allowlisted_follow_and_statistics_taps(monkeypatch, tmp_path: Path) -> None:
+    capture = tmp_path / "evidence.pcapng"
+    capture.write_bytes(b"\x0a\x0d\x0d\x0a" + b"\0" * 24)
+    resolution = ResolvedTool(source="native", launcher=Path("tshark"), executable="tshark")
+    launched: list[list[str]] = []
+    monkeypatch.setattr("app.analyzers.external.resolve_tool", lambda _name: resolution)
+
+    def fake_execute(_runner, argv, *, cwd, timeout=None, stdin_data=None):
+        launched.append(argv)
+        return _completed_tool_output("bounded output")
+
+    monkeypatch.setattr(ExternalToolRunner, "_execute", fake_execute)
+    follow = run_tshark_workbench(capture, action="follow", follow_protocol="tcp", follow_mode="ascii", stream_index=7)
+    stats = run_tshark_workbench(capture, action="statistics", statistic="endpoints")
+
+    assert "follow,tcp,ascii,7" in launched[0]
+    endpoint_taps = [launched[1][index + 1] for index, value in enumerate(launched[1][:-1]) if value == "-z"]
+    assert endpoint_taps == ["endpoints,eth", "endpoints,ip", "endpoints,ipv6", "endpoints,tcp", "endpoints,udp", "endpoints,wlan", "endpoints,usb"]
+    assert follow["output"] == "bounded output"
+    assert stats["statistic"] == "endpoints"
+
+
+def test_wsl_argument_converts_server_resolved_tls_keylog_path(monkeypatch) -> None:
+    monkeypatch.setattr("app.analyzers.external.os.name", "nt")
+
+    converted = ExternalToolRunner._wsl_argument(r"tls.keylog_file:C:\cases\tls keys.txt")  # noqa: SLF001
+
+    assert converted == "tls.keylog_file:/mnt/c/cases/tls keys.txt"
+
+
+def test_tshark_workbench_with_installed_wireshark(tmp_path: Path) -> None:
+    if resolve_tool("tshark") is None:
+        pytest.skip("TShark is optional")
+    ethernet = bytes.fromhex("00112233445566778899aabb0800")
+    ipv4 = bytes.fromhex("4500002000010000401100000a0000010a000002")
+    udp = struct.pack("!HHHH", 50_000, 53, 12, 0) + b"flag"
+    frame = ethernet + ipv4 + udp
+    capture = tmp_path / "real-tshark.pcap"
+    capture.write_bytes(
+        struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65_535, 1)
+        + struct.pack("<IIII", 1, 0, len(frame), len(frame))
+        + frame
+    )
+
+    packets = run_tshark_workbench(capture, action="packets", display_filter="udp.port == 53", packet_limit=10)
+    flag_packets = run_tshark_workbench(capture, action="packets", display_filter='frame contains "flag"', packet_limit=10)
+    assert packets["packet_count"] == 1
+    assert flag_packets["packet_count"] == 1
+    assert packets["packet_rows"][0]["source"] == "10.0.0.1"
+    assert packets["packet_rows"][0]["destination_port"] == "53"
+    for statistic in (
+        "protocol_hierarchy", "io_graph", "packet_lengths", "flow_graph", "endpoints", "conversations",
+        "dns", "http", "http_requests", "http2", "icmp", "sip", "rtp", "smb2", "expert", "credentials",
+    ):
+        statistics = run_tshark_workbench(capture, action="statistics", statistic=statistic)
+        assert statistics["statistic"] == statistic
+        assert isinstance(statistics["output"], str)
+    followed = run_tshark_workbench(capture, action="follow", follow_protocol="udp", stream_index=0)
+    assert followed["protocol"] == "udp"
 
 
 def test_missing_optional_tools_are_reported_without_failing(
@@ -160,9 +276,13 @@ def test_tshark_field_adapters_avoid_shell_metacharacter_separator(monkeypatch, 
         selected_tools={"tshark_fields", "tshark_usb_hid"},
     )
 
-    assert len(invocations) == 2
-    assert all("separator=/t" in argv for argv in invocations)
-    assert all(not any("|" in argument for argument in argv) for argv in invocations)
+    main_invocations = [argv for argv in invocations if "-r" in argv]
+    assert len(main_invocations) == 2
+    assert all("separator=/t" in argv for argv in main_invocations)
+    assert all(
+        not any(argument.startswith("separator=") and "|" in argument for argument in argv)
+        for argv in main_invocations
+    )
 
 
 def test_tshark_usb_mouse_reports_render_an_svg_artifact() -> None:
@@ -509,3 +629,142 @@ def test_steghide_extracts_payload_and_redacts_passphrase(
     assert "correct horse battery staple" not in " ".join(result["command"])
     assert "<redacted>" in result["command"]
     assert any("extract" in invocation for invocation in launched)
+
+
+def test_endpoint_and_disk_adapters_use_fixed_read_only_arguments(monkeypatch, tmp_path: Path) -> None:
+    samples = {
+        "lnk": ("evidence.lnk", "lnkinfo"),
+        "prefetch": ("evidence.pf", "sccainfo"),
+        "plist": ("evidence.plist", "plistutil"),
+        "ese": ("evidence.edb", "esedbinfo"),
+        "qcow": ("evidence.qcow2", "qemu_img_info"),
+        "disk": ("evidence.img", "bulk_extractor"),
+    }
+    monkeypatch.setattr(
+        "app.analyzers.external.resolve_tool",
+        lambda executable, **_kwargs: ResolvedTool(
+            source="native", launcher=Path(sys.executable), executable=executable
+        ),
+    )
+    runner = ExternalToolRunner(timeout=1)
+
+    def fake_execute(argv, *, cwd, timeout=None, stdin_data=None):
+        return {
+            "status": "completed", "return_code": 0, "stdout": "", "stderr": "",
+            "output_truncated": False,
+        }
+
+    monkeypatch.setattr(runner, "_execute", fake_execute)
+    commands: dict[str, list[str]] = {}
+    for kind, (name, tool_id) in samples.items():
+        evidence = tmp_path / name
+        evidence.write_bytes(b"synthetic evidence")
+        methods = runner.run_all(
+            evidence,
+            kind=kind,
+            profile="deep",
+            password=None,
+            work_dir=tmp_path,
+            selected_tools={tool_id},
+        )
+        commands[tool_id] = next(method for method in methods if method["id"] == tool_id)["command"]
+
+    assert commands["lnkinfo"][-1].endswith("evidence.lnk")
+    assert commands["sccainfo"][-1].endswith("evidence.pf")
+    assert commands["esedbinfo"][-1].endswith("evidence.edb")
+    assert commands["plistutil"][-2:] == ["-f", "json"]
+    assert commands["qemu_img_info"][1:3] == ["info", "--output=json"]
+    assert not {"convert", "commit", "rebase", "resize", "--backing-chain"} & set(commands["qemu_img_info"])
+    assert "-q" in commands["bulk_extractor"] and "-o" in commands["bulk_extractor"]
+
+
+def test_thumbcache_utmp_and_journal_adapters_never_use_write_modes(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        "app.analyzers.external.resolve_tool",
+        lambda executable, **_kwargs: ResolvedTool(
+            source="native", launcher=Path(sys.executable), executable=executable
+        ),
+    )
+    runner = ExternalToolRunner(timeout=1)
+
+    def fake_execute(argv, *, cwd, timeout=None, stdin_data=None):
+        return {
+            "status": "completed", "return_code": 0, "stdout": "", "stderr": "",
+            "output_truncated": False,
+        }
+
+    monkeypatch.setattr(runner, "_execute", fake_execute)
+    commands: dict[str, list[str]] = {}
+    for kind, name, tool_id in (
+        ("thumbcache", "thumbcache_256.db", "wtcdbinfo"),
+        ("thumbcache", "thumbcache_256.db", "wtcdbexport"),
+        ("utmp", "wtmp", "utmpdump"),
+        ("systemd_journal", "system.journal", "journalctl"),
+    ):
+        evidence = tmp_path / name
+        evidence.write_bytes(b"CMMM synthetic evidence")
+        methods = runner.run_all(
+            evidence, kind=kind, profile="deep", password=None, work_dir=tmp_path,
+            selected_tools={tool_id},
+        )
+        commands[tool_id] = next(method for method in methods if method["id"] == tool_id)["command"]
+
+    assert commands["wtcdbinfo"][-1].endswith("thumbcache_256.db")
+    assert commands["wtcdbexport"][1] == "-t"
+    assert commands["utmpdump"][-1].endswith("wtmp")
+    assert "-r" not in commands["utmpdump"] and "--reverse" not in commands["utmpdump"]
+    assert commands["journalctl"][1] == "--file"
+    assert commands["journalctl"][-3:] == ["--utc", "--no-pager", "--output=short-iso"]
+    assert not any(argument.startswith("--vacuum-") for argument in commands["journalctl"])
+    assert not {"--rotate", "--flush", "--sync", "--verify"} & set(commands["journalctl"])
+
+
+def test_program_timeline_network_and_mobile_adapters_use_fixed_offline_commands(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        "app.analyzers.external.resolve_tool",
+        lambda executable, **_kwargs: ResolvedTool(source="native", launcher=Path(sys.executable), executable=executable),
+    )
+    runner = ExternalToolRunner(timeout=1)
+    launched: dict[str, list[str]] = {}
+    active_tool = ""
+
+    def fake_execute(argv, *, cwd, timeout=None, stdin_data=None, env_overrides=None):
+        if "--version" not in argv and "-version" not in argv:
+            launched[active_tool] = list(argv)
+            if active_tool == "floss":
+                assert env_overrides == {"FLOSS_CACHE_ENABLE": "0", "FLOSS_SAVE_WORKSPACE": "0"}
+        return {"status": "completed", "return_code": 0, "stdout": "{}", "stderr": "", "output_truncated": False}
+
+    monkeypatch.setattr(runner, "_execute", fake_execute)
+    cases = (
+        ("yara_x_dump", "pe", "sample.exe"),
+        ("capa", "pe", "sample.exe"),
+        ("floss", "pe", "sample.exe"),
+        ("zeek", "pcap", "traffic.pcap"),
+        ("plaso_timeline", "evtx", "events.evtx"),
+        ("kaitai_dump", "wasm", "module.wasm"),
+        ("ileapp", "zip", "ios.zip"),
+        ("aleapp", "tar", "android.tar"),
+        ("ffmpeg_frames", "mp4", "clip.mp4"),
+    )
+    for tool_id, kind, name in cases:
+        active_tool = tool_id
+        evidence = tmp_path / name
+        evidence.write_bytes(b"synthetic evidence")
+        runner.run_all(
+            evidence, kind=kind, profile="deep", password=None, work_dir=tmp_path,
+            selected_tools={tool_id},
+        )
+
+    assert launched["yara_x_dump"][1:5] == ["dump", "--output-format", "json", "--no-colors"]
+    assert launched["capa"][1] == "-j"
+    assert launched["floss"][1:4] == ["-j", "--color", "never"]
+    assert launched["zeek"][1:4] == ["-C", "-r", str(tmp_path / "traffic.pcap")]
+    assert "LogAscii::use_json=T" in launched["zeek"]
+    assert "--source" in launched["plaso_timeline"] and "--storage-file" in launched["plaso_timeline"]
+    assert launched["kaitai_dump"][1:3] == ["-f", "json"]
+    assert launched["kaitai_dump"][-1].endswith("wasm_header.ksy")
+    assert launched["ileapp"][1:3] == ["-t", "zip"]
+    assert launched["aleapp"][1:3] == ["-t", "tar"]
+    assert "-protocol_whitelist" in launched["ffmpeg_frames"]
+    assert "http,https" not in launched["ffmpeg_frames"]

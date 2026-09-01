@@ -6,7 +6,7 @@ from pathlib import Path
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from app.analyzers.crypto import _evp_bytes_to_key, analyze_encrypted_payloads
-from app.engine import AnalysisEngine
+from app.engine import AnalysisEngine, _capture_openssl_passphrase_hints
 from conftest import patterned_pixels, rgb_png
 
 
@@ -84,6 +84,32 @@ def test_openssl_des3_envelope_is_supported() -> None:
 
     assert report["decryptions"][0]["algorithm"] == "openssl-des-ede3-cbc"
     assert report["decryptions"][0]["data"] == plaintext
+
+
+def test_pcap_openssl_command_hint_decrypts_without_persisting_the_secret() -> None:
+    passphrase = "captured-des3-secret"
+    plaintext = b"flag{pcap_openssl_command_fixture}"
+    hints = _capture_openssl_passphrase_hints([{
+        "source": "pcap-tcp-stream",
+        "text": f"openssl des3 -d -salt -in transfer.des3 -out flag.txt -k {passphrase}",
+    }])
+    ignored = _capture_openssl_passphrase_hints([{
+        "source": "strings:ascii",
+        "text": f"openssl des3 -d -k {passphrase}",
+    }])
+
+    report = analyze_encrypted_payloads(
+        [{"artifact_id": "pcap-stream", "label": "TCP recovery", "kind": "binary", "data": openssl_des3_salted_fixture(passphrase.encode(), plaintext)}],
+        passphrase=None,
+        passphrase_hints=hints,
+    )
+
+    assert hints == [passphrase]
+    assert ignored == []
+    assert report["decryptions"][0]["algorithm"] == "openssl-des-ede3-cbc"
+    assert report["decryptions"][0]["passphrase_source"] == "observed-capture-command"
+    assert report["decryptions"][0]["data"] == plaintext
+    assert passphrase not in str({key: value for key, value in report["decryptions"][0].items() if key != "data"})
 
 
 def test_crypto_stage_can_be_disabled() -> None:

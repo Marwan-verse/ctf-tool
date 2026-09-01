@@ -98,6 +98,40 @@ def _passphrase_candidates(passphrase: str) -> list[bytes]:
     return [candidate for candidate in candidates if candidate]
 
 
+def _recovery_passphrases(
+    passphrase: str | None,
+    passphrase_hints: Iterable[str],
+) -> list[tuple[str, str]]:
+    """Return a tiny, deduplicated list of explicitly observed credentials.
+
+    Hints are not guesses: callers may supply only literal credentials that
+    were already visible in the same evidence item (for example, an OpenSSL
+    command in a CTF TCP stream).  Values are intentionally kept transient and
+    never copied into reports or artifact metadata.
+    """
+
+    candidates: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(value: str | None, source: str) -> None:
+        if not isinstance(value, str):
+            return
+        candidate = value.strip()
+        if not candidate or len(candidate) > 256 or candidate in seen:
+            return
+        if any(ord(character) < 32 or ord(character) == 127 for character in candidate):
+            return
+        seen.add(candidate)
+        candidates.append((candidate, source))
+
+    add(passphrase, "user-supplied")
+    for hint in passphrase_hints:
+        add(hint, "observed-capture-command")
+        if len(candidates) >= 8:
+            break
+    return candidates
+
+
 def _xor_repeat(data: bytes, key: bytes) -> bytes:
     return bytes(byte ^ key[index % len(key)] for index, byte in enumerate(data))
 
@@ -134,10 +168,6 @@ def _openssl_aes_decrypt(data: bytes, passphrase: bytes) -> tuple[bytes | None, 
         return None, "not_an_openssl_envelope"
     try:
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        try:
-            from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
-        except ImportError:
-            TripleDES = algorithms.TripleDES
     except ImportError:
         return None, "cryptography_dependency_missing"
     salt = data[8:16]
@@ -172,6 +202,10 @@ def _openssl_des3_decrypt(data: bytes, passphrase: bytes) -> tuple[bytes | None,
         return None, "not_an_openssl_envelope"
     try:
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        try:
+            from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
+        except ImportError:
+            TripleDES = algorithms.TripleDES
     except ImportError:
         return None, "cryptography_dependency_missing"
     salt = data[8:16]
@@ -201,6 +235,7 @@ def analyze_encrypted_payloads(
     inputs: Iterable[dict[str, Any]],
     *,
     passphrase: str | None,
+    passphrase_hints: Iterable[str] = (),
     enabled: bool = True,
     max_inputs: int = _MAX_INPUTS,
     max_input_bytes: int = _MAX_INPUT_BYTES,
@@ -217,6 +252,7 @@ def analyze_encrypted_payloads(
             "summary": "Encrypted-payload analysis was disabled in this job's settings.",
         }
 
+    recovery_passphrases = _recovery_passphrases(passphrase, passphrase_hints)
     detections: list[dict[str, Any]] = []
     decryptions: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -250,7 +286,7 @@ def analyze_encrypted_payloads(
             is_salted = blob.startswith(b"Salted__")
             is_binary = _text_ratio(blob) < 0.72
             decoded_text = encoding != "raw"
-            passphrase_guided = bool(passphrase) and is_binary and len(blob) <= 1 * 1024 * 1024
+            passphrase_guided = bool(recovery_passphrases) and is_binary and len(blob) <= 1 * 1024 * 1024
             strong_signal = is_salted or (is_binary and entropy >= 7.05) or (decoded_text and entropy >= 6.35)
             if not strong_signal and not passphrase_guided:
                 continue
@@ -267,54 +303,64 @@ def analyze_encrypted_payloads(
                 "size": len(blob),
                 "entropy": entropy,
                 "passphrase_supplied": bool(passphrase),
+                "observed_passphrase_hint_available": any(source == "observed-capture-command" for _value, source in recovery_passphrases),
                 "decryption_status": "not_attempted",
             }
             successful = False
-            if attempts < max_attempts and passphrase:
-                for key in _passphrase_candidates(passphrase):
-                    if attempts >= max_attempts:
-                        break
-                    if is_salted:
-                        for algorithm_name, decryptor in (
-                            ("openssl-aes-256-cbc", _openssl_aes_decrypt),
-                            ("openssl-des-ede3-cbc", _openssl_des3_decrypt),
-                        ):
-                            if attempts >= max_attempts:
+            if attempts < max_attempts and recovery_passphrases:
+                for passphrase_value, passphrase_source in recovery_passphrases:
+                    for key in _passphrase_candidates(passphrase_value):
+                        if attempts >= max_attempts:
+                            break
+                        if is_salted:
+                            for algorithm_name, decryptor in (
+                                ("openssl-aes-256-cbc", _openssl_aes_decrypt),
+                                ("openssl-des-ede3-cbc", _openssl_des3_decrypt),
+                            ):
+                                if attempts >= max_attempts:
+                                    break
+                                attempts += 1
+                                plaintext, reason = decryptor(blob, key)
+                                if reason == "cryptography_dependency_missing":
+                                    dependency_missing = True
+                                if plaintext is not None and _looks_plaintext(plaintext):
+                                    decryptions.append({
+                                        "artifact_id": artifact_id,
+                                        "label": label,
+                                        "encoding": encoding,
+                                        "algorithm": algorithm_name,
+                                        "data": plaintext,
+                                        "size": len(plaintext),
+                                        "flag_like": _flag_like(plaintext),
+                                        "passphrase_source": passphrase_source,
+                                    })
+                                    successful = True
+                                    break
+                            if successful:
                                 break
+                        else:
                             attempts += 1
-                            plaintext, reason = decryptor(blob, key)
-                            if reason == "cryptography_dependency_missing":
-                                dependency_missing = True
-                            if plaintext is not None and _looks_plaintext(plaintext):
+                            plaintext = _xor_repeat(blob, key)
+                            if _looks_plaintext(plaintext) and plaintext != blob:
                                 decryptions.append({
                                     "artifact_id": artifact_id,
                                     "label": label,
                                     "encoding": encoding,
-                                    "algorithm": algorithm_name,
+                                    "algorithm": "repeating-key-xor",
                                     "data": plaintext,
                                     "size": len(plaintext),
                                     "flag_like": _flag_like(plaintext),
+                                    "passphrase_source": passphrase_source,
                                 })
                                 successful = True
                                 break
-                        if successful:
-                            break
-                    else:
-                        attempts += 1
-                        plaintext = _xor_repeat(blob, key)
-                        if _looks_plaintext(plaintext) and plaintext != blob:
-                            decryptions.append({
-                                "artifact_id": artifact_id,
-                                "label": label,
-                                "encoding": encoding,
-                                "algorithm": "repeating-key-xor",
-                                "data": plaintext,
-                                "size": len(plaintext),
-                                "flag_like": _flag_like(plaintext),
-                            })
-                            successful = True
-                            break
-            if not successful and attempts < max_attempts and not is_salted:
+                    if successful or attempts >= max_attempts:
+                        break
+            # A provided/observed passphrase can make an ordinary low-entropy
+            # container eligible for a repeating-key check. Do not then run a
+            # broad single-byte-XOR scan over that container: it is unrelated
+            # to the observed OpenSSL envelope and can create false flags.
+            if not successful and attempts < max_attempts and not is_salted and strong_signal:
                 attempts += min(255, max_attempts - attempts)
                 single = _single_byte_xor(blob)
                 if single is not None:
@@ -335,7 +381,7 @@ def analyze_encrypted_payloads(
                 # yields plausible plaintext; this avoids flagging every
                 # ordinary binary artifact as encrypted.
                 continue
-            detection["decryption_status"] = "decrypted" if successful else ("key_required" if not passphrase else "no_plaintext")
+            detection["decryption_status"] = "decrypted" if successful else ("key_required" if not recovery_passphrases else "no_plaintext")
             detections.append(detection)
 
     if detections:
