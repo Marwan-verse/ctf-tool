@@ -5,6 +5,8 @@ import os
 import shutil
 import struct
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -201,6 +203,69 @@ def test_tool_selection_is_recorded_as_skipped_without_lookup(monkeypatch, clean
     assert looked_up == []
     assert all(method["status"] == "skipped" for method in methods)
     assert all("settings" in method["summary"] for method in methods)
+
+
+def test_external_tools_can_run_concurrently_without_reordering_results(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "capture.pcap"
+    capture.write_bytes(b"capture")
+    resolution = ResolvedTool(source="native", launcher=Path("tshark"), executable="tshark")
+    resolution_calls: list[str] = []
+    monkeypatch.setattr(
+        "app.analyzers.external.resolve_tool",
+        lambda executable, **_kwargs: resolution_calls.append(executable) or resolution,
+    )
+    runner = ExternalToolRunner(timeout=1)
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def fake_run_spec(spec, *_args):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+        return runner._not_run(spec, "completed", "done", executable="tshark")  # noqa: SLF001
+
+    monkeypatch.setattr(runner, "_run_spec", fake_run_spec)
+    methods = runner.run_all(
+        capture,
+        kind="pcap",
+        profile="balanced",
+        password=None,
+        work_dir=tmp_path,
+        selected_tools={"tshark", "tshark_statistics"},
+        max_workers=2,
+    )
+
+    assert peak == 2
+    assert resolution_calls == ["tshark"]
+    assert [method["id"] for method in methods if method["status"] == "completed"] == [
+        "tshark",
+        "tshark_statistics",
+    ]
+
+
+def test_shared_executable_version_is_probed_once(monkeypatch, tmp_path: Path) -> None:
+    runner = ExternalToolRunner(timeout=1)
+    resolution = ResolvedTool(source="native", launcher=Path("tshark"), executable="tshark")
+    tshark_specs = [spec for spec in TOOL_SPECS if spec.tool_id in {"tshark", "tshark_statistics"}]
+    calls = 0
+
+    def fake_execute(_argv, *, cwd, timeout=None):
+        nonlocal calls
+        calls += 1
+        return _completed_tool_output("TShark 4.6.0")
+
+    monkeypatch.setattr(runner, "_execute", fake_execute)
+    assert runner._version(tshark_specs[0], resolution, tmp_path) == "TShark 4.6.0"  # noqa: SLF001
+    assert runner._version(tshark_specs[1], resolution, tmp_path) == "TShark 4.6.0"  # noqa: SLF001
+    assert calls == 1
 
 
 def test_external_output_is_hard_limited(tmp_path: Path) -> None:
@@ -637,6 +702,8 @@ def test_endpoint_and_disk_adapters_use_fixed_read_only_arguments(monkeypatch, t
         "prefetch": ("evidence.pf", "sccainfo"),
         "plist": ("evidence.plist", "plistutil"),
         "ese": ("evidence.edb", "esedbinfo"),
+        "hdf5": ("evidence.h5", "h5dump"),
+        "access_db": ("evidence.accdb", "mdb_schema"),
         "qcow": ("evidence.qcow2", "qemu_img_info"),
         "disk": ("evidence.img", "bulk_extractor"),
     }
@@ -672,6 +739,8 @@ def test_endpoint_and_disk_adapters_use_fixed_read_only_arguments(monkeypatch, t
     assert commands["lnkinfo"][-1].endswith("evidence.lnk")
     assert commands["sccainfo"][-1].endswith("evidence.pf")
     assert commands["esedbinfo"][-1].endswith("evidence.edb")
+    assert commands["h5dump"][1] == "--header" and commands["h5dump"][-1].endswith("evidence.h5")
+    assert commands["mdb_schema"][-1].endswith("evidence.accdb")
     assert commands["plistutil"][-2:] == ["-f", "json"]
     assert commands["qemu_img_info"][1:3] == ["info", "--output=json"]
     assert not {"convert", "commit", "rebase", "resize", "--backing-chain"} & set(commands["qemu_img_info"])

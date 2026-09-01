@@ -462,6 +462,8 @@ const resultTabs: Array<{ id: ResultTab; label: string }> = [
   { id: 'tools', label: 'Tool results' },
   { id: 'methods', label: 'Coverage & logs' },
 ];
+const AUDIO_CAPABILITY_KINDS = new Set(['audio', 'wav', 'aiff', 'flac', 'ogg', 'mp3', 'aac', 'm4a', 'au', 'asf', 'amr', 'caf', 'midi']);
+const IMAGE_CAPABILITY_KINDS = new Set(['png', 'jpeg', 'gif', 'bmp', 'webp', 'tiff', 'ico', 'psd', 'xcf', 'netpbm', 'heif', 'avif']);
 
 function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
   const startsWith = (...values: number[]) => values.every((value, index) => bytes[index] === value);
@@ -471,13 +473,16 @@ function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
   const extensionLabels: Record<string, string> = {
     jpg: 'JPEG image', jpeg: 'JPEG image', png: 'PNG image', apng: 'APNG image', gif: 'GIF image',
     bmp: 'BMP image', webp: 'WebP image', svg: 'SVG document', tif: 'TIFF image', tiff: 'TIFF image', ico: 'ICO image',
+    psd: 'Photoshop PSD image', psb: 'Photoshop PSB image', xcf: 'GIMP XCF image', pbm: 'Netpbm bitmap', pgm: 'Netpbm grayscale image', ppm: 'Netpbm color image', pnm: 'Netpbm image', pam: 'Netpbm image',
+    heif: 'HEIF image', heic: 'HEIC image', avif: 'AVIF image',
     wav: 'WAV audio', wave: 'WAV audio', mp3: 'MP3 audio', flac: 'FLAC audio', ogg: 'Ogg audio', opus: 'Opus audio',
     m4a: 'M4A / AAC audio', aac: 'AAC audio', aif: 'AIFF audio', aiff: 'AIFF audio', au: 'AU audio', snd: 'AU audio',
     wma: 'WMA audio', amr: 'AMR audio', caf: 'CAF audio', mid: 'MIDI file', midi: 'MIDI file',
-    pdf: 'PDF document', zip: 'ZIP archive', docx: 'ZIP / Office container', xlsx: 'ZIP / Office container', pptx: 'ZIP / Office container',
+    pdf: 'PDF document', zip: 'ZIP archive', docx: 'ZIP / Office container', docm: 'Macro-enabled Word package', dotx: 'Word template package', dotm: 'Macro-enabled Word template', xlsx: 'ZIP / Office container', xlsm: 'Macro-enabled Excel package', xltx: 'Excel template package', xltm: 'Macro-enabled Excel template', pptx: 'ZIP / Office container', pptm: 'Macro-enabled PowerPoint package', ppsx: 'PowerPoint show package', ppsm: 'Macro-enabled PowerPoint show',
     txt: 'Plain text document', text: 'Plain text document', md: 'Markdown document', markdown: 'Markdown document', rst: 'reStructuredText document', log: 'Text log', csv: 'CSV text data', tsv: 'TSV text data', json: 'JSON document', jsonl: 'JSON Lines document', xml: 'XML document', yaml: 'YAML document', yml: 'YAML document', ini: 'Configuration text', cfg: 'Configuration text', conf: 'Configuration text', toml: 'TOML document', html: 'HTML document', htm: 'HTML document',
-    doc: 'Legacy Office document', xls: 'Legacy Office spreadsheet', ppt: 'Legacy Office presentation', odt: 'OpenDocument text', ods: 'OpenDocument spreadsheet', odp: 'OpenDocument presentation', epub: 'EPUB document',
-    '7z': '7-Zip archive', rar: 'RAR archive', tar: 'TAR archive', gz: 'GZip stream', bz2: 'BZip2 stream', xz: 'XZ stream', zst: 'Zstandard stream',
+    doc: 'Legacy Office document', xls: 'Legacy Office spreadsheet', ppt: 'Legacy Office presentation', odt: 'OpenDocument text', ods: 'OpenDocument spreadsheet', odp: 'OpenDocument presentation', epub: 'EPUB document', xps: 'XPS document', oxps: 'OpenXPS document', one: 'OneNote document',
+    apk: 'Android APK package', aab: 'Android App Bundle', jar: 'Java archive', war: 'Java web archive', ipa: 'iOS application package', appx: 'Windows AppX package', msix: 'Windows MSIX package', nupkg: 'NuGet package',
+    '7z': '7-Zip archive', rar: 'RAR archive', tar: 'TAR archive', cab: 'Microsoft Cabinet archive', cpio: 'CPIO archive', rpm: 'RPM package', xar: 'XAR archive', gz: 'GZip stream', bz2: 'BZip2 stream', xz: 'XZ stream', zst: 'Zstandard stream',
     pcap: 'PCAP capture', pcapng: 'PCAPNG capture', db: 'SQLite database', sqlite: 'SQLite database', sqlite3: 'SQLite database',
     eml: 'RFC 5322 email', rtf: 'RTF document', evtx: 'Windows EVTX log', pst: 'Outlook PST store', ost: 'Outlook OST store',
     e01: 'EWF / E01 disk image', raw: 'Raw disk or memory image', img: 'Raw disk image', dd: 'Raw disk image', vmem: 'Memory dump', dmp: 'Memory or crash dump',
@@ -488,22 +493,32 @@ function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
     cbor: 'CBOR structured data', cborseq: 'CBOR sequence', cose: 'COSE / CBOR data',
     msgpack: 'MessagePack structured data', mpk: 'MessagePack structured data',
     pb: 'Protocol Buffers data', protobuf: 'Protocol Buffers data',
+    h5: 'HDF5 data', hdf5: 'HDF5 data', bson: 'BSON data', mdb: 'Access Jet database', accdb: 'Access ACE database',
+    ser: 'Java serialized object', pyc: 'Python bytecode', pkl: 'Python pickle', pickle: 'Python pickle', pack: 'Git pack', idx: 'Git index', hex: 'Intel HEX firmware', srec: 'Motorola S-record firmware',
   };
 
   if (startsWith(0x89, 0x50, 0x4e, 0x47)) return { label: 'PNG image', source: 'content' };
   if (startsWith(0xff, 0xd8, 0xff)) return { label: 'JPEG image', source: 'content' };
   if (ascii(0, 6) === 'GIF87a' || ascii(0, 6) === 'GIF89a') return { label: 'GIF image', source: 'content' };
   if (startsWith(0x42, 0x4d)) return { label: 'BMP image', source: 'content' };
+  if (ascii(0, 4) === '8BPS') return { label: 'Photoshop PSD/PSB image', source: 'content' };
+  if (ascii(0, 9) === 'gimp xcf ') return { label: 'GIMP XCF image', source: 'content' };
+  if (/^P[1-7][\s#]/.test(ascii(0, 3))) return { label: 'Netpbm image', source: 'content' };
   if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP') return { label: 'WebP image', source: 'content' };
   if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WAVE') return { label: 'WAV audio', source: 'content' };
   if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'AVI ') return { label: 'AVI video', source: 'content' };
-  if (ascii(4, 4) === 'ftyp') return { label: ascii(8, 4) === 'qt  ' ? 'QuickTime video' : extension === 'm4a' ? 'M4A / AAC audio' : 'MP4 video', source: 'content' };
+  if (ascii(4, 4) === 'ftyp') {
+    const brand = ascii(8, 4);
+    if (['avif', 'avis'].includes(brand)) return { label: 'AVIF image', source: 'content' };
+    if (['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(brand)) return { label: 'HEIF / HEIC image', source: 'content' };
+    return { label: brand === 'qt  ' ? 'QuickTime video' : extension === 'm4a' ? 'M4A / AAC audio' : 'MP4 video', source: 'content' };
+  }
   if (startsWith(0x1a, 0x45, 0xdf, 0xa3)) return { label: ascii(0, 4096).toLowerCase().includes('webm') ? 'WebM video' : 'Matroska video', source: 'content' };
   if (startsWith(0x49, 0x44, 0x33) || (bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0)) return { label: 'MP3 audio', source: 'content' };
   if (ascii(0, 4) === 'fLaC') return { label: 'FLAC audio', source: 'content' };
   if (ascii(0, 4) === 'OggS') return { label: 'Ogg audio', source: 'content' };
   if (ascii(0, 4) === '%PDF') return { label: 'PDF document', source: 'content' };
-  if (startsWith(0x50, 0x4b, 0x03, 0x04) || startsWith(0x50, 0x4b, 0x05, 0x06) || startsWith(0x50, 0x4b, 0x07, 0x08)) return { label: 'ZIP archive / Office container', source: 'content' };
+  if (startsWith(0x50, 0x4b, 0x03, 0x04) || startsWith(0x50, 0x4b, 0x05, 0x06) || startsWith(0x50, 0x4b, 0x07, 0x08)) return { label: extension && extensionLabels[extension] ? extensionLabels[extension] : 'ZIP archive / Office container', source: 'content' };
   if (startsWith(0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c)) return { label: '7-Zip archive', source: 'content' };
   if (startsWith(0x52, 0x61, 0x72, 0x21, 0x1a, 0x07)) return { label: 'RAR archive', source: 'content' };
   if (startsWith(0x1f, 0x8b)) return { label: 'GZip stream', source: 'content' };
@@ -511,7 +526,12 @@ function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
   if (startsWith(0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00)) return { label: 'XZ stream', source: 'content' };
   if (startsWith(0x28, 0xb5, 0x2f, 0xfd)) return { label: 'Zstandard stream', source: 'content' };
   if (ascii(257, 5) === 'ustar') return { label: 'TAR archive', source: 'content' };
+  if (ascii(0, 4) === 'MSCF') return { label: 'Microsoft Cabinet archive', source: 'content' };
+  if (['070701', '070702', '070707'].includes(ascii(0, 6))) return { label: 'CPIO archive', source: 'content' };
+  if (startsWith(0xed, 0xab, 0xee, 0xdb)) return { label: 'RPM package', source: 'content' };
+  if (ascii(0, 4) === 'xar!') return { label: 'XAR archive', source: 'content' };
   if (ascii(0, 16) === 'SQLite format 3\u0000') return { label: 'SQLite database', source: 'content' };
+  if (startsWith(0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a)) return { label: 'HDF5 data', source: 'content' };
   if (startsWith(0xd4, 0xc3, 0xb2, 0xa1) || startsWith(0xa1, 0xb2, 0xc3, 0xd4) || startsWith(0x4d, 0x3c, 0xb2, 0xa1) || startsWith(0xa1, 0xb2, 0x3c, 0x4d)) return { label: 'PCAP capture', source: 'content' };
   if (startsWith(0x0a, 0x0d, 0x0d, 0x0a)) return { label: 'PCAPNG capture', source: 'content' };
   if (startsWith(0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1)) return { label: 'OLE / legacy Office document', source: 'content' };
@@ -519,6 +539,9 @@ function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
   if (ascii(0, 7) === 'ElfFile') return { label: 'Windows EVTX log', source: 'content' };
   if (ascii(0, 4) === 'regf') return { label: 'Windows registry hive', source: 'content' };
   if (ascii(0, 4) === '!BDN') return { label: 'Outlook PST / OST store', source: 'content' };
+  if (startsWith(0xac, 0xed, 0x00, 0x05)) return { label: 'Java serialized object', source: 'content' };
+  if (ascii(0, 4) === 'PACK') return { label: 'Git pack', source: 'content' };
+  if (ascii(0, 4) === 'DIRC') return { label: 'Git index', source: 'content' };
   if (startsWith(0x7f, 0x45, 0x4c, 0x46)) return { label: 'ELF executable', source: 'content' };
   if (startsWith(0x4d, 0x5a)) return { label: 'Windows PE executable', source: 'content' };
   if (startsWith(0x00, 0x61, 0x73, 0x6d)) return { label: 'WebAssembly module', source: 'content' };
@@ -530,7 +553,7 @@ function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
   if (ascii(0, 4) === 'MThd') return { label: 'MIDI file', source: 'content' };
   if (ascii(0, 5).trimStart().startsWith('<svg')) return { label: 'SVG image', source: 'content' };
   if (/^(From:|Received:|MIME-Version:|Subject:)/m.test(ascii(0, 1024))) return { label: 'RFC 5322 email', source: 'content' };
-  if (extension && ['torrent', 'bencode', 'cbor', 'cborseq', 'cose', 'msgpack', 'mpk', 'pb', 'protobuf'].includes(extension)) return { label: extensionLabels[extension], source: 'extension' };
+  if (extension && ['torrent', 'bencode', 'cbor', 'cborseq', 'cose', 'msgpack', 'mpk', 'pb', 'protobuf', 'bson', 'pyc', 'pkl', 'pickle', 'hex', 'srec'].includes(extension)) return { label: extensionLabels[extension], source: 'extension' };
   if (file.type.startsWith('text/')) return { label: 'Plain text document', source: 'browser' };
   if (file.type) return { label: file.type, source: 'browser' };
   if (extension && extensionLabels[extension]) return { label: extensionLabels[extension], source: 'extension' };
@@ -737,12 +760,16 @@ const SAFE_PREVIEW_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif',
 const SAFE_AUDIO_MIME_TYPES = new Set(['audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/ogg', 'audio/flac', 'audio/mp4', 'audio/aac']);
 const TEXT_DOCUMENT_EXTENSIONS = new Set([
   'txt', 'text', 'md', 'markdown', 'rst', 'log', 'csv', 'tsv', 'json', 'jsonl', 'ndjson', 'xml', 'yaml', 'yml', 'ini', 'cfg', 'conf', 'properties', 'toml', 'html', 'htm', 'xhtml', 'tex',
-  'pdf', 'rtf', 'doc', 'xls', 'ppt', 'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp', 'epub', 'eml',
+  'pdf', 'rtf', 'doc', 'xls', 'ppt', 'docx', 'docm', 'dotx', 'dotm', 'xlsx', 'xlsm', 'xltx', 'xltm', 'pptx', 'pptm', 'ppsx', 'ppsm',
+  'odt', 'ods', 'odp', 'epub', 'xps', 'oxps', 'one', 'onetoc2', 'eml', 'mbox', 'pst', 'ost',
+  'apk', 'aab', 'jar', 'war', 'ipa', 'appx', 'msix', 'nupkg',
 ]);
 const TEXT_DOCUMENT_MEDIA_TYPES = new Set([
   'application/pdf', 'application/rtf', 'text/rtf', 'message/rfc822', 'application/msword', 'application/vnd.ms-excel', 'application/vnd.ms-powerpoint',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   'application/vnd.oasis.opendocument.text', 'application/vnd.oasis.opendocument.spreadsheet', 'application/vnd.oasis.opendocument.presentation', 'application/epub+zip',
+  'application/vnd.ms-xpsdocument', 'application/onenote', 'application/mbox', 'application/vnd.ms-outlook',
+  'application/vnd.android.package-archive', 'application/java-archive', 'application/vnd.ms-appx', 'application/x-ios-app',
 ]);
 function artifactSupportsTextPreview(artifact: Artifact) {
   const extension = artifactName(artifact).split('.').pop()?.toLowerCase() || '';
@@ -750,7 +777,7 @@ function artifactSupportsTextPreview(artifact: Artifact) {
   return TEXT_DOCUMENT_EXTENSIONS.has(extension)
     || mediaType.startsWith('text/')
     || TEXT_DOCUMENT_MEDIA_TYPES.has(mediaType)
-    || ['text', 'pdf', 'rtf', 'ole', 'eml'].includes(String(artifact.kind || artifact.detected_type || '').toLowerCase());
+    || ['text', 'pdf', 'rtf', 'ole', 'eml', 'mbox', 'pst', 'onenote', 'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp', 'epub', 'xps', 'apk', 'aab', 'jar', 'war', 'ipa', 'appx', 'msix', 'nupkg'].includes(String(artifact.kind || artifact.detected_type || '').toLowerCase());
 }
 function artifactPreviewUrl(artifact: Artifact) {
   const raw = artifact.preview_url;
@@ -1422,7 +1449,7 @@ function HomeWorkbench() {
   const artifacts = useMemo(() => job?.artifacts?.length ? job.artifacts : getArtifacts(result), [job, result]);
   const sourceDetectedKind = String(result?.source?.detected_type || '').toLowerCase();
   const textPreviewArtifacts = useMemo(() => artifacts.filter((artifact) => artifactSupportsTextPreview(artifact) || (
-    artifact.kind === 'original' && ['text', 'pdf', 'rtf', 'ole', 'eml', 'zip'].includes(sourceDetectedKind)
+    artifact.kind === 'original' && ['text', 'pdf', 'rtf', 'ole', 'eml', 'mbox', 'pst', 'onenote', 'zip', 'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp', 'epub', 'xps', 'apk', 'aab', 'jar', 'war', 'ipa', 'appx', 'msix', 'nupkg'].includes(sourceDetectedKind)
   )), [artifacts, sourceDetectedKind]);
   const selectedTextPreviewArtifact = useMemo(() => {
     const selected = textPreviewArtifacts.find((artifact) => artifactId(artifact) === textPreviewArtifactId);
@@ -1576,58 +1603,57 @@ function HomeWorkbench() {
   const solveNodeMap = useMemo(() => new Map(solveNodes.map((node) => [node.id, node])), [solveNodes]);
   const normalizedQuery = resultQuery.trim().toLowerCase();
   const queryMatches = useCallback((...values: unknown[]) => !normalizedQuery || searchable(...values).includes(normalizedQuery), [normalizedQuery]);
-  const filteredCandidates = candidates.filter((candidate) =>
+  const filteredCandidates = useMemo(() => candidates.filter((candidate) =>
     (candidateFilter === 'all' || confidenceBand(candidate) === candidateFilter)
     && queryMatches(candidateValue(candidate), candidateEvidence(candidate), candidate.reasons, candidate.occurrences, candidateTransformChain(candidate))
-  );
-  const filteredArtifacts = artifacts.filter((artifact) => queryMatches(artifactName(artifact), artifactMediaType(artifact), artifact.sha256, artifactOrigin(artifact), artifact.metadata));
-  const filteredRepairArtifacts = repairArtifacts.filter((artifact) => queryMatches(artifactName(artifact), artifactMediaType(artifact), artifact.sha256, artifact.metadata, artifactRepairDetails(artifact)));
-  const filteredMethods = methods.filter((method) =>
+  ), [candidateFilter, candidates, queryMatches]);
+  const filteredArtifacts = useMemo(() => artifacts.filter((artifact) => queryMatches(artifactName(artifact), artifactMediaType(artifact), artifact.sha256, artifactOrigin(artifact), artifact.metadata)), [artifacts, queryMatches]);
+  const filteredRepairArtifacts = useMemo(() => repairArtifacts.filter((artifact) => queryMatches(artifactName(artifact), artifactMediaType(artifact), artifact.sha256, artifact.metadata, artifactRepairDetails(artifact))), [queryMatches, repairArtifacts]);
+  const filteredMethods = useMemo(() => methods.filter((method) =>
     (methodFilter === 'all' || methodStatusGroup(method) === methodFilter)
     && queryMatches(methodName(method), method.status, method.summary, method.stdout, method.stderr, method.category)
-  );
-  const filteredToolMethods = toolMethods.filter((method) =>
+  ), [methodFilter, methods, queryMatches]);
+  const filteredToolMethods = useMemo(() => toolMethods.filter((method) =>
     (methodFilter === 'all' || methodStatusGroup(method) === methodFilter)
     && queryMatches(methodName(method), method.status, method.summary, method.stdout, method.stderr, method.category, method.command, method.tool?.executable, method.extracted_count)
-  );
-  const filteredMetadata = metadataRows.filter((row) => queryMatches(row.path, row.value));
-  const filteredFindings = findings.filter((finding) => queryMatches(finding.title, finding.description, finding.summary, finding.category, finding.method_id));
-  const filteredSolveRecommendations = solveRecommendations.filter((item) => queryMatches(item.title, item.reason, item.action, item.method_ids, item.tool_ids));
-  const filteredSolveEdges = solveEdges.filter((edge) => {
+  ), [methodFilter, queryMatches, toolMethods]);
+  const filteredMetadata = useMemo(() => metadataRows.filter((row) => queryMatches(row.path, row.value)), [metadataRows, queryMatches]);
+  const filteredFindings = useMemo(() => findings.filter((finding) => queryMatches(finding.title, finding.description, finding.summary, finding.category, finding.method_id)), [findings, queryMatches]);
+  const filteredSolveRecommendations = useMemo(() => solveRecommendations.filter((item) => queryMatches(item.title, item.reason, item.action, item.method_ids, item.tool_ids)), [queryMatches, solveRecommendations]);
+  const filteredSolveEdges = useMemo(() => solveEdges.filter((edge) => {
     const source = solveNodeMap.get(edge.source);
     const target = solveNodeMap.get(edge.target);
     return queryMatches(edge.relation, source?.label, source?.status, target?.label, target?.status);
-  });
-  const filteredRecoveryFindings = recoveryFindings.filter((finding) => queryMatches(finding.title, finding.description, finding.summary, finding.category, finding.method_id));
-  const filteredVisuals = visuals.filter((view) => queryMatches(view.title, view.name, view.kind, view.category));
-  const audioKinds = new Set(['audio', 'wav', 'aiff', 'flac', 'ogg', 'mp3', 'aac', 'm4a', 'au', 'asf', 'amr', 'caf', 'midi']);
-  const imageKinds = new Set(['png', 'jpeg', 'gif', 'bmp', 'webp', 'tiff', 'ico']);
-  const relevantCapabilities = capabilities.filter((capability) => {
+  }), [queryMatches, solveEdges, solveNodeMap]);
+  const filteredRecoveryFindings = useMemo(() => recoveryFindings.filter((finding) => queryMatches(finding.title, finding.description, finding.summary, finding.category, finding.method_id)), [queryMatches, recoveryFindings]);
+  const filteredVisuals = useMemo(() => visuals.filter((view) => queryMatches(view.title, view.name, view.kind, view.category)), [queryMatches, visuals]);
+  const relevantCapabilities = useMemo(() => capabilities.filter((capability) => {
     if (evidenceSection === 'corrupted') return true;
     const formats = capability.formats || ['all'];
     if (formats.includes('all')) return true;
-    return formats.some((format) => (evidenceSection === 'audio' ? audioKinds : imageKinds).has(format.toLowerCase()));
-  });
-  const webRepairCapabilities = relevantCapabilities.filter((capability) => capability.category === 'repair' && capability.source_url);
-  const availableTools = relevantCapabilities.filter((capability) => capability.available === true).length;
+    const kinds = evidenceSection === 'audio' ? AUDIO_CAPABILITY_KINDS : IMAGE_CAPABILITY_KINDS;
+    return formats.some((format) => kinds.has(format.toLowerCase()));
+  }), [capabilities, evidenceSection]);
+  const webRepairCapabilities = useMemo(() => relevantCapabilities.filter((capability) => capability.category === 'repair' && capability.source_url), [relevantCapabilities]);
+  const availableTools = useMemo(() => relevantCapabilities.filter((capability) => capability.available === true).length, [relevantCapabilities]);
   const armedMethodCount = 1 + currentConfigurableMethods.filter((method) => scanOptions[method.key]).length + availableTools;
-  const activeResultTabs = resultTabs.filter((tab) => {
+  const activeResultTabs = useMemo(() => resultTabs.filter((tab) => {
     if (tab.id === 'traffic') return isPcapResult;
     if (tab.id === 'audio') return isAudioResult;
     if (tab.id === 'repairs') return isRecoveryResult || repairArtifacts.length > 0;
     if (tab.id === 'document') return textPreviewArtifacts.length > 0;
     return true;
-  });
-  const originalArtifact = artifacts.find((artifact) => artifact.kind === 'original');
-  const recoveredArtifacts = artifacts.filter((artifact) => artifact.kind !== 'original' && !isRepairArtifact(artifact));
+  }), [isAudioResult, isPcapResult, isRecoveryResult, repairArtifacts.length, textPreviewArtifacts.length]);
+  const originalArtifact = useMemo(() => artifacts.find((artifact) => artifact.kind === 'original'), [artifacts]);
+  const recoveredArtifacts = useMemo(() => artifacts.filter((artifact) => artifact.kind !== 'original' && !isRepairArtifact(artifact)), [artifacts]);
   const sourceDetails = result?.source;
   const audioProperties = result?.audio_analysis?.metadata?.properties || {};
   const audioStatistics = result?.audio_analysis?.metadata?.statistics || {};
   const audioSignals = result?.audio_analysis?.signals || {};
-  const audioVisuals = visuals.filter((view) => String(view.category || '').startsWith('audio-'));
-  const sstvVisuals = audioVisuals.filter((view) => view.category === 'audio-sstv-image');
-  const diagnosticAudioVisuals = audioVisuals.filter((view) => view.category !== 'audio-sstv-image');
-  const audioArtifacts = artifacts.filter((artifact) => Boolean(artifactAudioUrl(artifact)));
+  const audioVisuals = useMemo(() => visuals.filter((view) => String(view.category || '').startsWith('audio-')), [visuals]);
+  const sstvVisuals = useMemo(() => audioVisuals.filter((view) => view.category === 'audio-sstv-image'), [audioVisuals]);
+  const diagnosticAudioVisuals = useMemo(() => audioVisuals.filter((view) => view.category !== 'audio-sstv-image'), [audioVisuals]);
+  const audioArtifacts = useMemo(() => artifacts.filter((artifact) => Boolean(artifactAudioUrl(artifact))), [artifacts]);
   const primaryAudioArtifact = audioArtifacts.find((artifact) => artifact.kind === 'original') || audioArtifacts.find((artifact) => artifactName(artifact).includes('audacity_review_normalized')) || audioArtifacts[0];
 
   function selectFile(file?: File | null) {

@@ -192,9 +192,14 @@ def _confidence(score: int) -> str:
 
 
 def inspect_bytes(data: bytes, *, max_strings: int) -> dict[str, Any]:
-    ascii_records = list(iter_ascii_strings(data, minimum=4, limit=max_strings))
+    ascii_records = list(iter_ascii_strings(data, minimum=4, limit=max_strings + 1))
+    ascii_truncated = len(ascii_records) > max_strings
+    ascii_records = ascii_records[:max_strings]
     remaining = max(0, max_strings - len(ascii_records))
-    utf16_records = list(iter_utf16_strings(data, minimum=4, limit=min(remaining, max_strings // 2)))
+    utf16_limit = min(remaining, max_strings // 2)
+    utf16_records = list(iter_utf16_strings(data, minimum=4, limit=utf16_limit + 1)) if utf16_limit else []
+    utf16_truncated = len(utf16_records) > utf16_limit
+    utf16_records = utf16_records[:utf16_limit]
     remaining = max(0, max_strings - len(ascii_records) - len(utf16_records))
     svg_records = _svg_text_records(data, limit=min(remaining, 2_000))
     whitespace_records = _whitespace_steg_records(data, limit=min(max_strings, 128))
@@ -217,7 +222,7 @@ def inspect_bytes(data: bytes, *, max_strings: int) -> dict[str, Any]:
         "byte_frequency": byte_counts,
         "magic_offsets": find_magic_offsets(data),
         "strings": records,
-        "strings_truncated": len(records) >= max_strings,
+        "strings_truncated": ascii_truncated or utf16_truncated or len(records) >= max_strings,
     }
 
 

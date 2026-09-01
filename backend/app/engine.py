@@ -38,14 +38,15 @@ from .analyzers.core import BoundedDecoder, CandidateCollector, inspect_bytes
 from .analyzers.compression import DECODERS, CompressionError
 from .analyzers.crypto import analyze_encrypted_payloads
 from .analyzers.external import ExternalToolRunner, TOOL_SPECS
+from .analyzers.extended import zip_directory_is_bounded
 from .analyzers.formats import analyze_format, propose_header_repairs
 from .analyzers.visual import analyze_visual
 from .solve_guidance import build_solve_guidance
 
 
-SUPPORTED_IMAGE_FORMATS = ["PNG/APNG", "JPEG/MPO", "GIF", "BMP", "WebP", "SVG text", "TIFF/BigTIFF", "ICO/CUR"]
+SUPPORTED_IMAGE_FORMATS = ["PNG/APNG", "JPEG/MPO", "GIF", "BMP", "WebP", "SVG text", "TIFF/BigTIFF", "ICO/CUR", "PSD/PSB", "GIMP XCF", "PBM/PGM/PPM/PAM", "HEIF/HEIC/AVIF"]
 SUPPORTED_AUDIO_FORMATS = ["WAV/PCM", "AIFF/AIFC", "FLAC", "Ogg/Opus", "MP3", "AAC/M4A", "AU", "WMA/ASF", "AMR", "CAF", "MIDI"]
-SUPPORTED_DOCUMENT_FORMATS = ["plain text", "Markdown/JSON/XML/CSV", "PDF", "RTF", "DOCX/XLSX/PPTX", "ODT/ODS/ODP", "EPUB", "legacy Office/OLE"]
+SUPPORTED_DOCUMENT_FORMATS = ["plain text", "Markdown/JSON/XML/CSV", "PDF", "RTF", "DOCX/XLSX/PPTX and macro variants", "ODT/ODS/ODP", "EPUB/XPS", "legacy Office/OLE", "OneNote"]
 SUPPORTED_FORENSIC_FORMATS = [
     "PCAP/PCAPNG", "SQLite", "OLE/RTF/EML/MBOX", "TAR/7z/RAR", "shar/uuencode/ar", "LZIP/LZ4/LZMA/LZOP",
     "raw disk/ISO", "E01/EWF", "Windows registry hive", "memory/crash dump",
@@ -56,21 +57,26 @@ SUPPORTED_FORENSIC_FORMATS = [
     "ESE/EDB", "QCOW/VMDK/VHDX/VDI/DMG/AFF",
     "PE/ELF/Mach-O/WebAssembly/DEX/Java class", "MP4/MOV/Matroska/WebM/AVI",
     "CBOR/MessagePack/bencode/BitTorrent/Protocol Buffers",
+    "APK/AAB/JAR/WAR/IPA/AppX/MSIX/NuGet packages", "CAB/CPIO/RPM/XAR",
+    "HDF5/BSON/Access databases", "Java serialization/Python pickle/PYC",
+    "Git pack/index", "Intel HEX/Motorola S-record firmware", "VHD/OneNote",
 ]
 BUILT_IN_STRUCTURE_KINDS = {
-    "png", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "pdf", "text",
-    "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub",
+    "png", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "psd", "xcf", "netpbm", "heif", "avif", "pdf", "text",
+    "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub", "xps",
+    "apk", "aab", "jar", "war", "ipa", "appx", "msix", "nupkg",
     "android_backup", "plist", "lnk", "jumplist", "prefetch", "mft", "usn", "recycle_bin_i", "ese",
-    "qcow", "vmdk", "vhdx", "vdi", "dmg", "aff",
+    "qcow", "vmdk", "vhd", "vhdx", "vdi", "dmg", "aff",
     "pcap", "pcapng", "sqlite", "sqlite_wal", "sqlite_journal", "ole", "rtf", "eml", "mbox", "systemd_journal", "disk", "ewf", "registry", "memory", "evtx", "pst",
     "thumbcache", "utmp", "ios_mbdb",
     "mozlz4", "leveldb", "ds_store", "binarycookies",
-    "shar", "ar", "lzip", "lz4", "lzma", "lzop",
+    "shar", "ar", "cab", "cpio", "rpm", "xar", "lzip", "lz4", "lzma", "lzop",
     "mp4", "mov", "matroska", "webm", "avi",
-    "pe", "elf", "macho", "wasm", "dex", "java_class",
+    "pe", "elf", "macho", "wasm", "dex", "java_class", "java_serialized", "pyc", "python_pickle",
+    "git_pack", "git_index", "intel_hex", "srec", "hdf5", "bson", "access_db", "onenote",
     "bencode", "cbor", "msgpack", "protobuf",
 }
-ZIP_DOCUMENT_KINDS = {"docx", "xlsx", "pptx", "odt", "ods", "odp", "epub"}
+ZIP_DOCUMENT_KINDS = {"docx", "xlsx", "pptx", "odt", "ods", "odp", "epub", "xps", "apk", "aab", "jar", "war", "ipa", "appx", "msix", "nupkg"}
 ARCHIVE_CONTAINER_KINDS = {"zip", "tar", "gzip", "bzip2", "xz", "lzip", "lz4", "lzma", "lzop"} | ZIP_DOCUMENT_KINDS
 
 
@@ -409,12 +415,13 @@ class AnalysisEngine:
             check_cancelled(is_cancelled)
             core_start = time.monotonic()
             core_details = inspect_bytes(source_data, max_strings=limits["max_strings"])
-            collector.scan_bytes(
-                source_data,
-                source_artifact_id=source_id,
-                method="raw-bytes",
-                include_utf16=False,
-            )
+            if core_details["strings_truncated"]:
+                collector.scan_bytes(
+                    source_data,
+                    source_artifact_id=source_id,
+                    method="raw-bytes",
+                    include_utf16=False,
+                )
             for record in core_details["strings"]:
                 encoding = str(record.get("encoding", ""))
                 record_method = (
@@ -873,6 +880,7 @@ class AnalysisEngine:
                 allow_extraction=bool(analysis_options["external_extraction"]),
                 max_extracted_files=int(analysis_options["max_external_files"]),
                 foremost_depth=int(analysis_options["foremost_depth"]),
+                max_workers=2,
             )
             for method in external_results:
                 check_cancelled(is_cancelled) if method["status"] not in {"cancelled"} else None
@@ -1238,12 +1246,13 @@ class AnalysisEngine:
             check_cancelled(is_cancelled)
             core_started = time.monotonic()
             core = inspect_bytes(source_data, max_strings=limits["max_strings"])
-            collector.scan_bytes(
-                source_data,
-                source_artifact_id=source_id,
-                method="audio-raw-bytes",
-                include_utf16=False,
-            )
+            if core["strings_truncated"]:
+                collector.scan_bytes(
+                    source_data,
+                    source_artifact_id=source_id,
+                    method="audio-raw-bytes",
+                    include_utf16=False,
+                )
             for record in core["strings"]:
                 collector.scan_text(
                     record["text"], source_artifact_id=source_id, method=f"audio-strings:{record['encoding']}",
@@ -1426,6 +1435,7 @@ class AnalysisEngine:
                 allow_extraction=bool(analysis_options.get("external_extraction", True)),
                 max_extracted_files=int(analysis_options.get("max_external_files", 32)),
                 foremost_depth=int(analysis_options.get("foremost_depth", 2)),
+                max_workers=2,
             )
             sstv_transcode_attempted = False
             for method in external_results:
@@ -1745,6 +1755,13 @@ class AnalysisEngine:
     ) -> int:
         count = 0
         if kind in ({"zip"} | ZIP_DOCUMENT_KINDS):
+            if not zip_directory_is_bounded(data, max_entries=1_000, max_directory_bytes=32 * 1024 * 1024):
+                add_finding({
+                    "severity": "warning", "category": "resource-limit", "title": "ZIP directory rejected safely",
+                    "description": "The central directory is missing, multi-disk/Zip64, or exceeds the recursive entry/byte limits.",
+                    "details": {"entry_limit": 1_000, "directory_byte_limit": 32 * 1024 * 1024},
+                }, parent_id, "recursive-analysis")
+                return count
             try:
                 with zipfile.ZipFile(io.BytesIO(data)) as archive:
                     infos = archive.infolist()
@@ -1907,6 +1924,9 @@ def _kind_from_extension(extension: str) -> str | None:
         ".png": "png", ".apng": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".jpe": "jpeg", ".mpo": "jpeg",
         ".gif": "gif", ".bmp": "bmp", ".dib": "bmp", ".webp": "webp", ".svg": "svg",
         ".tif": "tiff", ".tiff": "tiff", ".ico": "ico", ".cur": "ico",
+        ".psd": "psd", ".psb": "psd", ".xcf": "xcf",
+        ".pbm": "netpbm", ".pgm": "netpbm", ".ppm": "netpbm", ".pnm": "netpbm", ".pam": "netpbm",
+        ".heif": "heif", ".heic": "heif", ".avif": "avif",
         ".pdf": "pdf",
         ".pcap": "pcap", ".cap": "pcap", ".pcapng": "pcapng",
         ".sqlite": "sqlite", ".sqlite3": "sqlite", ".db": "sqlite",
@@ -1918,18 +1938,30 @@ def _kind_from_extension(extension: str) -> str | None:
         ".ldb": "leveldb", ".sst": "leveldb",
         ".doc": "ole", ".xls": "ole", ".ppt": "ole", ".msg": "ole", ".rtf": "rtf", ".eml": "eml",
         ".mbox": "mbox", ".mbx": "mbox", ".journal": "systemd_journal",
-        ".docx": "docx", ".xlsx": "xlsx", ".pptx": "pptx",
+        ".docx": "docx", ".docm": "docx", ".dotx": "docx", ".dotm": "docx",
+        ".xlsx": "xlsx", ".xlsm": "xlsx", ".xltx": "xlsx", ".xltm": "xlsx",
+        ".pptx": "pptx", ".pptm": "pptx", ".ppsx": "pptx", ".ppsm": "pptx",
         ".odt": "odt", ".ods": "ods", ".odp": "odp", ".epub": "epub",
+        ".xps": "xps", ".oxps": "xps", ".apk": "apk", ".aab": "aab", ".jar": "jar", ".war": "war",
+        ".ipa": "ipa", ".appx": "appx", ".appxbundle": "appx", ".msix": "msix", ".msixbundle": "msix",
+        ".nupkg": "nupkg", ".vsix": "nupkg",
         ".lnk": "lnk", ".pf": "prefetch", ".plist": "plist", ".ab": "android_backup",
         ".automaticdestinations-ms": "jumplist", ".customdestinations-ms": "jumplist",
         ".mft": "mft", ".usn": "usn", ".usnjrnl": "usn", ".edb": "ese",
-        ".qcow": "qcow", ".qcow2": "qcow", ".vmdk": "vmdk", ".vhdx": "vhdx",
+        ".h5": "hdf5", ".hdf": "hdf5", ".hdf5": "hdf5", ".he5": "hdf5",
+        ".bson": "bson", ".mdb": "access_db", ".accdb": "access_db",
+        ".qcow": "qcow", ".qcow2": "qcow", ".vmdk": "vmdk", ".vhd": "vhd", ".vhdx": "vhdx",
         ".vdi": "vdi", ".dmg": "dmg", ".aff": "aff", ".aff4": "aff",
-        ".img": "disk", ".dd": "disk", ".iso": "disk", ".vhd": "disk", ".vhdx": "disk", ".vmdk": "disk",
+        ".img": "disk", ".dd": "disk", ".iso": "disk",
         ".e01": "ewf", ".ex01": "ewf", ".s01": "ewf", ".hive": "registry",
         ".vmem": "memory", ".mem": "memory", ".lime": "memory", ".dmp": "memory", ".raw": "memory",
         ".evtx": "evtx", ".pst": "pst", ".ost": "pst",
-        ".7z": "7z", ".rar": "rar", ".tar": "tar",
+        ".one": "onenote", ".onetoc2": "onenote",
+        ".7z": "7z", ".rar": "rar", ".tar": "tar", ".cab": "cab", ".cpio": "cpio", ".rpm": "rpm", ".xar": "xar",
+        ".ser": "java_serialized", ".serialized": "java_serialized", ".pyc": "pyc",
+        ".pkl": "python_pickle", ".pickle": "python_pickle", ".pack": "git_pack", ".idx": "git_index",
+        ".hex": "intel_hex", ".ihex": "intel_hex", ".ihx": "intel_hex",
+        ".srec": "srec", ".s19": "srec", ".s28": "srec", ".s37": "srec", ".mot": "srec",
     }.get(extension)
 
 

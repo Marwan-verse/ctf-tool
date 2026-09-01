@@ -105,6 +105,26 @@ def test_document_preview_extracts_ooxml_text_without_rendering(tmp_path: Path) 
     assert preview["sources"] == ["word/document.xml"]
 
 
+def test_macro_ooxml_and_xps_packages_get_plain_text_previews(tmp_path: Path) -> None:
+    macro_path = tmp_path / "challenge.docm"
+    macro_path.write_bytes(_docx_with_text("flag{macro_document_preview}"))
+    macro_preview = build_text_preview(macro_path, filename=macro_path.name)
+    assert macro_preview["kind"] == "docx"
+    assert "flag{macro_document_preview}" in macro_preview["text"]
+
+    xps_path = tmp_path / "challenge.xps"
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "Documents/1/Pages/1.fpage",
+            '<FixedPage xmlns="http://schemas.microsoft.com/xps/2005/06"><Glyphs UnicodeString="flag{xps_preview}" /></FixedPage>',
+        )
+    xps_path.write_bytes(payload.getvalue())
+    xps_preview = build_text_preview(xps_path, filename=xps_path.name)
+    assert xps_preview["kind"] == "xps"
+    assert "flag{xps_preview}" in xps_preview["text"]
+
+
 def test_document_solver_recovers_split_deleted_and_custom_ooxml_text() -> None:
     report = analyze_format("docx", _docx_with_hidden_ctf_text())
     recovered = "\n".join(str(record["text"]) for record in report["text_records"])

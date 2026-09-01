@@ -173,17 +173,18 @@ Forenscope always begins with content signatures, SHA-256, bounded entropy/strin
 
 | Family | Recognized formats and artifacts | Main built-in work |
 |---|---|---|
-| Images | PNG/APNG, JPEG/MPO, GIF, BMP, WebP, SVG text, TIFF/BigTIFF, ICO/CUR | structure, metadata, frames, channels, palette/index data, bit planes, OCR/barcodes, embedded content, repairs |
+| Images | PNG/APNG, JPEG/MPO, GIF, BMP, WebP, SVG text, TIFF/BigTIFF, ICO/CUR, PSD/PSB, GIMP XCF, PBM/PGM/PPM/PAM, HEIF/HEIC/AVIF | structure, metadata, frames, channels, palette/index data, bit planes, OCR/barcodes, embedded content, repairs, bounded long-tail header triage |
 | Audio | WAV/PCM, AIFF/AIFC, FLAC, Ogg/Opus, MP3, AAC/M4A, AU, WMA/ASF, AMR, CAF, MIDI | headers/metadata, PCM analysis, waveform/spectrogram, channels, LSB lanes, DTMF/Morse/SSTV, conversion handoffs |
 | Video | MP4/MOV, Matroska/WebM, AVI | BMFF/EBML/RIFF structure, brands, text metadata, invalid sizes, trailers, optional metadata and contact-frame extraction |
-| Text and documents | plain text, Markdown, JSON/JSONL, XML, YAML, CSV/TSV, config/log files, PDF, RTF, EML/MBOX, DOC/XLS/PPT, DOCX/XLSX/PPTX, ODT/ODS/ODP, EPUB | bounded plain-text preview, package text/metadata, attachments/objects, active-content indicators, whitespace and encoding analysis |
+| Text and documents | plain text, Markdown, JSON/JSONL, XML, YAML, CSV/TSV, config/log files, PDF, RTF, EML/MBOX, DOC/XLS/PPT, DOCX/XLSX/PPTX plus macro/template variants, ODT/ODS/ODP, EPUB, XPS/OXPS, OneNote | bounded plain-text preview, package text/metadata, attachments/objects, active-content indicators, whitespace and encoding analysis |
 | Captures | PCAP, PCAPNG, PCAPNG secrets blocks, SocketCAN in captures | native flow/stream/object/covert-channel analysis plus optional TShark/Wireshark-grade queries |
-| Archives and compression | ZIP, TAR, gzip, bzip2, XZ, Zstandard, 7z, RAR, LZIP, LZ4, LZMA, LZOP, shar/uuencode, Unix ar | bounded recursion, safe member extraction, extra-field carving, trailers, decompression, optional flat 7-Zip extraction |
-| Databases and browser data | SQLite, WAL, rollback journal, LevelDB, ESE/EDB, Firefox MOZLZ4 | bounded schema/page/record work and fixed read-only queries for common browser, activity, quarantine, and message stores |
+| Archives, packages and compression | ZIP, TAR, gzip, bzip2, XZ, Zstandard, 7z, RAR, LZIP, LZ4, LZMA, LZOP, shar/uuencode, Unix ar, CAB, CPIO, RPM, XAR, APK, AAB, JAR/WAR, IPA, AppX/MSIX, NuGet/VSIX | bounded recursion, safe member extraction, package manifest text, extra-field carving, trailers, decompression, optional flat 7-Zip extraction |
+| Databases and browser data | SQLite, WAL, rollback journal, LevelDB, ESE/EDB, Firefox MOZLZ4, HDF5, BSON, Access Jet/ACE | bounded schema/page/record/object strings, BSON key/value and binary-field recovery, and fixed read-only queries for common browser, activity, quarantine, and message stores |
 | Windows artifacts | Registry hives, EVTX, LNK, Jump Lists, Prefetch, `$MFT`, `$UsnJrnl:$J`, `$Recycle.Bin` `$I`, thumbnail cache, PST/OST, memory/crash dumps | headers, records, paths, timestamps, stale cells, UserAssist, event strings, mail/store metadata, optional specialist tools |
 | Linux/macOS/mobile | utmp/wtmp/btmp, systemd journals, plist, `.DS_Store`, Safari binary cookies, iOS MBDB, Android ADB backup | records, fields, timestamps, strings, filenames/comments/cookies, backup manifests and bounded child extraction |
-| Disk and VM images | raw MBR/GPT/filesystem images, ISO, E01/EWF, QCOW, VMDK, VHDX, VDI, DMG, AFF/AFF4 | container/partition metadata, embedded signatures, optional Sleuth Kit/libewf/QEMU recovery workflows |
-| Programs | PE/PE32+, ELF32/ELF64, thin/fat Mach-O, WebAssembly, Android DEX, Java class | bounded headers, sections/segments/load commands, strings/custom sections, RWX warnings, overlays |
+| Disk and VM images | raw MBR/GPT/filesystem images, FAT/exFAT, NTFS, ext, HFS/HFS+, APFS, XFS, Btrfs, SquashFS/CramFS, LUKS/BitLocker indicators, ISO, E01/EWF, QCOW, VMDK, VHD/VHDX, VDI, DMG, AFF/AFF4 | container/partition metadata, embedded signatures, optional Sleuth Kit/libewf/QEMU recovery workflows |
+| Programs, serialization and firmware | PE/PE32+, ELF32/ELF64, thin/fat Mach-O, WebAssembly, Android DEX, Java class/serialization, Python PYC/pickle, Intel HEX, Motorola S-record | bounded headers, sections/segments/load commands, strings/custom sections, checksum-validated firmware reconstruction, serialization disassembly without object loading, RWX warnings, overlays |
+| Developer artifacts | Git pack and index files | bounded version/object metadata and path/string recovery without checking out or executing repository content |
 | Structured binary | bencode/BitTorrent, self-described or extension-identified CBOR, MessagePack, Protocol Buffers wire data | bounded maps, arrays, fields, strings, byte payloads, trailers, recursive child inspection |
 
 Unknown binary data still receives hashes, entropy, ASCII/UTF-16 strings, signature search, carving, common decoding/compression checks, crypto signals, and optional general-purpose tools.
@@ -215,7 +216,7 @@ This cannot restore pixels that no longer exist. Ordinary editor crops, most JPE
 
 ### Documents and text preview
 
-The Document text view supports readable text/config formats and `.pdf`, `.rtf`, `.eml`, `.doc`, `.xls`, `.ppt`, `.docx`, `.xlsx`, `.pptx`, `.odt`, `.ods`, `.odp`, and `.epub` artifacts. It reports encoding, character/line counts, source parts, and truncation.
+The Document text view supports readable text/config formats and `.pdf`, `.rtf`, `.eml`, `.mbox`, `.doc`, `.xls`, `.ppt`, OOXML and macro/template variants, `.odt`, `.ods`, `.odp`, `.epub`, `.xps`, `.oxps`, `.one`, and manifest-bearing APK/AAB/JAR/WAR/IPA/AppX/MSIX/NuGet packages. It reports encoding, character/line counts, source parts, and truncation.
 
 Preview safety limits are independent:
 
@@ -305,7 +306,7 @@ All optional adapters are capability checks, not requirements. The Settings and 
 | Steganography/carving | zsteg, Stegseek, Steghide, OutGuess, JPSeek, JSteg, OpenStego, Binwalk, Foremost, 7-Zip | embedded payload and bit/coefficient techniques |
 | Documents | Poppler, qpdf, SNOW, Oletools | text/images/attachments, whitespace steg, VBA/object indicators |
 | Network | capinfos, TShark, Zeek, tcpflow, hcxpcapngtool, pcapfix | packet dissection, objects, flows, authentication artifacts, repair |
-| Endpoint/disk | SQLite CLI, libyal tools, Sleuth Kit, libewf, Reglookup, python-evtx, libpst, QEMU, bulk_extractor | specialist read-only parsing and recovery |
+| Endpoint/database/disk | SQLite CLI, HDF5 `h5dump`, mdbtools, libyal tools, Sleuth Kit, libewf, Reglookup, python-evtx, libpst, QEMU, bulk_extractor | specialist read-only parsing and recovery |
 | Audio/video | FFmpeg/FFprobe, SoX, MediaInfo, Multimon-ng, Minimodem | media normalization, metadata, frames, spectra, signal decoding |
 | Program/mobile/timeline | YARA-X, capa, FLOSS, Kaitai, Plaso, iLEAPP, ALEAPP, Volatility 3 | capabilities/strings, headers, timelines, mobile reports, memory triage |
 
@@ -452,7 +453,9 @@ The interactive schema at `/api/docs` is the most precise request/response refer
 | `GET` | `/api/jobs/{job_id}/report.html?download=false` | CSP-restricted standalone report. |
 | `GET` | `/api/jobs/{job_id}/report.zip` | Report plus retained artifacts. |
 
-The browser uses the lightweight `detail=summary` job list and loads a full report only when a case is opened. Live Server-Sent Events drive scan progress; interval polling starts only if that stream disconnects. Analysis ingests each source in one pass for its bounded byte prefix, complete SHA-256, and size, then reuses extracted string and byte-frequency work instead of rescanning the same buffer.
+The browser uses the lightweight `detail=summary` job list and loads a full report only when a case is opened. Live Server-Sent Events drive scan progress; interval polling starts only if that stream disconnects. Heavy result searches and derived collections are memoized so unrelated UI updates do not repeatedly stringify a complete report.
+
+Analysis ingests each source in one pass for its bounded byte prefix, complete SHA-256, and size, then reuses extracted string and byte-frequency work instead of rescanning the same buffer. Independent external analyzers run with a strict two-process ceiling; executable resolution, child environment construction, and shared-binary version probes are reused within the job. Tool results remain in declared order, every adapter keeps its own temporary directory, argument arrays remain non-shell, and cancellation is checked before queued work and while child processes run.
 
 ### Create and monitor a job with PowerShell
 
@@ -592,6 +595,7 @@ Exports wrap the job, result, and public artifact records in schema version `1.0
 - No tool can recover bytes that were deleted or overwritten. “Uncrop” is evidence-backed container/residue recovery, not generative reconstruction.
 - Built-in reads, recursion, parser nodes, packet rows, strings, visuals, artifacts, decompression, tools, output, and report sizes are intentionally capped.
 - Large sources can be stored but only a profile-bounded prefix may be examined by generic passes.
+- Long-tail containers such as PSD/XCF, HDF5/Access, CAB/RPM/XAR, OneNote, VHD, and application packages receive safe built-in identification, header/manifest, string, and child-artifact triage. Full semantic extraction can still require the listed optional specialist tools.
 - Generic Protocol Buffers have no semantic field names without a trusted schema; evidence-provided schemas are not loaded.
 - 7z/RAR extraction, compressed-media decoding, full disk recovery, memory plugins, and many specialist reports depend on optional local tools.
 - Encrypted archives, encrypted Android backups, protected documents, and unknown cryptosystems are reported but not brute-forced.

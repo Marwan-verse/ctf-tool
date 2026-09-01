@@ -167,7 +167,7 @@ def build_solve_guidance(report: dict[str, Any]) -> dict[str, Any]:
             target_tab="traffic", method_ids=["tshark_fields", "tshark_packet_details", "tshark_statistics"],
             tool_ids=["tshark", "zeek"], action="investigate",
         ))
-    if detected in {"pe", "elf", "macho", "wasm", "dex", "java_class"}:
+    if detected in {"pe", "elf", "macho", "wasm", "dex", "java_class", "pyc"}:
         recommendations.append(_recommendation(
             "inspect-program", 91, "Inspect program structure without executing it",
             "Review imports, sections, strings, overlays, and capability matches; keep dynamic analysis isolated.",
@@ -179,11 +179,35 @@ def build_solve_guidance(report: dict[str, Any]) -> dict[str, Any]:
             "Compare container structure with FFprobe, then review frames and bytes beyond the declared container.",
             target_tab="visual", tool_ids=["ffprobe", "ffmpeg_frames"], action="inspect",
         ))
-    if detected in {"memory", "disk", "ewf", "qcow", "vmdk", "vhdx", "vdi", "dmg", "aff", "evtx", "registry"}:
+    if detected in {"memory", "disk", "ewf", "qcow", "vmdk", "vhd", "vhdx", "vdi", "dmg", "aff", "evtx", "registry"}:
         recommendations.append(_recommendation(
             "build-timeline", 86, "Correlate timestamps and endpoint artifacts",
             "Normalize event time, preserve source offsets, and pivot on users, paths, processes, and network indicators.",
             target_tab="metadata", tool_ids=["plaso"], action="correlate",
+        ))
+    if detected in {"apk", "aab", "jar", "war", "ipa", "appx", "msix", "nupkg", "xps", "cab", "cpio", "rpm", "xar"}:
+        recommendations.append(_recommendation(
+            "inspect-package", 87, "Inspect package manifests and recovered members",
+            "Start with manifest/configuration text, signatures, executable members, and nested child artifacts.",
+            target_tab="document", tool_ids=["7z_extract", "oleid"], action="inspect",
+        ))
+    if detected in {"hdf5", "bson", "access_db", "sqlite", "sqlite_wal", "sqlite_journal", "leveldb", "ese"}:
+        recommendations.append(_recommendation(
+            "inspect-database", 86, "Review structured records and database sidecars",
+            "Search keys, schema names, values, deleted/WAL records, and extracted binary fields before using a specialist reader.",
+            target_tab="metadata", tool_ids=["sqlite3", "esedbinfo"], action="inspect",
+        ))
+    if detected in {"java_serialized", "python_pickle"}:
+        recommendations.append(_recommendation(
+            "inspect-serialization", 90, "Review serialization tokens without loading the object",
+            "Prioritize string operands, global/class references, reducers, and embedded byte payloads; do not deserialize challenge data on the host.",
+            target_tab="metadata", action="inspect",
+        ))
+    if detected in {"intel_hex", "srec"}:
+        recommendations.append(_recommendation(
+            "inspect-firmware", 89, "Pivot into the reconstructed firmware image",
+            "The checksum-validated data records are available as a child artifact; inspect its signatures, strings, and nested filesystems.",
+            target_tab="artifacts", tool_ids=["binwalk", "foremost"], action="pivot",
         ))
     if missing_tools:
         recommendations.append(_recommendation(

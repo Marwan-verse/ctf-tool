@@ -59,6 +59,11 @@ MIME_BY_KIND = {
     "webp": "image/webp",
     "tiff": "image/tiff",
     "ico": "image/x-icon",
+    "psd": "image/vnd.adobe.photoshop",
+    "xcf": "image/x-xcf",
+    "netpbm": "image/x-portable-anymap",
+    "heif": "image/heif",
+    "avif": "image/avif",
     "wav": "audio/wav",
     "aiff": "audio/aiff",
     "flac": "audio/flac",
@@ -82,6 +87,13 @@ MIME_BY_KIND = {
     "wasm": "application/wasm",
     "dex": "application/vnd.android.dex",
     "java_class": "application/java-vm",
+    "java_serialized": "application/x-java-serialized-object",
+    "pyc": "application/x-python-code",
+    "python_pickle": "application/x-python-pickle",
+    "git_pack": "application/x-git-packed-objects",
+    "git_index": "application/x-git-index",
+    "intel_hex": "application/x-intel-hex",
+    "srec": "application/x-motorola-s-record",
     "bencode": "application/x-bittorrent",
     "cbor": "application/cbor",
     "msgpack": "application/msgpack",
@@ -94,6 +106,15 @@ MIME_BY_KIND = {
     "ods": "application/vnd.oasis.opendocument.spreadsheet",
     "odp": "application/vnd.oasis.opendocument.presentation",
     "epub": "application/epub+zip",
+    "xps": "application/vnd.ms-xpsdocument",
+    "apk": "application/vnd.android.package-archive",
+    "aab": "application/zip",
+    "jar": "application/java-archive",
+    "war": "application/java-archive",
+    "appx": "application/vnd.ms-appx",
+    "msix": "application/vnd.ms-appx",
+    "ipa": "application/x-ios-app",
+    "nupkg": "application/zip",
     "gzip": "application/gzip",
     "zlib": "application/zlib",
     "bzip2": "application/x-bzip2",
@@ -135,14 +156,23 @@ MIME_BY_KIND = {
     "usn": "application/x-ntfs-usn-journal",
     "recycle_bin_i": "application/x-windows-recycle-bin-metadata",
     "ese": "application/x-esedb",
+    "access_db": "application/x-msaccess",
+    "hdf5": "application/x-hdf5",
+    "bson": "application/bson",
     "qcow": "application/x-qemu-disk",
     "vmdk": "application/x-vmdk",
+    "vhd": "application/x-vhd",
     "vhdx": "application/x-vhdx",
     "vdi": "application/x-virtualbox-vdi",
     "dmg": "application/x-apple-diskimage",
     "aff": "application/x-aff",
+    "onenote": "application/onenote",
     "shar": "application/x-shar",
     "ar": "application/x-archive",
+    "cab": "application/vnd.ms-cab-compressed",
+    "cpio": "application/x-cpio",
+    "rpm": "application/x-rpm",
+    "xar": "application/x-xar",
     "lzip": "application/x-lzip",
     "lz4": "application/x-lz4",
     "lzma": "application/x-lzma",
@@ -279,6 +309,8 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "vhdx"
     if data.startswith(b"<<< Oracle VM VirtualBox Disk Image >>>"):
         return "vdi"
+    if extension == ".vhd" or (len(data) >= 512 and (data[:8] == b"conectix" or data[-512:-504] == b"conectix")):
+        return "vhd"
     if data.startswith(b"AFF10") or extension in {".aff", ".aff4"}:
         return "aff"
     if (extension == ".dmg" and data) or len(data) >= 512 and data[-512:-508] == b"koly":
@@ -293,6 +325,14 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "shar"
     if data.startswith(b"!<arch>\n"):
         return "ar"
+    if data.startswith(b"MSCF"):
+        return "cab"
+    if data.startswith((b"070701", b"070702", b"070707", b"\x71\xc7", b"\xc7\x71")):
+        return "cpio"
+    if data.startswith(b"\xed\xab\xee\xdb"):
+        return "rpm"
+    if data.startswith(b"xar!"):
+        return "xar"
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return "png"
     if data.startswith(b"\xff\xd8\xff"):
@@ -301,6 +341,12 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "gif"
     if data.startswith(b"BM"):
         return "bmp"
+    if data.startswith(b"8BPS"):
+        return "psd"
+    if data.startswith(b"gimp xcf "):
+        return "xcf"
+    if len(data) >= 3 and data[:2] in {b"P1", b"P2", b"P3", b"P4", b"P5", b"P6", b"P7"} and data[2] in b" \t\r\n#":
+        return "netpbm"
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "webp"
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
@@ -319,6 +365,10 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "aac"
     if len(data) >= 12 and data[4:8] == b"ftyp":
         brand = data[8:12]
+        if extension == ".avif" or brand in {b"avif", b"avis"}:
+            return "avif"
+        if extension in {".heif", ".heic", ".heifs", ".heics"} or brand in {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}:
+            return "heif"
         if extension in {".m4a", ".m4b", ".m4p"}:
             return "m4a"
         if extension == ".mov" or brand == b"qt  ":
@@ -361,6 +411,16 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "wasm"
     if data.startswith(b"dex\n") and len(data) >= 8 and data[7] == 0:
         return "dex"
+    if data.startswith(b"\xac\xed\x00\x05"):
+        return "java_serialized"
+    if data.startswith(b"PACK") and len(data) >= 12 and 2 <= int.from_bytes(data[4:8], "big") <= 3:
+        return "git_pack"
+    if data.startswith(b"DIRC") and len(data) >= 12 and 2 <= int.from_bytes(data[4:8], "big") <= 4:
+        return "git_index"
+    if any(data[offset:offset + 8] == b"\x89HDF\r\n\x1a\n" for offset in (0, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536)):
+        return "hdf5"
+    if len(data) >= 32 and data[4:20].startswith((b"Standard Jet DB", b"Standard ACE DB")):
+        return "access_db"
     if data.startswith(b"\xd9\xd9\xf7"):
         return "cbor"
     if data.startswith(b"d8:announce"):
@@ -372,7 +432,14 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
     if data.startswith(b"PK\x03\x04") or data.startswith(b"PK\x05\x06"):
         return {
             ".docx": "docx", ".xlsx": "xlsx", ".pptx": "pptx",
+            ".docm": "docx", ".dotx": "docx", ".dotm": "docx",
+            ".xlsm": "xlsx", ".xltx": "xlsx", ".xltm": "xlsx",
+            ".pptm": "pptx", ".ppsx": "pptx", ".ppsm": "pptx",
             ".odt": "odt", ".ods": "ods", ".odp": "odp", ".epub": "epub",
+            ".xps": "xps", ".oxps": "xps", ".apk": "apk", ".aab": "aab",
+            ".jar": "jar", ".war": "war", ".ear": "jar", ".ipa": "ipa",
+            ".appx": "appx", ".appxbundle": "appx", ".msix": "msix", ".msixbundle": "msix",
+            ".nupkg": "nupkg", ".vsix": "nupkg",
         }.get(extension, "zip")
     if data.startswith(b"7z\xbc\xaf'\x1c"):
         return "7z"
@@ -427,6 +494,8 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "evtx"
     if data.startswith(b"!BDN"):
         return "pst"
+    if data.startswith(bytes.fromhex("e4525c7b8cd8a74daeb15378d02996d3")):
+        return "onenote"
     if data.startswith((b"MDMP", b"PAGEDUMP", b"PAGEDU64")):
         return "memory"
     if _looks_like_disk_image(data):
@@ -446,19 +515,34 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "msgpack"
     if extension in {".pb", ".protobuf"}:
         return "protobuf"
+    if extension == ".bson" and len(data) >= 5:
+        declared = int.from_bytes(data[:4], "little", signed=True)
+        if 5 <= declared <= len(data) and data[declared - 1] == 0:
+            return "bson"
+    if extension in {".pkl", ".pickle"}:
+        return "python_pickle"
+    if extension == ".pyc":
+        return "pyc"
+    if extension in {".hex", ".ihex", ".ihx"} and re.match(br"(?m)^:[0-9A-Fa-f]{10,}$", data[:8192]):
+        return "intel_hex"
+    if extension in {".srec", ".s19", ".s28", ".s37", ".mot"} and re.match(br"(?m)^S[0-9][0-9A-Fa-f]{8,}$", data[:8192]):
+        return "srec"
     if data and _looks_textual(data[:8192]):
         return "text"
     return {
         ".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".jpe": "jpeg",
         ".gif": "gif", ".bmp": "bmp", ".webp": "webp", ".svg": "svg",
         ".tif": "tiff", ".tiff": "tiff", ".ico": "ico", ".cur": "ico",
+        ".psd": "psd", ".psb": "psd", ".xcf": "xcf",
+        ".pbm": "netpbm", ".pgm": "netpbm", ".ppm": "netpbm", ".pnm": "netpbm", ".pam": "netpbm",
+        ".heif": "heif", ".heic": "heif", ".heifs": "heif", ".heics": "heif", ".avif": "avif",
         ".wav": "wav", ".wave": "wav", ".aif": "aiff", ".aiff": "aiff", ".aifc": "aiff",
         ".flac": "flac", ".ogg": "ogg", ".oga": "ogg", ".opus": "ogg",
         ".mp3": "mp3", ".aac": "aac", ".m4a": "m4a", ".m4b": "m4a",
         ".mp4": "mp4", ".mov": "mov", ".mkv": "matroska", ".webm": "webm", ".avi": "avi",
         ".au": "au", ".snd": "au", ".wma": "asf", ".amr": "amr", ".caf": "caf",
         ".mid": "midi", ".midi": "midi",
-        ".7z": "7z", ".rar": "rar", ".tar": "tar",
+        ".7z": "7z", ".rar": "rar", ".tar": "tar", ".cab": "cab", ".cpio": "cpio", ".rpm": "rpm", ".xar": "xar",
         ".lzip": "lzip", ".lz4": "lz4", ".lzma": "lzma", ".lzo": "lzop", ".lzop": "lzop",
         ".tgz": "gzip", ".tbz": "bzip2", ".tbz2": "bzip2", ".txz": "xz",
         ".pcap": "pcap", ".cap": "pcap", ".pcapng": "pcapng",
@@ -469,21 +553,29 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         ".utmp": "utmp", ".wtmp": "utmp", ".btmp": "utmp",
         ".jsonlz4": "mozlz4", ".baklz4": "mozlz4", ".mozlz4": "mozlz4",
         ".ldb": "leveldb", ".sst": "leveldb",
+        ".h5": "hdf5", ".hdf": "hdf5", ".hdf5": "hdf5", ".he5": "hdf5",
+        ".bson": "bson", ".mdb": "access_db", ".accdb": "access_db",
         ".doc": "ole", ".xls": "ole", ".ppt": "ole", ".msg": "ole",
         ".rtf": "rtf", ".eml": "eml", ".mbox": "mbox", ".mbx": "mbox", ".journal": "systemd_journal",
         ".lnk": "lnk", ".pf": "prefetch", ".plist": "plist", ".ab": "android_backup",
         ".automaticdestinations-ms": "jumplist", ".customdestinations-ms": "jumplist",
         ".mft": "mft", ".usn": "usn", ".usnjrnl": "usn", ".edb": "ese",
-        ".img": "disk", ".dd": "disk", ".iso": "disk", ".vhd": "disk",
+        ".img": "disk", ".dd": "disk", ".iso": "disk", ".vhd": "vhd",
         ".vhdx": "vhdx", ".vmdk": "vmdk", ".qcow": "qcow", ".qcow2": "qcow",
         ".vdi": "vdi", ".dmg": "dmg", ".aff": "aff", ".aff4": "aff",
         ".e01": "ewf", ".ex01": "ewf", ".s01": "ewf",
         ".dat": "binary", ".hive": "registry",
         ".vmem": "memory", ".mem": "memory", ".lime": "memory", ".dmp": "memory", ".raw": "memory",
         ".evtx": "evtx", ".pst": "pst", ".ost": "pst",
+        ".one": "onenote", ".onetoc2": "onenote",
         ".exe": "pe", ".dll": "pe", ".sys": "pe", ".efi": "pe",
         ".elf": "elf", ".so": "elf", ".o": "elf", ".dylib": "macho", ".wasm": "wasm",
         ".dex": "dex", ".class": "java_class",
+        ".ser": "java_serialized", ".serialized": "java_serialized", ".pyc": "pyc",
+        ".pkl": "python_pickle", ".pickle": "python_pickle",
+        ".pack": "git_pack", ".idx": "git_index",
+        ".hex": "intel_hex", ".ihex": "intel_hex", ".ihx": "intel_hex",
+        ".srec": "srec", ".s19": "srec", ".s28": "srec", ".s37": "srec", ".mot": "srec",
         ".torrent": "bencode", ".bencode": "bencode",
         ".cbor": "cbor", ".cborseq": "cbor", ".cose": "cbor",
         ".msgpack": "msgpack", ".mpk": "msgpack",
@@ -542,7 +634,19 @@ def _looks_like_disk_image(data: bytes) -> bool:
         return True
     if len(data) >= 11 and data[3:11] == b"NTFS    ":
         return True
+    if len(data) >= 11 and data[3:11] == b"EXFAT   ":
+        return True
     if len(data) >= 90 and (data[54:62].startswith(b"FAT") or data[82:90].startswith(b"FAT")):
+        return True
+    if len(data) >= 36 and data[32:36] == b"NXSB":
+        return True
+    if len(data) >= 1026 and data[1024:1026] in {b"BD", b"H+", b"HX"}:
+        return True
+    if data.startswith(b"XFSB") or data.startswith((b"hsqs", b"sqsh", b"\x45\x3d\xcd\x28")):
+        return True
+    if len(data) >= 65_608 and data[65_600:65_608] == b"_BHRfS_M":
+        return True
+    if data.startswith(b"LUKS\xba\xbe") or (len(data) >= 11 and data[3:11] == b"-FVE-FS-"):
         return True
     if len(data) >= 32774 and data[32769:32774] == b"CD001":
         return True
@@ -557,23 +661,30 @@ def extension_for(kind: str) -> str:
     return {
         "png": ".png", "jpeg": ".jpg", "gif": ".gif", "bmp": ".bmp",
         "webp": ".webp", "svg": ".svg", "tiff": ".tiff", "ico": ".ico", "zip": ".zip",
+        "psd": ".psd", "xcf": ".xcf", "netpbm": ".pnm", "heif": ".heif", "avif": ".avif",
         "docx": ".docx", "xlsx": ".xlsx", "pptx": ".pptx",
         "odt": ".odt", "ods": ".ods", "odp": ".odp", "epub": ".epub",
+        "xps": ".xps", "apk": ".apk", "aab": ".aab", "jar": ".jar", "war": ".war",
+        "appx": ".appx", "msix": ".msix", "ipa": ".ipa", "nupkg": ".nupkg",
         "wav": ".wav", "aiff": ".aiff", "flac": ".flac", "ogg": ".ogg",
         "mp3": ".mp3", "aac": ".aac", "m4a": ".m4a", "au": ".au",
         "asf": ".wma", "amr": ".amr", "caf": ".caf", "midi": ".mid",
         "mp4": ".mp4", "mov": ".mov", "matroska": ".mkv", "webm": ".webm", "avi": ".avi",
         "pe": ".exe", "elf": ".elf", "macho": ".macho", "wasm": ".wasm",
         "dex": ".dex", "java_class": ".class",
+        "java_serialized": ".ser", "pyc": ".pyc", "python_pickle": ".pickle",
+        "git_pack": ".pack", "git_index": ".idx", "intel_hex": ".hex", "srec": ".srec",
         "bencode": ".torrent", "cbor": ".cbor", "msgpack": ".msgpack", "protobuf": ".pb",
         "gzip": ".gz", "zlib": ".zlib", "bzip2": ".bz2", "xz": ".xz", "zstd": ".zst",
         "7z": ".7z", "rar": ".rar", "tar": ".tar", "shar": ".shar", "ar": ".a",
+        "cab": ".cab", "cpio": ".cpio", "rpm": ".rpm", "xar": ".xar",
         "lzip": ".lz", "lz4": ".lz4", "lzma": ".lzma", "lzop": ".lzo",
         "pdf": ".pdf", "pcap": ".pcap", "pcapng": ".pcapng", "sqlite": ".sqlite",
         "sqlite_wal": ".sqlite-wal", "sqlite_journal": ".sqlite-journal",
         "thumbcache": ".db", "utmp": ".wtmp", "ios_mbdb": ".mbdb",
         "mozlz4": ".jsonlz4", "leveldb": ".ldb", "ds_store": ".DS_Store",
         "binarycookies": ".binarycookies",
+        "hdf5": ".h5", "bson": ".bson", "access_db": ".accdb",
         "ole": ".ole", "rtf": ".rtf", "eml": ".eml", "mbox": ".mbox",
         "systemd_journal": ".journal", "disk": ".img", "ewf": ".E01",
         "registry": ".hive", "memory": ".mem", "text": ".txt",
@@ -582,7 +693,8 @@ def extension_for(kind: str) -> str:
         "jumplist": ".automaticDestinations-ms",
         "mft": ".mft", "usn": ".usn", "ese": ".edb", "qcow": ".qcow2",
         "recycle_bin_i": ".recycle-bin-i",
-        "vmdk": ".vmdk", "vhdx": ".vhdx", "vdi": ".vdi", "dmg": ".dmg", "aff": ".aff4",
+        "vmdk": ".vmdk", "vhd": ".vhd", "vhdx": ".vhdx", "vdi": ".vdi", "dmg": ".dmg", "aff": ".aff4",
+        "onenote": ".one",
     }.get(kind, ".bin")
 
 

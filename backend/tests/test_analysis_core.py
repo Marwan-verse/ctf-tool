@@ -88,6 +88,14 @@ def test_byte_inspection_is_bounded() -> None:
     assert len(report["byte_frequency"]) == 256
 
 
+def test_byte_inspection_marks_utf16_only_truncation() -> None:
+    payload = b"\0\0".join(f"value-{index}".encode("utf-16-le") for index in range(12))
+    report = inspect_bytes(payload, max_strings=6)
+
+    assert report["strings_truncated"] is True
+    assert len(report["strings"]) <= 6
+
+
 def test_svg_text_nodes_are_concatenated_for_flag_scanning() -> None:
     svg = b"<svg xmlns='http://www.w3.org/2000/svg'>" + b"".join(
         f"<text>{char}</text>".encode("ascii") for char in "flag{svg_nodes}"

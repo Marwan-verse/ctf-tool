@@ -7,7 +7,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -43,22 +45,22 @@ class ResolvedTool:
         return f"WSL: {self.executable}"
 
 
-IMAGE_KINDS = frozenset({"png", "jpeg", "gif", "bmp", "webp", "tiff", "ico"})
+IMAGE_KINDS = frozenset({"png", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "psd", "xcf", "netpbm", "heif", "avif"})
 AUDIO_KINDS = frozenset({"audio", "wav", "aiff", "flac", "ogg", "mp3", "aac", "m4a", "au", "asf", "amr", "caf", "midi"})
 VIDEO_KINDS = frozenset({"mp4", "mov", "matroska", "webm", "avi"})
-PROGRAM_KINDS = frozenset({"pe", "elf", "macho", "wasm", "dex", "java_class"})
+PROGRAM_KINDS = frozenset({"pe", "elf", "macho", "wasm", "dex", "java_class", "pyc"})
 PDF_KINDS = frozenset({"pdf"})
 TEXT_KINDS = frozenset({"text", "svg"})
 NETWORK_KINDS = frozenset({"pcap", "pcapng"})
-ARCHIVE_KINDS = frozenset({"zip", "7z", "rar", "tar", "gzip", "bzip2", "xz", "zstd", "android_backup"})
-OFFICE_KINDS = frozenset({"ole", "rtf", "zip", "docx", "xlsx", "pptx", "odt", "ods", "odp"})
-DISK_KINDS = frozenset({"disk", "ewf", "qcow", "vmdk", "vhdx", "vdi", "dmg", "aff"})
+ARCHIVE_KINDS = frozenset({"zip", "7z", "rar", "tar", "gzip", "bzip2", "xz", "zstd", "android_backup", "cab", "cpio", "rpm", "xar", "apk", "aab", "jar", "war", "ipa", "appx", "msix", "nupkg", "xps"})
+OFFICE_KINDS = frozenset({"ole", "rtf", "zip", "docx", "xlsx", "pptx", "odt", "ods", "odp", "xps", "onenote"})
+DISK_KINDS = frozenset({"disk", "ewf", "qcow", "vmdk", "vhd", "vhdx", "vdi", "dmg", "aff"})
 MEMORY_KINDS = frozenset({"memory"})
 THUMBCACHE_KINDS = frozenset({"thumbcache"})
 JOURNAL_KINDS = frozenset({"systemd_journal"})
 TIMELINE_KINDS = DISK_KINDS | frozenset({
     "registry", "evtx", "mft", "usn", "prefetch", "lnk", "jumplist", "recycle_bin_i",
-    "sqlite", "sqlite_wal", "sqlite_journal", "ese", "pst", "systemd_journal", "utmp",
+    "sqlite", "sqlite_wal", "sqlite_journal", "ese", "access_db", "hdf5", "bson", "pst", "systemd_journal", "utmp",
     "plist", "ios_mbdb", "binarycookies", "ds_store", "leveldb", "mozlz4",
 })
 
@@ -123,6 +125,10 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("hcxpcapngtool", "hcxpcapngtool", "WPA/PMKID and EAPOL hash extraction", "network-auth", NETWORK_KINDS, frozenset({"deep"}), "https://github.com/ZerBea/hcxtools"),
     ToolSpec("pcapfix", "pcapfix", "pcapfix non-destructive capture repair", "repair", NETWORK_KINDS, frozenset({"balanced", "deep"}), "https://github.com/Rup0rt/pcapfix"),
     ToolSpec("sqlite3", "sqlite3", "SQLite read-only safe database dump", "database", frozenset({"sqlite"}), frozenset({"balanced", "deep"}), "https://www.sqlite.org/cli.html"),
+    ToolSpec("h5dump", "h5dump", "HDF5 structure and attribute dump", "database", frozenset({"hdf5"}), frozenset({"balanced", "deep"}), "https://support.hdfgroup.org/documentation/hdf5/latest/_h5_t_o_o_l__d_p__u_g.html"),
+    ToolSpec("h5dump_values", "h5dump", "HDF5 bounded dataset-value dump", "database", frozenset({"hdf5"}), frozenset({"deep"}), "https://support.hdfgroup.org/documentation/hdf5/latest/_h5_t_o_o_l__d_p__u_g.html"),
+    ToolSpec("mdb_tables", "mdb-tables", "Access Jet/ACE table inventory", "database", frozenset({"access_db"}), frozenset({"balanced", "deep"}), "https://github.com/mdbtools/mdbtools"),
+    ToolSpec("mdb_schema", "mdb-schema", "Access Jet/ACE schema dump", "database", frozenset({"access_db"}), frozenset({"deep"}), "https://github.com/mdbtools/mdbtools"),
     ToolSpec("lnkinfo", "lnkinfo", "liblnk Windows shortcut report", "endpoint-artifact", frozenset({"lnk"}), frozenset({"quick", "balanced", "deep"}), "https://github.com/libyal/liblnk"),
     ToolSpec("sccainfo", "sccainfo", "libscca Windows Prefetch report", "endpoint-artifact", frozenset({"prefetch"}), frozenset({"quick", "balanced", "deep"}), "https://github.com/libyal/libscca"),
     ToolSpec("plistutil", "plistutil", "libplist property-list cross-check", "mobile-artifact", frozenset({"plist"}), frozenset({"balanced", "deep"}), "https://github.com/libimobiledevice/libplist"),
@@ -618,6 +624,9 @@ class ExternalToolRunner:
         self.output_limit = max(64 * 1024, output_limit)
         self.is_cancelled = is_cancelled
         self._version_cache: dict[str, str | None] = {}
+        self._version_cache_lock = threading.Lock()
+        self._environment_cache: dict[str, str] | None = None
+        self._environment_cache_lock = threading.Lock()
 
     def run_all(
         self,
@@ -633,15 +642,18 @@ class ExternalToolRunner:
         allow_extraction: bool = True,
         max_extracted_files: int = 32,
         foremost_depth: int = 2,
+        max_workers: int = 1,
     ) -> list[dict[str, Any]]:
-        results: list[dict[str, Any]] = []
+        results: list[dict[str, Any] | None] = [None] * len(TOOL_SPECS)
+        scheduled: list[tuple[int, ToolSpec, ResolvedTool]] = []
         wsl_tools: dict[str, str] | None = None
-        for spec in TOOL_SPECS:
+        resolutions: dict[str, ResolvedTool | None] = {}
+        for index, spec in enumerate(TOOL_SPECS):
             if cancel_requested(self.is_cancelled):
-                results.append(self._not_run(spec, "cancelled", "Job cancellation was requested."))
+                results[index] = self._not_run(spec, "cancelled", "Job cancellation was requested.")
                 continue
             if selected_tools is not None and spec.tool_id not in selected_tools:
-                results.append(self._not_run(spec, "skipped", "Disabled in this job's analysis settings."))
+                results[index] = self._not_run(spec, "skipped", "Disabled in this job's analysis settings.")
                 continue
             if not allow_extraction and spec.tool_id in {
                 "foremost", "jpseek", "openstego", "outguess", "steghide", "stegseek",
@@ -652,38 +664,59 @@ class ExternalToolRunner:
                 "readpst", "bulk_extractor", "wtcdbexport", "ffmpeg_frames", "zeek",
                 "plaso_timeline", "ileapp", "aleapp",
             }:
-                results.append(self._not_run(spec, "skipped", "External payload extraction is disabled in this job's settings."))
+                results[index] = self._not_run(spec, "skipped", "External payload extraction is disabled in this job's settings.")
                 continue
             if spec.kinds is not None and kind not in spec.kinds:
-                results.append(self._not_run(spec, "skipped", f"Not applicable to detected {kind} input."))
+                results[index] = self._not_run(spec, "skipped", f"Not applicable to detected {kind} input.")
                 continue
             if profile not in spec.profiles:
-                results.append(self._not_run(spec, "skipped", f"Disabled by the {profile} scan profile."))
+                results[index] = self._not_run(spec, "skipped", f"Disabled by the {profile} scan profile.")
                 continue
-            resolution = resolve_tool(spec.executable, wsl_tools={})
+            if spec.executable not in resolutions:
+                resolution = resolve_tool(spec.executable, wsl_tools={})
+                if resolution is None:
+                    if wsl_tools is None:
+                        wsl_tools = discover_wsl_tools(tuple(candidate.executable for candidate in TOOL_SPECS))
+                    resolution = resolve_tool(spec.executable, wsl_tools=wsl_tools)
+                resolutions[spec.executable] = resolution
+            resolution = resolutions[spec.executable]
             if resolution is None:
-                if wsl_tools is None:
-                    wsl_tools = discover_wsl_tools(tuple(candidate.executable for candidate in TOOL_SPECS))
-                resolution = resolve_tool(spec.executable, wsl_tools=wsl_tools)
-            if resolution is None:
-                results.append(self._not_run(spec, "missing", f"Optional executable {spec.executable!r} was not found natively or in WSL."))
+                results[index] = self._not_run(spec, "missing", f"Optional executable {spec.executable!r} was not found natively or in WSL.")
                 continue
-            results.append(
-                self._run_spec(
-                    spec,
-                    resolution,
-                    path,
-                    kind,
-                    profile,
-                    password,
-                    work_dir,
-                    ocr_language,
-                    zsteg_mode,
-                    max_extracted_files,
-                    foremost_depth,
-                )
+            scheduled.append((index, spec, resolution))
+
+        def execute(item: tuple[int, ToolSpec, ResolvedTool]) -> tuple[int, dict[str, Any]]:
+            index, spec, resolution = item
+            if cancel_requested(self.is_cancelled):
+                return index, self._not_run(spec, "cancelled", "Job cancellation was requested.")
+            return index, self._run_spec(
+                spec,
+                resolution,
+                path,
+                kind,
+                profile,
+                password,
+                work_dir,
+                ocr_language,
+                zsteg_mode,
+                max_extracted_files,
+                foremost_depth,
             )
-        return results
+
+        worker_count = min(4, max(1, int(max_workers)), max(1, len(scheduled)))
+        if worker_count == 1:
+            for item in scheduled:
+                index, result = execute(item)
+                results[index] = result
+        elif scheduled:
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="forenscope-tool") as executor:
+                futures = [executor.submit(execute, item) for item in scheduled]
+                for future in as_completed(futures):
+                    index, result = future.result()
+                    results[index] = result
+        if any(result is None for result in results):
+            raise RuntimeError("external tool scheduler did not produce a result for every adapter")
+        return [result for result in results if result is not None]
 
     def _run_spec(
         self,
@@ -947,6 +980,14 @@ class ExternalToolRunner:
                 ]
             elif spec.tool_id == "sqlite3":
                 argv = [executable, "-readonly", "-safe", str(input_path), ".dump"]
+            elif spec.tool_id == "h5dump":
+                argv = [executable, "--header", str(input_path)]
+            elif spec.tool_id == "h5dump_values":
+                argv = [executable, "--enable-error-stack=1", "--noindex", "--width=128", str(input_path)]
+            elif spec.tool_id == "mdb_tables":
+                argv = [executable, "-1", str(input_path)]
+            elif spec.tool_id == "mdb_schema":
+                argv = [executable, str(input_path)]
             elif spec.tool_id in {"lnkinfo", "sccainfo", "esedbinfo"}:
                 argv = [executable, str(input_path)]
             elif spec.tool_id == "plistutil":
@@ -1706,7 +1747,7 @@ class ExternalToolRunner:
         output_truncated = False
         return_code: int | None = None
         with tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(mode="w+b") as stderr_file:
-            environment = tool_environment()
+            environment = self._tool_environment()
             for key, value in (env_overrides or {}).items():
                 if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", key):
                     environment[key] = display_text(value, 256)
@@ -1775,6 +1816,14 @@ class ExternalToolRunner:
                 "output_truncated": output_truncated,
             }
 
+    def _tool_environment(self) -> dict[str, str]:
+        """Build the child environment once per job and copy it per process."""
+
+        with self._environment_cache_lock:
+            if self._environment_cache is None:
+                self._environment_cache = tool_environment()
+            return self._environment_cache.copy()
+
     @staticmethod
     def _terminate(process: subprocess.Popen[Any]) -> None:
         if os.name == "nt":
@@ -1802,37 +1851,41 @@ class ExternalToolRunner:
                 pass
 
     def _version(self, spec: ToolSpec, resolution: ResolvedTool, cwd: Path) -> str | None:
-        if spec.tool_id in self._version_cache:
-            return self._version_cache[spec.tool_id]
-        if spec.tool_id == "jpseek":
-            self._version_cache[spec.tool_id] = None
-            return None
-        version_args = {
-            "exiftool": ["-ver"], "gifsicle": ["--version"], "file": ["--version"],
-            "strings": ["--version"], "pngcheck": ["-h"], "jpeginfo": ["--version"],
-            "zsteg": ["--version"], "stegseek": ["--version"], "binwalk": ["--version"],
-            "tiffinfo": ["--version"], "webpinfo": ["-version"],
-            "exiv2": ["--version"], "identify": ["-version"], "pngcrush": ["-version"],
-            "jpegtran": ["-version"], "djpeg": ["-version"], "steghide": ["--version"],
-            "outguess": ["-h"], "7z": [], "tiffdump": ["--version"], "webpmux": ["-version"],
-            "tesseract": ["--version"], "zbarimg": ["--version"],
-            "foremost": ["-V"], "jpseek": [], "jsteg": ["--help"], "openstego": ["--version"],
-            "ffprobe": ["-version"], "ffmpeg_spectrogram": ["-version"], "ffmpeg_pcm": ["-version"],
-            "sox_stats": ["--version"], "sox_spectrogram": ["--version"],
-            "mediainfo": ["--Version"], "multimon_ng": ["--help"], "minimodem": ["--version"],
-            "lnkinfo": ["-V"], "sccainfo": ["-V"], "esedbinfo": ["-V"],
-            "plistutil": ["--version"], "qemu_img_info": ["--version"], "bulk_extractor": ["-V"],
-            "wtcdbinfo": ["-V"], "wtcdbexport": ["-V"], "utmpdump": ["--version"],
-            "journalctl": ["--version"],
-            "yara_x_dump": ["--version"], "capa": ["--version"], "floss": ["--version"],
-            "zeek": ["--version"], "plaso_timeline": ["--version"], "kaitai_dump": ["--version"],
-            "ileapp": ["--version"], "aleapp": ["--version"], "ffmpeg_frames": ["-version"],
-        }.get(spec.tool_id, ["--version"])
-        result = self._execute(self._launch_argv(resolution, version_args), cwd=cwd, timeout=4)
-        combined = (result["stdout"] or result["stderr"]).strip().splitlines()
-        version = display_text(combined[0], 300) if combined else None
-        self._version_cache[spec.tool_id] = version
-        return version
+        cache_key = f"{resolution.source}\0{resolution.launcher}\0{resolution.executable}"
+        with self._version_cache_lock:
+            if cache_key in self._version_cache:
+                return self._version_cache[cache_key]
+            if spec.tool_id == "jpseek":
+                self._version_cache[cache_key] = None
+                return None
+            version_args = {
+                "exiftool": ["-ver"], "gifsicle": ["--version"], "file": ["--version"],
+                "strings": ["--version"], "pngcheck": ["-h"], "jpeginfo": ["--version"],
+                "zsteg": ["--version"], "stegseek": ["--version"], "binwalk": ["--version"],
+                "tiffinfo": ["--version"], "webpinfo": ["-version"],
+                "exiv2": ["--version"], "identify": ["-version"], "pngcrush": ["-version"],
+                "jpegtran": ["-version"], "djpeg": ["-version"], "steghide": ["--version"],
+                "outguess": ["-h"], "7z": [], "tiffdump": ["--version"], "webpmux": ["-version"],
+                "tesseract": ["--version"], "zbarimg": ["--version"],
+                "foremost": ["-V"], "jpseek": [], "jsteg": ["--help"], "openstego": ["--version"],
+                "ffprobe": ["-version"], "ffmpeg_spectrogram": ["-version"], "ffmpeg_pcm": ["-version"],
+                "sox_stats": ["--version"], "sox_spectrogram": ["--version"],
+                "mediainfo": ["--Version"], "multimon_ng": ["--help"], "minimodem": ["--version"],
+                "lnkinfo": ["-V"], "sccainfo": ["-V"], "esedbinfo": ["-V"],
+                "h5dump": ["--version"], "h5dump_values": ["--version"],
+                "mdb_tables": ["--version"], "mdb_schema": ["--version"],
+                "plistutil": ["--version"], "qemu_img_info": ["--version"], "bulk_extractor": ["-V"],
+                "wtcdbinfo": ["-V"], "wtcdbexport": ["-V"], "utmpdump": ["--version"],
+                "journalctl": ["--version"],
+                "yara_x_dump": ["--version"], "capa": ["--version"], "floss": ["--version"],
+                "zeek": ["--version"], "plaso_timeline": ["--version"], "kaitai_dump": ["--version"],
+                "ileapp": ["--version"], "aleapp": ["--version"], "ffmpeg_frames": ["-version"],
+            }.get(spec.tool_id, ["--version"])
+            result = self._execute(self._launch_argv(resolution, version_args), cwd=cwd, timeout=4)
+            combined = (result["stdout"] or result["stderr"]).strip().splitlines()
+            version = display_text(combined[0], 300) if combined else None
+            self._version_cache[cache_key] = version
+            return version
 
     @staticmethod
     def _not_run(spec: ToolSpec, status: str, summary: str, executable: str | None = None) -> dict[str, Any]:

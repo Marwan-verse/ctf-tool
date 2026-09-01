@@ -45,6 +45,22 @@ from .artifacts import (
 )
 from .common import byte_entropy, display_text, iter_ascii_strings, iter_utf16_strings, safe_label, sniff_kind
 from .compression import DECODERS, CompressionError
+from .extended import (
+    parse_access_db,
+    parse_bson,
+    parse_firmware_text,
+    parse_git_object,
+    parse_hdf5,
+    parse_java_serialized,
+    parse_netpbm,
+    parse_opaque_container,
+    parse_psd,
+    parse_pyc,
+    parse_python_pickle,
+    parse_xcf,
+    parse_zip_application,
+    zip_directory_is_bounded,
+)
 from .programs import parse_dex, parse_elf, parse_java_class, parse_macho, parse_pe, parse_wasm
 from .structured import parse_bencode, parse_cbor, parse_msgpack, parse_protobuf
 from .video import parse_avi, parse_ebml_video, parse_iso_bmff
@@ -59,6 +75,11 @@ def analyze_format(kind: str, data: bytes, *, profile: str = "balanced") -> dict
         "webp": parse_webp,
         "tiff": parse_tiff,
         "ico": parse_ico,
+        "psd": parse_psd,
+        "xcf": parse_xcf,
+        "netpbm": parse_netpbm,
+        "heif": lambda source, selected: parse_iso_bmff(source, selected, kind="heif"),
+        "avif": lambda source, selected: parse_iso_bmff(source, selected, kind="avif"),
         "mp4": lambda source, selected: parse_iso_bmff(source, selected, kind="mp4"),
         "mov": lambda source, selected: parse_iso_bmff(source, selected, kind="mov"),
         "matroska": lambda source, selected: parse_ebml_video(source, selected, kind="matroska"),
@@ -70,6 +91,13 @@ def analyze_format(kind: str, data: bytes, *, profile: str = "balanced") -> dict
         "wasm": parse_wasm,
         "dex": parse_dex,
         "java_class": parse_java_class,
+        "java_serialized": parse_java_serialized,
+        "pyc": parse_pyc,
+        "python_pickle": parse_python_pickle,
+        "git_pack": parse_git_object,
+        "git_index": parse_git_object,
+        "intel_hex": lambda source, selected: parse_firmware_text(source, selected, kind="intel_hex"),
+        "srec": lambda source, selected: parse_firmware_text(source, selected, kind="srec"),
         "bencode": parse_bencode,
         "cbor": parse_cbor,
         "msgpack": parse_msgpack,
@@ -83,6 +111,15 @@ def analyze_format(kind: str, data: bytes, *, profile: str = "balanced") -> dict
         "ods": lambda source, selected: parse_document_package(source, selected, package_kind="ods"),
         "odp": lambda source, selected: parse_document_package(source, selected, package_kind="odp"),
         "epub": lambda source, selected: parse_document_package(source, selected, package_kind="epub"),
+        "xps": lambda source, selected: parse_zip_application(source, selected, package_kind="xps"),
+        "apk": lambda source, selected: parse_zip_application(source, selected, package_kind="apk"),
+        "aab": lambda source, selected: parse_zip_application(source, selected, package_kind="aab"),
+        "jar": lambda source, selected: parse_zip_application(source, selected, package_kind="jar"),
+        "war": lambda source, selected: parse_zip_application(source, selected, package_kind="war"),
+        "appx": lambda source, selected: parse_zip_application(source, selected, package_kind="appx"),
+        "msix": lambda source, selected: parse_zip_application(source, selected, package_kind="msix"),
+        "ipa": lambda source, selected: parse_zip_application(source, selected, package_kind="ipa"),
+        "nupkg": lambda source, selected: parse_zip_application(source, selected, package_kind="nupkg"),
         "android_backup": parse_android_backup,
         "binarycookies": parse_binarycookies,
         "ds_store": parse_ds_store,
@@ -94,12 +131,16 @@ def analyze_format(kind: str, data: bytes, *, profile: str = "balanced") -> dict
         "usn": parse_usn,
         "recycle_bin_i": parse_recycle_bin_i,
         "ese": parse_ese,
+        "access_db": parse_access_db,
+        "hdf5": parse_hdf5,
+        "bson": parse_bson,
         "qcow": lambda source, selected: parse_virtual_disk(source, selected, disk_kind="qcow"),
         "vmdk": lambda source, selected: parse_virtual_disk(source, selected, disk_kind="vmdk"),
         "vhdx": lambda source, selected: parse_virtual_disk(source, selected, disk_kind="vhdx"),
         "vdi": lambda source, selected: parse_virtual_disk(source, selected, disk_kind="vdi"),
         "dmg": lambda source, selected: parse_virtual_disk(source, selected, disk_kind="dmg"),
         "aff": lambda source, selected: parse_virtual_disk(source, selected, disk_kind="aff"),
+        "vhd": lambda source, selected: parse_opaque_container(source, selected, kind="vhd"),
         "pcap": parse_pcap,
         "pcapng": parse_pcapng,
         "sqlite": parse_sqlite,
@@ -123,6 +164,11 @@ def analyze_format(kind: str, data: bytes, *, profile: str = "balanced") -> dict
         "pst": parse_pst,
         "shar": parse_shar,
         "ar": parse_ar,
+        "cab": lambda source, selected: parse_opaque_container(source, selected, kind="cab"),
+        "cpio": lambda source, selected: parse_opaque_container(source, selected, kind="cpio"),
+        "rpm": lambda source, selected: parse_opaque_container(source, selected, kind="rpm"),
+        "xar": lambda source, selected: parse_opaque_container(source, selected, kind="xar"),
+        "onenote": lambda source, selected: parse_opaque_container(source, selected, kind="onenote"),
         "lzip": parse_lzip,
         "lz4": parse_lz4,
         "lzma": parse_lzma,
@@ -3923,6 +3969,12 @@ def parse_document_package(data: bytes, profile: str = "balanced", *, package_ki
     entry_limit = _DOCUMENT_PACKAGE_ENTRY_LIMIT
     member_limit = _DOCUMENT_PACKAGE_MEMBER_LIMIT * (2 if profile == "deep" else 1)
     total_limit = _DOCUMENT_PACKAGE_TOTAL_LIMIT * (4 if profile == "deep" else 1)
+    if not zip_directory_is_bounded(data, max_entries=_DOCUMENT_PACKAGE_ENTRY_LIMIT, max_directory_bytes=16 * 1024 * 1024):
+        result["findings"].append(_finding(
+            "warning", "resource-limit", "Document package directory rejected",
+            "The central directory is missing, multi-disk/Zip64, or exceeds the safe entry/byte limits.",
+        ))
+        return result
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
     except (OSError, ValueError, zipfile.BadZipFile):
@@ -4963,6 +5015,15 @@ def parse_pst(data: bytes, profile: str = "balanced") -> dict[str, Any]:
         "client_version": int.from_bytes(data[12:14], "little"),
         "platform_create": data[14], "platform_access": data[15],
     })
+    scan_limit = min(len(data), 16 * 1024 * 1024 if profile == "deep" else 4 * 1024 * 1024)
+    records = list(iter_ascii_strings(data[:scan_limit], minimum=6, limit=2_500))
+    records.extend(iter_utf16_strings(data[:scan_limit], minimum=6, limit=2_500))
+    if records:
+        result["text_records"].append({
+            "encoding": "pst-bounded-strings", "offset": None,
+            "text": display_text("\n".join(str(record["text"]) for record in records), 2_000_000),
+            "source": "PST/OST bounded raw strings", "confidence_hint": 5,
+        })
     result["findings"].append(_finding("info", "email", "Outlook PST/OST store detected", "Deep scans can list mailboxes and convert messages, attachments, and deleted items into recursively scanned artifacts with libpst."))
     return result
 

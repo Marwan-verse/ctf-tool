@@ -29,12 +29,14 @@ _DOCUMENT_EXTENSIONS = {
     ".txt", ".text", ".md", ".markdown", ".rst", ".log", ".csv", ".tsv",
     ".json", ".jsonl", ".ndjson", ".xml", ".yaml", ".yml", ".ini", ".cfg",
     ".conf", ".properties", ".toml", ".html", ".htm", ".xhtml", ".tex",
-    ".pdf", ".rtf", ".doc", ".xls", ".ppt", ".docx", ".xlsx", ".pptx",
-    ".odt", ".ods", ".odp", ".epub", ".eml",
+    ".pdf", ".rtf", ".doc", ".xls", ".ppt", ".docx", ".docm", ".dotx", ".dotm",
+    ".xlsx", ".xlsm", ".xltx", ".xltm", ".pptx", ".pptm", ".ppsx", ".ppsm",
+    ".odt", ".ods", ".odp", ".epub", ".xps", ".oxps", ".one", ".onetoc2", ".eml", ".mbox", ".pst", ".ost",
+    ".apk", ".aab", ".jar", ".war", ".ipa", ".appx", ".msix", ".nupkg",
 }
-_OOXML_EXTENSIONS = {".docx", ".xlsx", ".pptx"}
+_OOXML_EXTENSIONS = {".docx", ".docm", ".dotx", ".dotm", ".xlsx", ".xlsm", ".xltx", ".xltm", ".pptx", ".pptm", ".ppsx", ".ppsm"}
 _ODF_EXTENSIONS = {".odt", ".ods", ".odp"}
-_PACKAGE_KINDS = {"docx", "xlsx", "pptx", "odt", "ods", "odp", "epub"}
+_PACKAGE_KINDS = {"docx", "xlsx", "pptx", "odt", "ods", "odp", "epub", "xps", "apk", "aab", "jar", "war", "ipa", "appx", "msix", "nupkg"}
 
 
 class TextPreviewUnavailableError(ValueError):
@@ -61,6 +63,12 @@ def _strip_markup(payload: bytes) -> str:
     """
 
     source = payload.decode("utf-8", "replace")
+    # XPS stores rendered glyph text in UnicodeString attributes rather than
+    # ordinary XML text nodes. Preserve those values before removing tags.
+    xps_glyph_text = [
+        html.unescape(match.group(2))
+        for match in re.finditer(r"\bUnicodeString\s*=\s*(['\"])(.*?)\1", source, re.IGNORECASE | re.DOTALL)
+    ][:10_000]
     source = re.sub(r"<(?:w:)?(?:tab|br|cr)\b[^>]*/?>", "\t", source, flags=re.IGNORECASE)
     source = re.sub(r"</(?:w:)?(?:p|tr|tc)\s*>", "\n", source, flags=re.IGNORECASE)
     source = re.sub(r"</(?:text:p|text:h|table:table-row|table:table-cell)\s*>", "\n", source, flags=re.IGNORECASE)
@@ -69,13 +77,15 @@ def _strip_markup(payload: bytes) -> str:
     source = html.unescape(source).replace("\r\n", "\n").replace("\r", "\n")
     source = re.sub(r"[ \t]+\n", "\n", source)
     source = re.sub(r"\n{3,}", "\n\n", source)
+    if xps_glyph_text:
+        source = "\n".join(xps_glyph_text + ([source] if source.strip() else []))
     return display_text(source.strip(), MAX_PREVIEW_CHARS)
 
 
 def _package_member_names(archive: zipfile.ZipFile, extension: str) -> list[str]:
     names = [item.filename for item in archive.infolist() if not item.is_dir()]
     lowered = {name.casefold(): name for name in names}
-    if extension == ".docx" or "word/document.xml" in lowered:
+    if extension in {".docx", ".docm", ".dotx", ".dotm"} or "word/document.xml" in lowered:
         return [
             name for name in names
             if (
@@ -86,14 +96,14 @@ def _package_member_names(archive: zipfile.ZipFile, extension: str) -> list[str]
             )
             or name.casefold().startswith(("docprops/", "customxml/")) and name.casefold().endswith(".xml")
         ]
-    if extension == ".xlsx" or "xl/sharedstrings.xml" in lowered:
+    if extension in {".xlsx", ".xlsm", ".xltx", ".xltm"} or "xl/sharedstrings.xml" in lowered:
         return [
             name for name in names
             if name.casefold() in {"xl/sharedstrings.xml", "xl/workbook.xml"}
             or name.casefold().startswith(("xl/worksheets/", "xl/comments", "xl/threadedcomments/")) and name.casefold().endswith(".xml")
             or name.casefold().startswith(("docprops/", "customxml/")) and name.casefold().endswith(".xml")
         ]
-    if extension == ".pptx" or any(name.casefold().startswith("ppt/slides/slide") for name in names):
+    if extension in {".pptx", ".pptm", ".ppsx", ".ppsm"} or any(name.casefold().startswith("ppt/slides/slide") for name in names):
         return [
             name for name in names
             if (
@@ -107,6 +117,14 @@ def _package_member_names(archive: zipfile.ZipFile, extension: str) -> list[str]
         return [lowered[name] for name in ("content.xml", "meta.xml", "settings.xml") if name in lowered]
     if extension == ".epub" or "meta-inf/container.xml" in lowered:
         return [name for name in names if name.casefold().endswith((".xhtml", ".html", ".htm", ".opf", ".ncx"))]
+    if extension in {".xps", ".oxps"} or any("fixedpage" in name.casefold() for name in names):
+        return [name for name in names if name.casefold().endswith((".fpage", ".fdoc", ".fdseq", ".xml", ".rels"))]
+    if extension in {".apk", ".aab", ".jar", ".war", ".ipa", ".appx", ".msix", ".nupkg"}:
+        return [
+            name for name in names
+            if name.casefold().endswith((".xml", ".json", ".txt", ".properties", ".mf", ".html", ".xhtml"))
+            or any(marker in name.casefold() for marker in ("manifest", "package", "content_types"))
+        ]
     return []
 
 
@@ -242,7 +260,7 @@ def build_text_preview(path: Path, *, filename: str) -> dict[str, Any]:
     if kind == "text":
         text, encoding = _decode_text_document(data)
         labels = ["plain text"]
-    elif kind in {"pdf", "rtf", "eml"}:
+    elif kind in {"pdf", "rtf", "eml", "mbox", "pst", "onenote"}:
         text, labels = _preview_parser_records(kind, data)
         encoding = "extracted document text"
     elif kind == "ole" or extension in {".doc", ".xls", ".ppt"}:
