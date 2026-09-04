@@ -1,1 +1,0 @@
-fnir_VSF="${VSF}"

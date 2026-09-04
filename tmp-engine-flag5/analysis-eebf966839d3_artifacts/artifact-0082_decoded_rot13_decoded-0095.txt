@@ -1,1 +1,0 @@
-${ZQ5FHZ} -p >/qri/ahyy 2>&1 || ${rpub} 'synt': 'ZQ5 purpx snvyrq'
