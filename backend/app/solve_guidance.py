@@ -191,10 +191,10 @@ def build_solve_guidance(report: dict[str, Any]) -> dict[str, Any]:
             "Start with manifest/configuration text, signatures, executable members, and nested child artifacts.",
             target_tab="document", tool_ids=["7z_extract", "oleid"], action="inspect",
         ))
-    if detected in {"hdf5", "bson", "access_db", "sqlite", "sqlite_wal", "sqlite_journal", "leveldb", "ese"}:
+    if detected in {"hdf5", "parquet", "avro", "arrow_ipc", "orc", "bson", "access_db", "sqlite", "sqlite_wal", "sqlite_journal", "leveldb", "ese"}:
         recommendations.append(_recommendation(
             "inspect-database", 86, "Review structured records and database sidecars",
-            "Search keys, schema names, values, deleted/WAL records, and extracted binary fields before using a specialist reader.",
+            "Search keys, inert schema/footer text, values, deleted/WAL records, and extracted binary fields before using a specialist reader.",
             target_tab="metadata", tool_ids=["sqlite3", "esedbinfo"], action="inspect",
         ))
     if detected in {"java_serialized", "python_pickle"}:
@@ -203,11 +203,35 @@ def build_solve_guidance(report: dict[str, Any]) -> dict[str, Any]:
             "Prioritize string operands, global/class references, reducers, and embedded byte payloads; do not deserialize challenge data on the host.",
             target_tab="metadata", action="inspect",
         ))
-    if detected in {"intel_hex", "srec"}:
+    if detected in {"intel_hex", "srec", "android_sparse", "dtb", "uimage", "android_boot", "android_vendor_boot", "uefi_fv", "squashfs"}:
         recommendations.append(_recommendation(
             "inspect-firmware", 89, "Pivot into the reconstructed firmware image",
-            "The checksum-validated data records are available as a child artifact; inspect its signatures, strings, and nested filesystems.",
-            target_tab="artifacts", tool_ids=["binwalk", "foremost"], action="pivot",
+            "Review validated segments or device-tree properties, then inspect CRCs, boot arguments, embedded blobs, and nested filesystems.",
+            target_tab="artifacts", tool_ids=["binwalk", "foremost", "fdtdump", "dumpimage", "unsquashfs"], action="pivot",
+        ))
+    if detected in {"warc", "chm", "djvu"}:
+        recommendations.append(_recommendation(
+            "inspect-longtail-document", 88, "Review recovered document records and members",
+            "Start with bounded text/header records, then pivot into exact WARC payloads or specialist member listings without rendering active content.",
+            target_tab="document", tool_ids=["7z_extract", "djvudump"], action="inspect",
+        ))
+    if detected in {"dicom", "fits"}:
+        recommendations.append(_recommendation(
+            "inspect-scientific-image", 90, "Inspect scientific-image metadata and exact boundaries",
+            "Review DICOM text VRs or FITS cards, dimensions, non-zero preambles, pixel/data offsets, and evidence-backed trailing payloads.",
+            target_tab="document", tool_ids=["dcmdump", "identify"], action="inspect",
+        ))
+    if detected in {"qoi", "dds", "ktx", "openexr"}:
+        recommendations.append(_recommendation(
+            "inspect-texture-image", 88, "Inspect texture structure, metadata, and residue",
+            "Compare declared geometry and metadata with the logical end of the image, then pivot into any carved trailer or embedded value.",
+            target_tab="metadata", tool_ids=["identify", "exrheader"], action="inspect",
+        ))
+    if detected == "tnef":
+        recommendations.append(_recommendation(
+            "inspect-tnef", 90, "Inspect recovered winmail.dat attachments",
+            "Verify per-attribute checksums, message text, attachment names, and the recursively analyzed attachment artifacts.",
+            target_tab="artifacts", action="pivot",
         ))
     if missing_tools:
         recommendations.append(_recommendation(

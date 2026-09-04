@@ -1,4 +1,4 @@
-"""FastAPI control plane for the local Forenscope GUI."""
+"""FastAPI control plane for the local Remanence GUI."""
 
 from __future__ import annotations
 
@@ -268,7 +268,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             manager.shutdown()
 
     application = FastAPI(
-        title="Forenscope API",
+        title="Remanence API",
         summary="Local-first image, audio, and corrupted-file forensics control plane",
         version=__version__,
         docs_url="/api/docs",
@@ -321,7 +321,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.get("/", include_in_schema=False)
     async def root() -> dict[str, str]:
-        return {"name": "Forenscope API", "version": __version__, "health": "/api/health"}
+        return {"name": "Remanence API", "version": __version__, "health": "/api/health"}
 
     @application.get("/api/health", response_model=HealthResponse)
     async def health(request: Request) -> dict[str, Any]:
@@ -344,7 +344,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _invalidate_tool_capabilities()
         tools = await anyio.to_thread.run_sync(_tool_capabilities)
         return {
-            "name": "Forenscope Forensics Analyzer",
+            "name": "Remanence Forensics Analyzer",
             "version": __version__,
             "max_upload_bytes": configured_settings.max_upload_bytes,
             "profiles": [profile.value for profile in ScanProfile],
@@ -1268,7 +1268,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return Response(
             report_json_bytes(payload),
             media_type="application/json",
-            headers={"Content-Disposition": safe_content_disposition(f"forenscope-{identifier}.json")},
+            headers={"Content-Disposition": safe_content_disposition(f"remanence-{identifier}.json")},
         )
 
     @application.get("/api/jobs/{job_id}/report.html")
@@ -1282,7 +1282,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return HTMLResponse(
             render_html_report(payload),
             headers={
-                "Content-Disposition": safe_content_disposition(f"forenscope-{identifier}.html", inline=not download),
+                "Content-Disposition": safe_content_disposition(f"remanence-{identifier}.html", inline=not download),
                 "Content-Security-Policy": report_csp(),
             },
         )
@@ -1292,7 +1292,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _job, artifacts, payload = await export_context(request, job_id)
         configured_settings = _settings(request)
         temp_handle = tempfile.NamedTemporaryFile(
-            prefix="forenscope-report-",
+            prefix="remanence-report-",
             suffix=".zip",
             dir=configured_settings.temp_dir,
             delete=False,
@@ -1311,7 +1311,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return FileResponse(
             temp_path,
             media_type="application/zip",
-            headers={"Content-Disposition": safe_content_disposition(f"forenscope-{identifier}.zip")},
+            headers={"Content-Disposition": safe_content_disposition(f"remanence-{identifier}.zip")},
             background=BackgroundTask(temp_path.unlink, missing_ok=True),
         )
 

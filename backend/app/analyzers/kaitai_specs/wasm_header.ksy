@@ -1,5 +1,5 @@
 meta:
-  id: forenscope_webassembly
+  id: remanence_webassembly
   title: Bounded WebAssembly section table
   endian: le
 seq:

@@ -7,19 +7,24 @@ const geistMono = Geist_Mono({ variable: '--font-geist-mono', subsets: ['latin']
 
 export const metadata: Metadata = {
   metadataBase: new URL('http://localhost:3000'),
-  title: 'Forenscope — CTF Media Forensics',
-  description: 'A private, local-first image and audio forensics workbench for CTF investigations.',
+  title: 'Remanence — CTF File Forensics',
+  description: 'A private, local-first file-forensics workbench for CTF investigations.',
+  applicationName: 'Remanence',
+  icons: {
+    icon: '/remanence-logo.png',
+    apple: '/remanence-logo.png',
+  },
   openGraph: {
-    title: 'Forenscope — CTF Media Forensics',
-    description: 'Find what pixels and waveforms are hiding with a private, local-first forensic workbench.',
+    title: 'Remanence — CTF File Forensics',
+    description: 'Find what files are hiding with a private, local-first forensic workbench.',
     type: 'website',
-    images: [{ url: '/og.png', width: 1672, height: 941, alt: 'Forenscope media forensics workbench' }],
+    images: [{ url: '/remanence-logo.png', width: 1200, height: 1200, alt: 'Remanence CTF forensics logo' }],
   },
   twitter: {
-    card: 'summary_large_image',
-    title: 'Forenscope — CTF Media Forensics',
-    description: 'Find what pixels and waveforms are hiding with a private, local-first forensic workbench.',
-    images: ['/og.png'],
+    card: 'summary',
+    title: 'Remanence — CTF File Forensics',
+    description: 'Find what files are hiding with a private, local-first forensic workbench.',
+    images: ['/remanence-logo.png'],
   },
 };
 

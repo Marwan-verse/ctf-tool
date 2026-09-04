@@ -105,6 +105,19 @@ def test_document_preview_extracts_ooxml_text_without_rendering(tmp_path: Path) 
     assert preview["sources"] == ["word/document.xml"]
 
 
+def test_scientific_and_firmware_metadata_get_plain_text_previews(tmp_path: Path) -> None:
+    card = lambda value: value.encode("ascii").ljust(80, b" ")
+    fits_path = tmp_path / "challenge.fits"
+    fits_path.write_bytes((card("SIMPLE  =                    T") + card("NAXIS   =                    0") + card("COMMENT flag{fits_preview}") + card("END")).ljust(2880, b" "))
+
+    preview = build_text_preview(fits_path, filename=fits_path.name)
+
+    assert preview["kind"] == "fits"
+    assert preview["encoding"] == "extracted document text"
+    assert "flag{fits_preview}" in preview["text"]
+    assert preview["sources"] == ["FITS HDU header cards"]
+
+
 def test_macro_ooxml_and_xps_packages_get_plain_text_previews(tmp_path: Path) -> None:
     macro_path = tmp_path / "challenge.docm"
     macro_path.write_bytes(_docx_with_text("flag{macro_document_preview}"))

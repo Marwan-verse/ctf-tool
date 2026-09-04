@@ -22,10 +22,13 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .app-shell-loading { grid-template-columns: 1fr; place-items: center; color: var(--green); }
 .app-shell-loading > div { display: grid; justify-items: center; gap: 12px; }
 .app-shell-loading p { margin: 0; color: var(--muted); font-size: 12px; }
-.loading-mark { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 13px; color: #10291f; background: var(--lime); font-family: var(--font-geist-mono); font-weight: 800; }
+.loading-mark { width: 78px; height: 78px; display: grid; place-items: center; overflow: hidden; border: 1px solid rgba(71,219,255,.45); border-radius: 22px; background: #07131c; box-shadow: 0 0 0 5px rgba(105,231,255,.09), 0 18px 45px rgba(23,99,163,.2); }
+.loading-mark img { width: 100%; height: 100%; object-fit: cover; }
 .sidebar { position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; padding: 28px 20px 22px; background: #10291f; color: #edf8f1; border-right: 1px solid rgba(255,255,255,.07); }
 .brand { display: flex; align-items: center; gap: 12px; padding: 0 8px 34px; }
-.brand-mark { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 12px; color: #10291f; background: var(--lime); font-family: var(--font-geist-mono); font-weight: 800; box-shadow: inset 0 0 0 1px rgba(17,52,37,.15); }
+.brand-mark { width: 46px; height: 46px; flex: 0 0 46px; display: grid; place-items: center; overflow: hidden; border: 1px solid rgba(83,223,255,.42); border-radius: 14px; background: #07131c; box-shadow: 0 0 0 3px rgba(84,225,255,.07), 0 9px 24px rgba(0,0,0,.25); }
+.brand-logo { width: 100%; height: 100%; object-fit: cover; transition: transform .2s ease, filter .2s ease; }
+.brand-button:hover .brand-logo { transform: scale(1.06); filter: saturate(1.15) brightness(1.06); }
 .brand strong, .brand small { display: block; }
 .brand strong { font-size: 15px; letter-spacing: -.02em; }
 .brand small { margin-top: 2px; color: #91aa9c; font-size: 11px; }
@@ -132,6 +135,7 @@ button, a { -webkit-tap-highlight-color: transparent; }
   .sidebar { position: static; width: 100%; height: 62px; flex-direction: row; align-items: center; padding: 10px 16px; }
   .brand { padding: 0; }
   .brand > span:last-child { display: block; }
+  .screen-setup .new-scan { display: none; }
   .sidebar nav, .privacy-card { display: none; }
   .workspace { padding: 24px 16px 40px; }
   .topbar { align-items: flex-start; }

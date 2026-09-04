@@ -1,23 +1,23 @@
-name: forenscope
+name: remanence
 
 services:
   backend:
     build:
       context: ./backend
     environment:
-      FORENSCOPE_ALLOWED_HOSTS: "localhost,127.0.0.1,[::1],backend,testserver"
-      FORENSCOPE_ALLOWED_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000"
-      FORENSCOPE_DATA_DIR: /data
-      FORENSCOPE_DB_PATH: /data/forenscope.sqlite3
-      FORENSCOPE_MAX_UPLOAD_BYTES: ${FORENSCOPE_MAX_UPLOAD_BYTES:-104857600}
-      FORENSCOPE_MAX_WORKERS: ${FORENSCOPE_MAX_WORKERS:-2}
+      REMANENCE_ALLOWED_HOSTS: "localhost,127.0.0.1,[::1],backend,testserver"
+      REMANENCE_ALLOWED_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000"
+      REMANENCE_DATA_DIR: /data
+      REMANENCE_DB_PATH: /data/remanence.sqlite3
+      REMANENCE_MAX_UPLOAD_BYTES: ${REMANENCE_MAX_UPLOAD_BYTES:-104857600}
+      REMANENCE_MAX_WORKERS: ${REMANENCE_MAX_WORKERS:-2}
       PYTHONUNBUFFERED: "1"
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      - forenscope-data:/data
+      - remanence-data:/data
     networks:
-      - forenscope-local
+      - remanence-local
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=256m
@@ -40,7 +40,7 @@ services:
     ports:
       - "127.0.0.1:3000:3000"
     networks:
-      - forenscope-local
+      - remanence-local
     depends_on:
       backend:
         condition: service_healthy
@@ -55,8 +55,8 @@ services:
     stop_grace_period: 15s
 
 networks:
-  forenscope-local:
+  remanence-local:
     internal: true
 
 volumes:
-  forenscope-data:
+  remanence-data:

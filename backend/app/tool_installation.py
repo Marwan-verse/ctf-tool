@@ -44,6 +44,13 @@ WSL_APT_PACKAGES: dict[str, tuple[str, ...]] = {
     "webpmux": ("webp",),
     "gifsicle": ("gifsicle",),
     "gifsicle_repair": ("gifsicle",),
+    "dcmdump": ("dcmtk",),
+    "exrheader": ("openexr",),
+    "fdtdump": ("device-tree-compiler",),
+    "dumpimage": ("u-boot-tools",),
+    "unsquashfs": ("squashfs-tools",),
+    "djvudump": ("djvulibre-bin",),
+    "djvutxt": ("djvulibre-bin",),
     "zipfix": ("zip",),
     "zipfix_deep": ("zip",),
     "pdfinfo": ("poppler-utils",),
@@ -166,7 +173,7 @@ VOLATILITY3_VERSION = "2.28.0"
 PYTHON_EVTX_VERSION = "0.8.1"
 JPSEEK_BUILD_SCRIPT = rf"""
 set -eu
-build_dir="$(mktemp -d /tmp/forenscope-jphs.XXXXXX)"
+build_dir="$(mktemp -d /tmp/remanence-jphs.XXXXXX)"
 cleanup() {{ rm -rf -- "$build_dir"; }}
 trap cleanup EXIT
 git clone --quiet https://github.com/h3xx/jphs.git "$build_dir"
@@ -186,19 +193,19 @@ install -m 0755 jpseek /usr/local/bin/jpseek
 """.strip()
 VOLATILITY3_INSTALL_SCRIPT = rf"""
 set -eu
-install_root=/opt/forenscope-volatility3
+install_root=/opt/remanence-volatility3
 python3 -m venv "$install_root"
 "$install_root/bin/python" -m pip install --disable-pip-version-check --no-input "volatility3=={VOLATILITY3_VERSION}"
 ln -sfn "$install_root/bin/vol" /usr/local/bin/vol
 """.strip()
 PYTHON_EVTX_INSTALL_SCRIPT = rf"""
 set -eu
-install_root=/opt/forenscope-python-evtx
+install_root=/opt/remanence-python-evtx
 python3 -m venv "$install_root"
 "$install_root/bin/python" -m pip install --disable-pip-version-check --no-input "python-evtx=={PYTHON_EVTX_VERSION}"
 wrapper="$install_root/bin/evtx_dump.py"
 printf '%s\n' \
-    '#!/opt/forenscope-python-evtx/bin/python' \
+    '#!/opt/remanence-python-evtx/bin/python' \
     'import sys' \
     'from Evtx.Evtx import Evtx' \
     'if len(sys.argv) != 2:' \

@@ -33,6 +33,9 @@ _DOCUMENT_EXTENSIONS = {
     ".xlsx", ".xlsm", ".xltx", ".xltm", ".pptx", ".pptm", ".ppsx", ".ppsm",
     ".odt", ".ods", ".odp", ".epub", ".xps", ".oxps", ".one", ".onetoc2", ".eml", ".mbox", ".pst", ".ost",
     ".apk", ".aab", ".jar", ".war", ".ipa", ".appx", ".msix", ".nupkg",
+    ".dcm", ".dicom", ".fits", ".fit", ".fts", ".ktx", ".ktx2", ".exr", ".sxr", ".mxr", ".dxr",
+    ".dtb", ".dtbo", ".tnef", ".parquet", ".avro", ".arrow", ".feather", ".orc",
+    ".warc", ".chm", ".chi", ".chw", ".djvu", ".djv", ".uimg", ".uimage", ".bootimg", ".vendor_boot", ".fv", ".fd", ".squashfs", ".sqfs",
 }
 _OOXML_EXTENSIONS = {".docx", ".docm", ".dotx", ".dotm", ".xlsx", ".xlsm", ".xltx", ".xltm", ".pptx", ".pptm", ".ppsx", ".ppsm"}
 _ODF_EXTENSIONS = {".odt", ".ods", ".odp"}
@@ -260,7 +263,11 @@ def build_text_preview(path: Path, *, filename: str) -> dict[str, Any]:
     if kind == "text":
         text, encoding = _decode_text_document(data)
         labels = ["plain text"]
-    elif kind in {"pdf", "rtf", "eml", "mbox", "pst", "onenote"}:
+    elif kind in {
+        "pdf", "rtf", "eml", "mbox", "pst", "onenote", "dicom", "fits", "ktx", "openexr", "dtb", "tnef",
+        "parquet", "avro", "arrow_ipc", "orc", "warc", "chm", "djvu", "uimage", "android_boot",
+        "android_vendor_boot", "uefi_fv", "squashfs",
+    }:
         text, labels = _preview_parser_records(kind, data)
         encoding = "extracted document text"
     elif kind == "ole" or extension in {".doc", ".xls", ".ppt"}:

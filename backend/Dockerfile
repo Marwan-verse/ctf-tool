@@ -8,9 +8,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
-    FORENSCOPE_DATA_DIR=/data \
-    FORENSCOPE_DB_PATH=/data/forenscope.sqlite3 \
-    FORENSCOPE_ALLOWED_HOSTS=localhost,127.0.0.1,[::1],backend \
+    REMANENCE_DATA_DIR=/data \
+    REMANENCE_DB_PATH=/data/remanence.sqlite3 \
+    REMANENCE_ALLOWED_HOSTS=localhost,127.0.0.1,[::1],backend \
     MAGICK_MEMORY_LIMIT=256MiB \
     MAGICK_MAP_LIMIT=512MiB \
     MAGICK_DISK_LIMIT=1GiB \
@@ -49,16 +49,16 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*
 
-WORKDIR /opt/forenscope
+WORKDIR /opt/remanence
 
 COPY pyproject.toml ./
 COPY app ./app
 
 RUN python -m pip install . \
-    && groupadd --gid 10001 forenscope \
-    && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin forenscope \
+    && groupadd --gid 10001 remanence \
+    && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin remanence \
     && mkdir -p /data/jobs /data/tmp \
-    && chown -R forenscope:forenscope /data /opt/forenscope
+    && chown -R remanence:remanence /data /opt/remanence
 
 USER 10001:10001
 

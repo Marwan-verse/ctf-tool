@@ -1,5 +1,6 @@
 'use client';
 
+import Image from 'next/image';
 import { type CSSProperties, type ClipboardEvent, type DragEvent, type FormEvent, type KeyboardEvent, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 
 type Profile = 'quick' | 'balanced' | 'deep';
@@ -314,7 +315,7 @@ const API_BASE = (
   process.env.NEXT_PUBLIC_API_URL
   || (typeof window !== 'undefined' ? `${window.location.protocol}//${window.location.hostname}:8000` : 'http://localhost:8000')
 ).replace(/\/$/, '');
-const UI_PREFERENCES_KEY = 'forenscope.ui-preferences.v1';
+const UI_PREFERENCES_KEY = 'remanence.ui-preferences.v1';
 const DEFAULT_UI_PREFERENCES: UiPreferences = { theme: 'light', zoom: 100 };
 const UI_ZOOM_MIN = 100;
 const UI_ZOOM_MAX = 160;
@@ -463,7 +464,7 @@ const resultTabs: Array<{ id: ResultTab; label: string }> = [
   { id: 'methods', label: 'Coverage & logs' },
 ];
 const AUDIO_CAPABILITY_KINDS = new Set(['audio', 'wav', 'aiff', 'flac', 'ogg', 'mp3', 'aac', 'm4a', 'au', 'asf', 'amr', 'caf', 'midi']);
-const IMAGE_CAPABILITY_KINDS = new Set(['png', 'jpeg', 'gif', 'bmp', 'webp', 'tiff', 'ico', 'psd', 'xcf', 'netpbm', 'heif', 'avif']);
+const IMAGE_CAPABILITY_KINDS = new Set(['png', 'jpeg', 'gif', 'bmp', 'webp', 'tiff', 'ico', 'psd', 'xcf', 'netpbm', 'heif', 'avif', 'qoi', 'dds', 'ktx', 'openexr', 'dicom', 'fits']);
 
 function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
   const startsWith = (...values: number[]) => values.every((value, index) => bytes[index] === value);
@@ -475,6 +476,8 @@ function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
     bmp: 'BMP image', webp: 'WebP image', svg: 'SVG document', tif: 'TIFF image', tiff: 'TIFF image', ico: 'ICO image',
     psd: 'Photoshop PSD image', psb: 'Photoshop PSB image', xcf: 'GIMP XCF image', pbm: 'Netpbm bitmap', pgm: 'Netpbm grayscale image', ppm: 'Netpbm color image', pnm: 'Netpbm image', pam: 'Netpbm image',
     heif: 'HEIF image', heic: 'HEIC image', avif: 'AVIF image',
+    qoi: 'QOI image', dds: 'DirectDraw Surface texture', ktx: 'KTX texture', ktx2: 'KTX2 texture', exr: 'OpenEXR image', sxr: 'OpenEXR image', mxr: 'OpenEXR image', dxr: 'Deep OpenEXR image',
+    dcm: 'DICOM medical image', dicom: 'DICOM medical image', fits: 'FITS scientific image', fit: 'FITS scientific image', fts: 'FITS scientific image',
     wav: 'WAV audio', wave: 'WAV audio', mp3: 'MP3 audio', flac: 'FLAC audio', ogg: 'Ogg audio', opus: 'Opus audio',
     m4a: 'M4A / AAC audio', aac: 'AAC audio', aif: 'AIFF audio', aiff: 'AIFF audio', au: 'AU audio', snd: 'AU audio',
     wma: 'WMA audio', amr: 'AMR audio', caf: 'CAF audio', mid: 'MIDI file', midi: 'MIDI file',
@@ -494,7 +497,11 @@ function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
     msgpack: 'MessagePack structured data', mpk: 'MessagePack structured data',
     pb: 'Protocol Buffers data', protobuf: 'Protocol Buffers data',
     h5: 'HDF5 data', hdf5: 'HDF5 data', bson: 'BSON data', mdb: 'Access Jet database', accdb: 'Access ACE database',
+    parquet: 'Apache Parquet dataset', avro: 'Apache Avro object container', arrow: 'Apache Arrow IPC file', feather: 'Feather V2 / Arrow IPC file', orc: 'Apache ORC dataset',
     ser: 'Java serialized object', pyc: 'Python bytecode', pkl: 'Python pickle', pickle: 'Python pickle', pack: 'Git pack', idx: 'Git index', hex: 'Intel HEX firmware', srec: 'Motorola S-record firmware',
+    simg: 'Android sparse image', sparse: 'Android sparse image', dtb: 'Flattened device tree', dtbo: 'Device-tree overlay', tnef: 'Microsoft TNEF / winmail.dat',
+    uimg: 'U-Boot legacy image', uimage: 'U-Boot legacy image', bootimg: 'Android boot image', vendor_boot: 'Android vendor boot image', fv: 'UEFI firmware volume', fd: 'UEFI firmware volume', squashfs: 'SquashFS filesystem', sqfs: 'SquashFS filesystem',
+    warc: 'WARC web archive', chm: 'Compiled HTML Help container', chi: 'Compiled HTML Help index', chw: 'Compiled HTML Help index', djvu: 'DjVu document', djv: 'DjVu document',
   };
 
   if (startsWith(0x89, 0x50, 0x4e, 0x47)) return { label: 'PNG image', source: 'content' };
@@ -504,6 +511,13 @@ function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
   if (ascii(0, 4) === '8BPS') return { label: 'Photoshop PSD/PSB image', source: 'content' };
   if (ascii(0, 9) === 'gimp xcf ') return { label: 'GIMP XCF image', source: 'content' };
   if (/^P[1-7][\s#]/.test(ascii(0, 3))) return { label: 'Netpbm image', source: 'content' };
+  if (ascii(0, 4) === 'qoif') return { label: 'QOI image', source: 'content' };
+  if (ascii(0, 4) === 'DDS ') return { label: 'DirectDraw Surface texture', source: 'content' };
+  if (startsWith(0xab, 0x4b, 0x54, 0x58, 0x20, 0x31, 0x31, 0xbb)) return { label: 'KTX1 texture', source: 'content' };
+  if (startsWith(0xab, 0x4b, 0x54, 0x58, 0x20, 0x32, 0x30, 0xbb)) return { label: 'KTX2 texture', source: 'content' };
+  if (startsWith(0x76, 0x2f, 0x31, 0x01)) return { label: 'OpenEXR image', source: 'content' };
+  if (ascii(128, 4) === 'DICM') return { label: 'DICOM medical image', source: 'content' };
+  if (ascii(0, 9) === 'SIMPLE  =') return { label: 'FITS scientific image', source: 'content' };
   if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP') return { label: 'WebP image', source: 'content' };
   if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WAVE') return { label: 'WAV audio', source: 'content' };
   if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'AVI ') return { label: 'AVI video', source: 'content' };
@@ -540,6 +554,21 @@ function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
   if (ascii(0, 4) === 'regf') return { label: 'Windows registry hive', source: 'content' };
   if (ascii(0, 4) === '!BDN') return { label: 'Outlook PST / OST store', source: 'content' };
   if (startsWith(0xac, 0xed, 0x00, 0x05)) return { label: 'Java serialized object', source: 'content' };
+  if (startsWith(0x27, 0x05, 0x19, 0x56)) return { label: 'U-Boot legacy image', source: 'content' };
+  if (ascii(0, 8) === 'ANDROID!') return { label: 'Android boot image', source: 'content' };
+  if (ascii(0, 8) === 'VNDRBOOT') return { label: 'Android vendor boot image', source: 'content' };
+  if (startsWith(0x3a, 0xff, 0x26, 0xed)) return { label: 'Android sparse image', source: 'content' };
+  if (startsWith(0xd0, 0x0d, 0xfe, 0xed)) return { label: 'Flattened device tree', source: 'content' };
+  if (startsWith(0x78, 0x9f, 0x3e, 0x22)) return { label: 'Microsoft TNEF / winmail.dat', source: 'content' };
+  if (ascii(0, 4) === 'PAR1' || ascii(0, 4) === 'PARE') return { label: 'Apache Parquet dataset', source: 'content' };
+  if (ascii(0, 4) === 'Obj\u0001') return { label: 'Apache Avro object container', source: 'content' };
+  if (ascii(0, 6) === 'ARROW1') return { label: 'Apache Arrow IPC file', source: 'content' };
+  if (ascii(0, 3) === 'ORC') return { label: 'Apache ORC dataset', source: 'content' };
+  if (/^WARC\/1\.[01]/.test(ascii(0, 10))) return { label: 'WARC web archive', source: 'content' };
+  if (ascii(0, 4) === 'ITSF') return { label: 'Compiled HTML Help container', source: 'content' };
+  if (ascii(0, 8) === 'AT&TFORM') return { label: 'DjVu document', source: 'content' };
+  if (ascii(40, 4) === '_FVH') return { label: 'UEFI firmware volume', source: 'content' };
+  if (ascii(0, 4) === 'hsqs') return { label: 'SquashFS filesystem', source: 'content' };
   if (ascii(0, 4) === 'PACK') return { label: 'Git pack', source: 'content' };
   if (ascii(0, 4) === 'DIRC') return { label: 'Git index', source: 'content' };
   if (startsWith(0x7f, 0x45, 0x4c, 0x46)) return { label: 'ELF executable', source: 'content' };
@@ -553,7 +582,7 @@ function clientFileTypeFromBytes(bytes: Uint8Array, file: File): FileDetection {
   if (ascii(0, 4) === 'MThd') return { label: 'MIDI file', source: 'content' };
   if (ascii(0, 5).trimStart().startsWith('<svg')) return { label: 'SVG image', source: 'content' };
   if (/^(From:|Received:|MIME-Version:|Subject:)/m.test(ascii(0, 1024))) return { label: 'RFC 5322 email', source: 'content' };
-  if (extension && ['torrent', 'bencode', 'cbor', 'cborseq', 'cose', 'msgpack', 'mpk', 'pb', 'protobuf', 'bson', 'pyc', 'pkl', 'pickle', 'hex', 'srec'].includes(extension)) return { label: extensionLabels[extension], source: 'extension' };
+  if (extension && ['torrent', 'bencode', 'cbor', 'cborseq', 'cose', 'msgpack', 'mpk', 'pb', 'protobuf', 'bson', 'pyc', 'pkl', 'pickle', 'hex', 'srec', 'qoi', 'dds', 'ktx', 'ktx2', 'exr', 'sxr', 'mxr', 'dxr', 'dcm', 'dicom', 'fits', 'fit', 'fts', 'simg', 'sparse', 'dtb', 'dtbo', 'tnef', 'parquet', 'avro', 'arrow', 'feather', 'orc', 'uimg', 'uimage', 'bootimg', 'vendor_boot', 'fv', 'fd', 'squashfs', 'sqfs', 'warc', 'chm', 'chi', 'chw', 'djvu', 'djv'].includes(extension)) return { label: extensionLabels[extension], source: 'extension' };
   if (file.type.startsWith('text/')) return { label: 'Plain text document', source: 'browser' };
   if (file.type) return { label: file.type, source: 'browser' };
   if (extension && extensionLabels[extension]) return { label: extensionLabels[extension], source: 'extension' };
@@ -763,6 +792,9 @@ const TEXT_DOCUMENT_EXTENSIONS = new Set([
   'pdf', 'rtf', 'doc', 'xls', 'ppt', 'docx', 'docm', 'dotx', 'dotm', 'xlsx', 'xlsm', 'xltx', 'xltm', 'pptx', 'pptm', 'ppsx', 'ppsm',
   'odt', 'ods', 'odp', 'epub', 'xps', 'oxps', 'one', 'onetoc2', 'eml', 'mbox', 'pst', 'ost',
   'apk', 'aab', 'jar', 'war', 'ipa', 'appx', 'msix', 'nupkg',
+  'dcm', 'dicom', 'fits', 'fit', 'fts', 'ktx', 'ktx2', 'exr', 'sxr', 'mxr', 'dxr', 'dtb', 'dtbo', 'tnef',
+  'parquet', 'avro', 'arrow', 'feather', 'orc', 'warc', 'chm', 'chi', 'chw', 'djvu', 'djv',
+  'uimg', 'uimage', 'bootimg', 'vendor_boot', 'fv', 'fd', 'squashfs', 'sqfs',
 ]);
 const TEXT_DOCUMENT_MEDIA_TYPES = new Set([
   'application/pdf', 'application/rtf', 'text/rtf', 'message/rfc822', 'application/msword', 'application/vnd.ms-excel', 'application/vnd.ms-powerpoint',
@@ -770,6 +802,10 @@ const TEXT_DOCUMENT_MEDIA_TYPES = new Set([
   'application/vnd.oasis.opendocument.text', 'application/vnd.oasis.opendocument.spreadsheet', 'application/vnd.oasis.opendocument.presentation', 'application/epub+zip',
   'application/vnd.ms-xpsdocument', 'application/onenote', 'application/mbox', 'application/vnd.ms-outlook',
   'application/vnd.android.package-archive', 'application/java-archive', 'application/vnd.ms-appx', 'application/x-ios-app',
+  'application/dicom', 'image/fits', 'image/ktx', 'image/x-exr', 'application/x-dtb', 'application/vnd.ms-tnef',
+  'application/vnd.apache.parquet', 'application/avro', 'application/vnd.apache.arrow.file', 'application/vnd.apache.orc',
+  'application/warc', 'application/vnd.ms-htmlhelp', 'image/vnd.djvu', 'application/x-u-boot-image',
+  'application/x-android-boot-image', 'application/x-android-vendor-boot-image', 'application/x-uefi-firmware-volume', 'application/vnd.squashfs',
 ]);
 function artifactSupportsTextPreview(artifact: Artifact) {
   const extension = artifactName(artifact).split('.').pop()?.toLowerCase() || '';
@@ -777,7 +813,7 @@ function artifactSupportsTextPreview(artifact: Artifact) {
   return TEXT_DOCUMENT_EXTENSIONS.has(extension)
     || mediaType.startsWith('text/')
     || TEXT_DOCUMENT_MEDIA_TYPES.has(mediaType)
-    || ['text', 'pdf', 'rtf', 'ole', 'eml', 'mbox', 'pst', 'onenote', 'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp', 'epub', 'xps', 'apk', 'aab', 'jar', 'war', 'ipa', 'appx', 'msix', 'nupkg'].includes(String(artifact.kind || artifact.detected_type || '').toLowerCase());
+    || ['text', 'pdf', 'rtf', 'ole', 'eml', 'mbox', 'pst', 'onenote', 'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp', 'epub', 'xps', 'apk', 'aab', 'jar', 'war', 'ipa', 'appx', 'msix', 'nupkg', 'dicom', 'fits', 'ktx', 'openexr', 'dtb', 'tnef', 'parquet', 'avro', 'arrow_ipc', 'orc', 'warc', 'chm', 'djvu', 'uimage', 'android_boot', 'android_vendor_boot', 'uefi_fv', 'squashfs'].includes(String(artifact.kind || artifact.detected_type || '').toLowerCase());
 }
 function artifactPreviewUrl(artifact: Artifact) {
   const raw = artifact.preview_url;
@@ -1449,7 +1485,7 @@ function HomeWorkbench() {
   const artifacts = useMemo(() => job?.artifacts?.length ? job.artifacts : getArtifacts(result), [job, result]);
   const sourceDetectedKind = String(result?.source?.detected_type || '').toLowerCase();
   const textPreviewArtifacts = useMemo(() => artifacts.filter((artifact) => artifactSupportsTextPreview(artifact) || (
-    artifact.kind === 'original' && ['text', 'pdf', 'rtf', 'ole', 'eml', 'mbox', 'pst', 'onenote', 'zip', 'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp', 'epub', 'xps', 'apk', 'aab', 'jar', 'war', 'ipa', 'appx', 'msix', 'nupkg'].includes(sourceDetectedKind)
+    artifact.kind === 'original' && ['text', 'pdf', 'rtf', 'ole', 'eml', 'mbox', 'pst', 'onenote', 'zip', 'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp', 'epub', 'xps', 'apk', 'aab', 'jar', 'war', 'ipa', 'appx', 'msix', 'nupkg', 'dicom', 'fits', 'ktx', 'openexr', 'dtb', 'tnef'].includes(sourceDetectedKind)
   )), [artifacts, sourceDetectedKind]);
   const selectedTextPreviewArtifact = useMemo(() => {
     const selected = textPreviewArtifacts.find((artifact) => artifactId(artifact) === textPreviewArtifactId);
@@ -2150,8 +2186,8 @@ function HomeWorkbench() {
     <main className={`app-shell theme-${uiPreferences.theme}`} data-interface-zoom={uiPreferences.zoom}>
       <aside className="sidebar">
         <button className="brand brand-button" onClick={resetScan} aria-label="Return to new scan">
-          <span className="brand-mark" aria-hidden="true">F</span>
-          <span><strong>Forenscope</strong><small>CTF workbench</small></span>
+          <span className="brand-mark" aria-hidden="true"><Image className="brand-logo" src="/remanence-logo.png" alt="" width={46} height={46} priority /></span>
+          <span><strong>Remanence</strong><small>CTF workbench</small></span>
         </button>
 
         <nav aria-label="Forensics workspace">
@@ -2480,7 +2516,7 @@ function HomeWorkbench() {
               {activeTab === 'repairs' && (
                 <section className="tab-panel repair-lab-panel">
                   <div className="section-title"><div><p className="eyebrow">Non-destructive recovery</p><h2>Repair laboratory</h2></div><span>{repairArtifacts.length} candidate{repairArtifacts.length === 1 ? '' : 's'} · source preserved</span></div>
-                  <p className="panel-lede">Forenscope records only bounded, derived copies. Download a candidate for review; it never replaces the uploaded evidence or changes its original hash.</p>
+                  <p className="panel-lede">Remanence records only bounded, derived copies. Download a candidate for review; it never replaces the uploaded evidence or changes its original hash.</p>
 
                   {uncropArtifacts.length > 0 && <section className="uncrop-recovery-banner">
                     <span>▣</span>
@@ -2603,7 +2639,7 @@ function HomeWorkbench() {
               {activeTab === 'document' && selectedTextPreviewArtifact && (
                 <section className="tab-panel document-preview-panel">
                   <div className="section-title"><div><p className="eyebrow">Read-only extracted evidence</p><h2>Document text</h2></div><span>{textPreview ? `${textPreview.character_count?.toLocaleString() || 0} characters · ${textPreview.line_count?.toLocaleString() || 0} lines` : 'Loading bounded preview'}</span></div>
-                  <p className="panel-lede">This view extracts readable text locally from text files, PDF, RTF, mail, and supported Office document packages. It never renders document HTML, opens Office, or runs embedded code.</p>
+                  <p className="panel-lede">This view extracts readable text locally from text files, documents, mail, package manifests, scientific-image headers, and device-tree metadata. It never renders document HTML, opens Office, deserializes objects, or runs embedded code.</p>
                   <div className="document-preview-toolbar">
                     <label><span>Artifact</span><select value={artifactId(selectedTextPreviewArtifact)} onChange={(event) => setTextPreviewArtifactId(event.target.value)}>{textPreviewArtifacts.map((artifact) => <option key={artifactId(artifact)} value={artifactId(artifact)}>{artifactName(artifact)} · {formatBytes(artifactSize(artifact))}</option>)}</select></label>
                     <a href={normalizeUrl(selectedTextPreviewArtifact.download_url) || `${API_BASE}/api/jobs/${jobId}/artifacts/${artifactId(selectedTextPreviewArtifact)}/download`}>Download original ↓</a>
@@ -2914,7 +2950,7 @@ const getServerSnapshot = () => false;
 export default function Home() {
   const hydrated = useSyncExternalStore(subscribeToNothing, getClientSnapshot, getServerSnapshot);
   if (!hydrated) {
-    return <main className="app-shell app-shell-loading" aria-busy="true" suppressHydrationWarning><div><span className="loading-mark">F</span><p>Loading forensic workbench…</p></div></main>;
+    return <main className="app-shell app-shell-loading" aria-busy="true" suppressHydrationWarning><div><span className="loading-mark"><Image src="/remanence-logo.png" alt="" width={78} height={78} priority /></span><p>Loading Remanence…</p></div></main>;
   }
   return <HomeWorkbench />;
 }

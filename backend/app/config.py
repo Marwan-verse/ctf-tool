@@ -1,4 +1,4 @@
-"""Runtime configuration for the local Forenscope control plane."""
+"""Runtime configuration for the local Remanence control plane."""
 
 from __future__ import annotations
 
@@ -18,8 +18,19 @@ DEFAULT_ALLOWED_ORIGINS = (
 DEFAULT_ALLOWED_HOSTS = ("localhost", "127.0.0.1", "[::1]", "testserver")
 
 
+def _environment(name: str) -> str | None:
+    """Read a Remanence setting while accepting the former prefix for upgrades."""
+
+    value = os.getenv(name)
+    if value is not None:
+        return value
+    if name.startswith("REMANENCE_"):
+        return os.getenv(f"FORENSCOPE_{name.removeprefix('REMANENCE_')}")
+    return None
+
+
 def _positive_int(name: str, default: int, *, minimum: int = 1) -> int:
-    raw = os.getenv(name)
+    raw = _environment(name)
     if raw is None:
         return default
     try:
@@ -32,7 +43,7 @@ def _positive_int(name: str, default: int, *, minimum: int = 1) -> int:
 
 
 def _positive_float(name: str, default: float, *, minimum: float = 0.01) -> float:
-    raw = os.getenv(name)
+    raw = _environment(name)
     if raw is None:
         return default
     try:
@@ -76,44 +87,48 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         backend_dir = Path(__file__).resolve().parents[1]
-        data_dir = Path(os.getenv("FORENSCOPE_DATA_DIR", str(backend_dir / "data"))).expanduser().resolve()
-        database_raw = os.getenv("FORENSCOPE_DB_PATH")
+        data_dir = Path(_environment("REMANENCE_DATA_DIR") or str(backend_dir / "data")).expanduser().resolve()
+        database_raw = _environment("REMANENCE_DB_PATH")
+        default_database = data_dir / "remanence.sqlite3"
+        legacy_database = data_dir / "forenscope.sqlite3"
+        if not default_database.exists() and legacy_database.exists():
+            default_database = legacy_database
         database_path = (
             Path(database_raw).expanduser().resolve()
             if database_raw
-            else (data_dir / "forenscope.sqlite3").resolve()
+            else default_database.resolve()
         )
 
-        origins_raw = os.getenv("FORENSCOPE_ALLOWED_ORIGINS")
+        origins_raw = _environment("REMANENCE_ALLOWED_ORIGINS")
         origins = (
             tuple(item.strip().rstrip("/") for item in origins_raw.split(",") if item.strip())
             if origins_raw
             else DEFAULT_ALLOWED_ORIGINS
         )
         if not origins or any(not _is_loopback_origin(origin) for origin in origins):
-            raise ValueError("FORENSCOPE_ALLOWED_ORIGINS may contain only loopback HTTP(S) origins")
+            raise ValueError("REMANENCE_ALLOWED_ORIGINS may contain only loopback HTTP(S) origins")
 
-        hosts_raw = os.getenv("FORENSCOPE_ALLOWED_HOSTS")
+        hosts_raw = _environment("REMANENCE_ALLOWED_HOSTS")
         hosts = (
             tuple(item.strip() for item in hosts_raw.split(",") if item.strip())
             if hosts_raw
             else DEFAULT_ALLOWED_HOSTS
         )
         if not hosts:
-            raise ValueError("FORENSCOPE_ALLOWED_HOSTS cannot be empty")
+            raise ValueError("REMANENCE_ALLOWED_HOSTS cannot be empty")
 
         return cls(
             data_dir=data_dir,
             database_path=database_path,
             jobs_dir=(data_dir / "jobs").resolve(),
             temp_dir=(data_dir / "tmp").resolve(),
-            max_upload_bytes=_positive_int("FORENSCOPE_MAX_UPLOAD_BYTES", 100 * MEBIBYTE),
-            max_workers=_positive_int("FORENSCOPE_MAX_WORKERS", 2),
-            max_artifacts=_positive_int("FORENSCOPE_MAX_ARTIFACTS", 500),
-            max_report_bytes=_positive_int("FORENSCOPE_MAX_REPORT_BYTES", 25 * MEBIBYTE),
-            event_poll_seconds=_positive_float("FORENSCOPE_EVENT_POLL_SECONDS", 0.35),
-            rate_limit_per_minute=_positive_int("FORENSCOPE_RATE_LIMIT", 300),
-            upload_limit_per_minute=_positive_int("FORENSCOPE_UPLOAD_RATE_LIMIT", 12),
+            max_upload_bytes=_positive_int("REMANENCE_MAX_UPLOAD_BYTES", 100 * MEBIBYTE),
+            max_workers=_positive_int("REMANENCE_MAX_WORKERS", 2),
+            max_artifacts=_positive_int("REMANENCE_MAX_ARTIFACTS", 500),
+            max_report_bytes=_positive_int("REMANENCE_MAX_REPORT_BYTES", 25 * MEBIBYTE),
+            event_poll_seconds=_positive_float("REMANENCE_EVENT_POLL_SECONDS", 0.35),
+            rate_limit_per_minute=_positive_int("REMANENCE_RATE_LIMIT", 300),
+            upload_limit_per_minute=_positive_int("REMANENCE_UPLOAD_RATE_LIMIT", 12),
             allowed_origins=origins,
             allowed_hosts=hosts,
         )

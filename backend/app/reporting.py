@@ -448,7 +448,7 @@ def build_export_payload(job: Mapping[str, Any], artifacts: Sequence[Mapping[str
     return {
         "schema_version": "1.0",
         "exported_at": _utc_now(),
-        "application": {"name": "Forenscope", "section": section},
+        "application": {"name": "Remanence", "section": section},
         "job": {key: value for key, value in public_job.items() if key not in {"result", "artifacts"}},
         "result": result,
         "artifacts": public_job["artifacts"],
@@ -512,8 +512,8 @@ def render_html_report(payload: Mapping[str, Any]) -> str:
     status = str(job.get("status") or "unknown")
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Forenscope report — {e(job.get('original_filename'))}</title><style>{REPORT_CSS}</style></head>
-<body><main><header><div class="eyebrow">Forenscope · Image analysis</div><h1>Forensic analysis report</h1>
+<title>Remanence report — {e(job.get('original_filename'))}</title><style>{REPORT_CSS}</style></head>
+<body><main><header><div class="eyebrow">Remanence · File analysis</div><h1>Forensic analysis report</h1>
 <p class="muted">Reproducible evidence summary for <strong>{e(job.get('original_filename'))}</strong></p>
 <div class="grid"><div class="metric"><span>Status</span><strong class="{e(status)}">{e(status.upper())}</strong></div>
 <div class="metric"><span>Profile</span><strong>{e(job.get('profile'))}</strong></div>
@@ -522,7 +522,7 @@ def render_html_report(payload: Mapping[str, Any]) -> str:
 <section><h2>Candidate flags</h2>{candidate_table}</section>
 <section><h2>Artifacts</h2>{artifact_table}</section>
 <section><h2>Complete structured result</h2><pre>{detailed_json}</pre></section>
-<footer>Generated locally by Forenscope at {e(payload.get('exported_at'))}. The source evidence was not modified.</footer>
+<footer>Generated locally by Remanence at {e(payload.get('exported_at'))}. The source evidence was not modified.</footer>
 </main></body></html>"""
 
 

@@ -8,7 +8,7 @@ import time
 import zipfile
 from typing import Any, Iterable
 
-from .common import display_text, iter_ascii_strings, iter_utf16_strings, sniff_kind
+from .common import display_text, iter_ascii_strings, iter_utf16_strings, safe_label, sniff_kind
 
 
 def _result(kind: str) -> dict[str, Any]:
@@ -571,7 +571,7 @@ def parse_zip_application(data: bytes, profile: str = "balanced", *, package_kin
                 continue
             name = info.filename.replace("\\", "/")
             lowered_name = name.casefold()
-            eligible = lowered_name.endswith((".xml", ".rels", ".json", ".txt", ".properties", ".mf", ".html", ".xhtml")) or any(marker in lowered_name for marker in text_names)
+            eligible = lowered_name.endswith((".xml", ".rels", ".json", ".txt", ".properties", ".mf", ".html", ".xhtml", ".xaml", ".fpage", ".fdoc", ".fdseq")) or any(marker in lowered_name for marker in text_names)
             if not eligible or total_read >= total_limit or info.compress_size and info.file_size / max(1, info.compress_size) > 200:
                 continue
             try:
@@ -589,6 +589,711 @@ def parse_zip_application(data: bytes, profile: str = "balanced", *, package_kin
                 result["text_records"].append({"encoding": "zip-package-member-strings", "offset": None, "text": display_text("\n".join(str(item["text"]) for item in strings), 500_000), "source": f"{package_kind.upper()} member:{display_text(name, 240)}", "confidence_hint": 8})
         result["properties"].update({"text_members_scanned": scanned, "text_member_bytes_read": total_read, "entry_listing_truncated": len(infos) > entry_limit})
     result["findings"].append(_finding("info", "package", f"{package_kind.upper()} package inspected", "Package entries were read in memory with per-member, total-size, entry-count, and compression-ratio limits."))
+    return result
+
+
+_DICOM_LONG_VR = {"OB", "OD", "OF", "OL", "OV", "OW", "SQ", "SV", "UC", "UR", "UT", "UN", "UV"}
+_DICOM_TEXT_VR = {"AE", "AS", "CS", "DA", "DS", "DT", "IS", "LO", "LT", "PN", "SH", "ST", "TM", "UC", "UI", "UR", "UT"}
+_DICOM_TAGS: dict[tuple[int, int], tuple[str, str]] = {
+    (0x0002, 0x0002): ("media_storage_sop_class_uid", "UI"),
+    (0x0002, 0x0003): ("media_storage_sop_instance_uid", "UI"),
+    (0x0002, 0x0010): ("transfer_syntax_uid", "UI"),
+    (0x0002, 0x0012): ("implementation_class_uid", "UI"),
+    (0x0008, 0x0008): ("image_type", "CS"),
+    (0x0008, 0x0020): ("study_date", "DA"),
+    (0x0008, 0x0030): ("study_time", "TM"),
+    (0x0008, 0x0060): ("modality", "CS"),
+    (0x0008, 0x1030): ("study_description", "LO"),
+    (0x0008, 0x103E): ("series_description", "LO"),
+    (0x0010, 0x0010): ("patient_name", "PN"),
+    (0x0010, 0x0020): ("patient_id", "LO"),
+    (0x0018, 0x1030): ("protocol_name", "LO"),
+    (0x0020, 0x0011): ("series_number", "IS"),
+    (0x0020, 0x0013): ("instance_number", "IS"),
+    (0x0028, 0x0008): ("number_of_frames", "IS"),
+    (0x0028, 0x0010): ("rows", "US"),
+    (0x0028, 0x0011): ("columns", "US"),
+    (0x0028, 0x0100): ("bits_allocated", "US"),
+    (0x7FE0, 0x0010): ("pixel_data", "OB"),
+}
+
+
+def _dicom_element(
+    data: bytes,
+    cursor: int,
+    end: int,
+    *,
+    endian: str,
+    explicit_vr: bool,
+) -> tuple[tuple[int, int], str, int | None, int, int]:
+    if cursor + 8 > end:
+        raise ValueError("truncated DICOM element header")
+    group, element = struct.unpack_from(f"{endian}HH", data, cursor)
+    if explicit_vr:
+        raw_vr = data[cursor + 4:cursor + 6]
+        if len(raw_vr) != 2 or not raw_vr.isalpha() or not raw_vr.isupper():
+            raise ValueError("invalid explicit DICOM value representation")
+        vr = raw_vr.decode("ascii")
+        if vr in _DICOM_LONG_VR:
+            if cursor + 12 > end:
+                raise ValueError("truncated long DICOM element header")
+            length = struct.unpack_from(f"{endian}I", data, cursor + 8)[0]
+            value_offset = cursor + 12
+        else:
+            length = struct.unpack_from(f"{endian}H", data, cursor + 6)[0]
+            value_offset = cursor + 8
+    else:
+        vr = _DICOM_TAGS.get((group, element), ("", "UN"))[1]
+        length = struct.unpack_from(f"{endian}I", data, cursor + 4)[0]
+        value_offset = cursor + 8
+    if length == 0xFFFFFFFF:
+        return (group, element), vr, None, value_offset, value_offset
+    if length > end - value_offset:
+        raise ValueError("DICOM element exceeds retained bytes")
+    return (group, element), vr, length, value_offset, value_offset + length
+
+
+def parse_dicom(data: bytes, profile: str = "balanced") -> dict[str, Any]:
+    """Inspect a Part 10 DICOM stream without decoding pixel data."""
+
+    result = _result("dicom")
+    if len(data) < 132 or data[128:132] != b"DICM":
+        result["findings"].append(_finding("error", "structure", "Invalid DICOM Part 10 header", "The 128-byte preamble and DICM prefix are missing or truncated."))
+        return result
+    preamble = data[:128]
+    result["properties"].update({"file_size": len(data), "preamble_nonzero_bytes": sum(value != 0 for value in preamble)})
+    preamble_kind = sniff_kind(preamble)
+    if any(preamble) and preamble_kind not in {"binary", "text"}:
+        result["extracted"].append({
+            "label": "dicom_preamble_payload",
+            "data": preamble,
+            "kind": preamble_kind,
+            "offset": 0,
+            "transformation": "extract non-zero DICOM preamble",
+            "parameters": {"bytes": 128},
+        })
+
+    scan_end = min(len(data), 64 * 1024 * 1024 if profile == "deep" else 16 * 1024 * 1024)
+    cursor = 132
+    transfer_syntax = "1.2.840.10008.1.2.1"
+    values: list[str] = []
+    elements = 0
+    malformed: str | None = None
+    deadline = time.monotonic() + (8.0 if profile == "deep" else 3.0)
+
+    while cursor + 8 <= scan_end and elements < 20_000:
+        group = int.from_bytes(data[cursor:cursor + 2], "little")
+        if group != 0x0002:
+            break
+        try:
+            tag, vr, length, value_offset, next_cursor = _dicom_element(data, cursor, scan_end, endian="<", explicit_vr=True)
+        except ValueError as exc:
+            malformed = display_text(exc, 300)
+            break
+        if length is None:
+            malformed = "undefined-length file meta element"
+            break
+        payload = data[value_offset:next_cursor]
+        name = _DICOM_TAGS.get(tag, (f"tag_{tag[0]:04x}_{tag[1]:04x}", vr))[0]
+        if vr in _DICOM_TEXT_VR and length <= 1_000_000:
+            value = payload.rstrip(b"\0 ").decode("utf-8", "replace")
+            if value:
+                values.append(f"({tag[0]:04X},{tag[1]:04X}) {name} [{vr}] = {value}")
+                if name == "transfer_syntax_uid":
+                    transfer_syntax = value
+                result["metadata"][name] = display_text(value, 16_384)
+        cursor = next_cursor
+        elements += 1
+
+    endian = ">" if transfer_syntax == "1.2.840.10008.1.2.2" else "<"
+    explicit_vr = transfer_syntax != "1.2.840.10008.1.2"
+    pixel_offset: int | None = None
+    pixel_length: int | None = None
+    while cursor + 8 <= scan_end and elements < (100_000 if profile == "deep" else 40_000) and time.monotonic() <= deadline:
+        try:
+            tag, vr, length, value_offset, next_cursor = _dicom_element(data, cursor, scan_end, endian=endian, explicit_vr=explicit_vr)
+        except ValueError as exc:
+            malformed = display_text(exc, 300)
+            break
+        name, expected_vr = _DICOM_TAGS.get(tag, (f"tag_{tag[0]:04x}_{tag[1]:04x}", vr))
+        if tag == (0x7FE0, 0x0010):
+            pixel_offset, pixel_length = value_offset, length
+            if length is None:
+                malformed = "encapsulated undefined-length pixel data was not traversed"
+            break
+        if length is None:
+            malformed = f"undefined-length {name}; nested sequences were not traversed"
+            break
+        payload = data[value_offset:next_cursor]
+        effective_vr = vr if explicit_vr else expected_vr
+        if effective_vr in _DICOM_TEXT_VR and length <= 1_000_000:
+            value = payload.rstrip(b"\0 ").decode("utf-8", "replace")
+            if value:
+                values.append(f"({tag[0]:04X},{tag[1]:04X}) {name} [{effective_vr}] = {value}")
+                if tag in _DICOM_TAGS:
+                    result["metadata"][name] = display_text(value, 16_384)
+        elif effective_vr in {"US", "SS"} and length in {2, 4, 6, 8} and tag in _DICOM_TAGS:
+            signed = effective_vr == "SS"
+            width = 2
+            numbers = [int.from_bytes(payload[index:index + width], "little" if endian == "<" else "big", signed=signed) for index in range(0, length, width)]
+            result["properties"][name] = numbers[0] if len(numbers) == 1 else numbers
+        cursor = next_cursor
+        elements += 1
+
+    result["properties"].update({
+        "transfer_syntax_uid": transfer_syntax,
+        "explicit_vr": explicit_vr,
+        "byte_order": "big-endian" if endian == ">" else "little-endian",
+        "elements_scanned": elements,
+        "bytes_scanned": min(cursor, scan_end),
+        "pixel_data_offset": pixel_offset,
+        "pixel_data_length": pixel_length,
+        "parser_stop": malformed,
+        "input_truncated": len(data) > scan_end,
+    })
+    if values:
+        result["text_records"].append({"encoding": "dicom-text-vr", "offset": 132, "text": display_text("\n".join(values), 2_000_000), "source": "DICOM text-valued data elements", "confidence_hint": 10})
+    if malformed:
+        result["findings"].append(_finding("info", "structure", "DICOM traversal stopped conservatively", "The parser retained completed elements and stopped before an unsupported or incomplete structure.", reason=malformed))
+    return result
+
+
+def parse_fits(data: bytes, profile: str = "balanced") -> dict[str, Any]:
+    """Parse bounded FITS HDUs and carve only bytes after their padded end."""
+
+    result = _result("fits")
+    if len(data) < 80 or not data[:30].startswith(b"SIMPLE  ="):
+        result["findings"].append(_finding("error", "structure", "Invalid FITS primary header", "The first 80-byte card does not begin with the required SIMPLE keyword."))
+        return result
+    card_limit = 100_000 if profile == "deep" else 25_000
+    hdu_limit = 1_024 if profile == "deep" else 256
+    all_cards: list[str] = []
+    summaries: list[dict[str, Any]] = []
+    primary_values: dict[str, str] = {}
+    cursor = 0
+    cards_scanned = 0
+    incomplete: str | None = None
+
+    for hdu_index in range(hdu_limit):
+        if cursor + 80 > len(data):
+            break
+        prefix = data[cursor:cursor + 8]
+        if hdu_index == 0 and prefix != b"SIMPLE  ":
+            incomplete = "primary HDU does not start with SIMPLE"
+            break
+        if hdu_index > 0 and prefix not in {b"XTENSION", b"SIMPLE  "}:
+            break
+        header_start = cursor
+        values: dict[str, str] = {}
+        cards: list[str] = []
+        end_offset: int | None = None
+        while cursor + 80 <= len(data) and cards_scanned < card_limit:
+            raw = data[cursor:cursor + 80]
+            card = raw.decode("ascii", "replace")
+            keyword = card[:8].strip()
+            if keyword:
+                cards.append(card.rstrip())
+            if card[8:10] == "= ":
+                values[keyword] = card[10:].split("/", 1)[0].strip()
+            cursor += 80
+            cards_scanned += 1
+            if keyword == "END":
+                end_offset = cursor
+                break
+        if end_offset is None:
+            incomplete = f"HDU {hdu_index} has no END card within the bounded scan"
+            break
+        header_bytes = ((end_offset - header_start + 2879) // 2880) * 2880
+        data_start = header_start + header_bytes
+        if data_start > len(data):
+            incomplete = f"HDU {hdu_index} header padding exceeds retained bytes"
+            break
+
+        def integer(keyword: str, default: int = 0) -> int:
+            try:
+                return int(values.get(keyword, str(default)).strip().strip("'"))
+            except ValueError:
+                return default
+
+        bitpix = integer("BITPIX")
+        naxis = max(0, min(999, integer("NAXIS")))
+        if naxis > 16:
+            incomplete = f"HDU {hdu_index} declares more than 16 dimensions"
+            break
+        axes = [max(0, integer(f"NAXIS{axis}")) for axis in range(1, naxis + 1)]
+        elements = 1
+        for axis in axes:
+            elements *= axis
+            if elements > 1 << 60:
+                incomplete = f"HDU {hdu_index} dimensions exceed the safe arithmetic limit"
+                break
+        if incomplete:
+            break
+        bytes_per_value = abs(bitpix) // 8 if bitpix and abs(bitpix) % 8 == 0 else 0
+        pcount = max(0, integer("PCOUNT"))
+        gcount = max(1, integer("GCOUNT", 1))
+        expected_data = bytes_per_value * gcount * (elements + pcount) if naxis > 0 and bytes_per_value else 0
+        padded_data_bytes = ((expected_data + 2879) // 2880) * 2880
+        logical_end = data_start + padded_data_bytes
+        if logical_end > len(data):
+            incomplete = f"HDU {hdu_index} data exceeds retained bytes"
+            break
+        hdu_type = "PRIMARY" if hdu_index == 0 else values.get("XTENSION", "EXTENSION").strip().strip("'")
+        summaries.append({"index": hdu_index, "type": hdu_type, "header_offset": header_start, "header_bytes": header_bytes, "data_offset": data_start, "data_bytes": expected_data, "padded_end": logical_end, "bitpix": bitpix, "axes": axes})
+        all_cards.extend([f"[HDU {hdu_index} {hdu_type}]", *cards])
+        if hdu_index == 0:
+            primary_values = values
+        cursor = logical_end
+
+    if len(summaries) >= hdu_limit and data[cursor:cursor + 8] in {b"XTENSION", b"SIMPLE  "}:
+        incomplete = "FITS HDU traversal reached the profile HDU limit"
+    trailer_bytes = max(0, len(data) - cursor)
+    primary = summaries[0] if summaries else {}
+    result["properties"].update({
+        "hdu_count": len(summaries), "cards": cards_scanned, "hdus": summaries[:256],
+        "header_bytes": primary.get("header_bytes"), "bitpix": primary.get("bitpix"), "naxis": len(primary.get("axes", [])),
+        "axes": primary.get("axes", []), "expected_primary_data_bytes": primary.get("data_bytes"),
+        "expected_primary_hdu_end": primary.get("padded_end"), "logical_file_end": cursor,
+        "trailing_bytes": trailer_bytes, "header_scan_bounded": cards_scanned >= card_limit,
+        "parser_stop": incomplete,
+    })
+    for key in ("OBJECT", "TELESCOP", "INSTRUME", "OBSERVER", "DATE", "DATE-OBS", "ORIGIN", "EXTEND"):
+        if key in primary_values:
+            result["metadata"][key.casefold().replace("-", "_")] = display_text(primary_values[key].strip().strip("'"), 16_384)
+    if all_cards:
+        result["text_records"].append({"encoding": "fits-80-byte-cards", "offset": 0, "text": display_text("\n".join(all_cards), 2_000_000), "source": "FITS HDU header cards", "confidence_hint": 10})
+    if incomplete:
+        result["findings"].append(_finding("warning", "structure", "FITS traversal stopped", "Completed HDUs were retained before an incomplete or unsafe header/data declaration.", reason=incomplete))
+    trailer_limit = 64 * 1024 * 1024 if profile == "deep" else 16 * 1024 * 1024
+    if summaries and not incomplete and 0 < trailer_bytes <= trailer_limit:
+        trailer = data[cursor:]
+        if any(trailer):
+            result["extracted"].append({"label": "fits_trailing_payload", "data": trailer, "kind": sniff_kind(trailer), "offset": cursor, "transformation": "extract bytes after the final padded FITS HDU", "parameters": {"bytes": len(trailer), "hdus": len(summaries)}})
+    return result
+
+
+def parse_qoi(data: bytes, profile: str = "balanced") -> dict[str, Any]:
+    result = _result("qoi")
+    if len(data) < 22 or not data.startswith(b"qoif"):
+        result["findings"].append(_finding("error", "structure", "Invalid QOI header", "The qoif header or minimum end marker is missing."))
+        return result
+    width = int.from_bytes(data[4:8], "big")
+    height = int.from_bytes(data[8:12], "big")
+    channels, colorspace = data[12], data[13]
+    target_pixels = width * height
+    cursor = 14
+    decoded_pixels = 0
+    chunks = 0
+    limit = min(len(data), 192 * 1024 * 1024 if profile == "deep" else 96 * 1024 * 1024)
+    chunk_limit = {"quick": 500_000, "balanced": 2_000_000, "deep": 5_000_000}.get(profile, 2_000_000)
+    deadline = time.monotonic() + (5.0 if profile == "deep" else 2.0)
+    while cursor < limit and decoded_pixels < target_pixels and chunks < chunk_limit and time.monotonic() <= deadline:
+        opcode = data[cursor]
+        cursor += 1
+        if opcode == 0xFE:
+            cursor += 3
+            decoded_pixels += 1
+        elif opcode == 0xFF:
+            cursor += 4
+            decoded_pixels += 1
+        elif opcode & 0xC0 == 0x80:
+            cursor += 1
+            decoded_pixels += 1
+        elif opcode & 0xC0 == 0xC0:
+            decoded_pixels += (opcode & 0x3F) + 1
+        else:
+            decoded_pixels += 1
+        chunks += 1
+        if cursor > limit:
+            break
+    marker_valid = decoded_pixels == target_pixels and data[cursor:cursor + 8] == b"\0\0\0\0\0\0\0\x01"
+    logical_end = cursor + 8 if marker_valid else cursor
+    trailer_bytes = max(0, len(data) - logical_end) if marker_valid else 0
+    scan_bounded = not marker_valid and (chunks >= chunk_limit or time.monotonic() > deadline)
+    result["properties"].update({
+        "width": width, "height": height, "channels": channels, "colorspace": colorspace,
+        "target_pixels": target_pixels, "decoded_pixels": decoded_pixels, "chunks_scanned": chunks,
+        "end_marker_valid": marker_valid, "logical_end": logical_end if marker_valid else None,
+        "trailing_bytes": trailer_bytes, "geometry_valid": width > 0 and height > 0 and channels in {3, 4} and colorspace in {0, 1},
+        "scan_bounded": scan_bounded,
+    })
+    if scan_bounded:
+        result["findings"].append(_finding("info", "resource-limit", "QOI chunk traversal reached its profile limit", "No logical trailer was emitted because the canonical end marker was not reached within the chunk/time budget.", chunks=chunks, chunk_limit=chunk_limit))
+    elif not marker_valid:
+        result["findings"].append(_finding("warning", "structure", "QOI stream did not reach its canonical end marker", "Chunk lengths or the declared pixel count do not match the available bytes."))
+    trailer_limit = 64 * 1024 * 1024 if profile == "deep" else 16 * 1024 * 1024
+    if 0 < trailer_bytes <= trailer_limit:
+        trailer = data[logical_end:]
+        result["extracted"].append({"label": "qoi_trailing_payload", "data": trailer, "kind": sniff_kind(trailer), "offset": logical_end, "transformation": "extract bytes after canonical QOI end marker", "parameters": {"bytes": len(trailer)}})
+    return result
+
+
+def parse_dds(data: bytes, profile: str = "balanced") -> dict[str, Any]:
+    result = _result("dds")
+    if len(data) < 128 or data[:4] != b"DDS " or int.from_bytes(data[4:8], "little") != 124:
+        result["findings"].append(_finding("error", "structure", "Invalid DDS header", "DDS magic and the 124-byte base header are required."))
+        return result
+    pixel_format_size = int.from_bytes(data[76:80], "little")
+    fourcc = data[84:88].rstrip(b"\0").decode("ascii", "replace")
+    has_dx10 = fourcc == "DX10" and len(data) >= 148
+    result["properties"].update({
+        "flags": f"0x{int.from_bytes(data[8:12], 'little'):08x}",
+        "height": int.from_bytes(data[12:16], "little"), "width": int.from_bytes(data[16:20], "little"),
+        "pitch_or_linear_size": int.from_bytes(data[20:24], "little"), "depth": int.from_bytes(data[24:28], "little"),
+        "mipmap_count": int.from_bytes(data[28:32], "little"), "pixel_format_size": pixel_format_size,
+        "pixel_format_flags": f"0x{int.from_bytes(data[80:84], 'little'):08x}", "fourcc": fourcc or None,
+        "rgb_bit_count": int.from_bytes(data[88:92], "little"), "caps": f"0x{int.from_bytes(data[108:112], 'little'):08x}",
+        "has_dx10_header": has_dx10, "pixel_data_offset": 148 if has_dx10 else 128,
+    })
+    if has_dx10:
+        result["properties"].update({"dxgi_format": int.from_bytes(data[128:132], "little"), "resource_dimension": int.from_bytes(data[132:136], "little"), "array_size": int.from_bytes(data[140:144], "little")})
+    if pixel_format_size != 32:
+        result["findings"].append(_finding("warning", "structure", "Unexpected DDS pixel-format size", "The DDS_PIXELFORMAT structure should be 32 bytes.", declared=pixel_format_size))
+    _append_bounded_strings(result, data[: min(len(data), 4 * 1024 * 1024)], source="DDS header and texture strings", profile=profile, confidence=6)
+    return result
+
+
+_KTX1_IDENTIFIER = b"\xabKTX 11\xbb\r\n\x1a\n"
+_KTX2_IDENTIFIER = b"\xabKTX 20\xbb\r\n\x1a\n"
+
+
+def _ktx_key_values(data: bytes, offset: int, length: int, *, endian: str) -> list[str]:
+    if offset < 0 or length < 0 or offset + length > len(data) or length > 32 * 1024 * 1024:
+        return []
+    cursor, end = offset, offset + length
+    records: list[str] = []
+    while cursor + 4 <= end and len(records) < 10_000:
+        size = int.from_bytes(data[cursor:cursor + 4], "little" if endian == "<" else "big")
+        cursor += 4
+        if size <= 0 or size > end - cursor:
+            break
+        payload = data[cursor:cursor + size]
+        key, separator, value = payload.partition(b"\0")
+        rendered_key = key.decode("utf-8", "replace")
+        if separator:
+            rendered_value = value.rstrip(b"\0").decode("utf-8", "replace")
+            records.append(f"{rendered_key}={display_text(rendered_value, 16_384)}")
+        else:
+            records.append(display_text(rendered_key, 16_384))
+        cursor += size
+        cursor = (cursor + 3) & ~3
+    return records
+
+
+def parse_ktx(data: bytes, profile: str = "balanced") -> dict[str, Any]:
+    result = _result("ktx")
+    if data.startswith(_KTX1_IDENTIFIER) and len(data) >= 64:
+        endian_marker = data[12:16]
+        endian = "<" if endian_marker == b"\x01\x02\x03\x04" else ">" if endian_marker == b"\x04\x03\x02\x01" else ""
+        if not endian:
+            result["findings"].append(_finding("error", "structure", "Invalid KTX1 endianness marker", "The KTX1 byte-order marker is not recognized."))
+            return result
+        fields = struct.unpack_from(f"{endian}12I", data, 16)
+        gl_type, type_size, gl_format, internal_format, base_format, width, height, depth, arrays, faces, levels, kv_bytes = fields
+        kv_offset = 64
+        records = _ktx_key_values(data, kv_offset, kv_bytes, endian=endian)
+        result["properties"].update({"version": 1, "byte_order": "little-endian" if endian == "<" else "big-endian", "gl_type": gl_type, "type_size": type_size, "gl_format": gl_format, "gl_internal_format": internal_format, "gl_base_internal_format": base_format, "width": width, "height": height, "depth": depth, "array_elements": arrays, "faces": faces, "mipmap_levels": levels, "key_value_bytes": kv_bytes, "image_data_offset": kv_offset + kv_bytes})
+    elif data.startswith(_KTX2_IDENTIFIER) and len(data) >= 80:
+        fields = struct.unpack_from("<9I4I2Q", data, 12)
+        vk_format, type_size, width, height, depth, layers, faces, levels, supercompression, dfd_offset, dfd_length, kv_offset, kv_length, sgd_offset, sgd_length = fields
+        records = _ktx_key_values(data, kv_offset, kv_length, endian="<")
+        result["properties"].update({"version": 2, "vk_format": vk_format, "type_size": type_size, "width": width, "height": height, "depth": depth, "layers": layers, "faces": faces, "levels": levels, "supercompression_scheme": supercompression, "dfd_offset": dfd_offset, "dfd_bytes": dfd_length, "key_value_offset": kv_offset, "key_value_bytes": kv_length, "supercompression_global_offset": sgd_offset, "supercompression_global_bytes": sgd_length})
+    else:
+        result["findings"].append(_finding("error", "structure", "Invalid KTX header", "Neither the KTX1 nor KTX2 identifier and minimum header were found."))
+        return result
+    if records:
+        result["text_records"].append({"encoding": "ktx-key-value-data", "offset": None, "text": display_text("\n".join(records), 1_000_000), "source": "KTX metadata", "confidence_hint": 10})
+    return result
+
+
+def _bounded_cstring(data: bytes, cursor: int, end: int, maximum: int = 65_536) -> tuple[str, int]:
+    terminator = data.find(b"\0", cursor, min(end, cursor + maximum))
+    if terminator < 0:
+        raise ValueError("unterminated bounded string")
+    return data[cursor:terminator].decode("utf-8", "replace"), terminator + 1
+
+
+def parse_openexr(data: bytes, profile: str = "balanced") -> dict[str, Any]:
+    result = _result("openexr")
+    if len(data) < 9 or data[:4] != b"v/1\x01":
+        result["findings"].append(_finding("error", "structure", "Invalid OpenEXR header", "The OpenEXR magic number and version field are missing."))
+        return result
+    version_field = int.from_bytes(data[4:8], "little")
+    cursor = 8
+    scan_end = min(len(data), 32 * 1024 * 1024 if profile == "deep" else 8 * 1024 * 1024)
+    attributes: list[str] = []
+    attribute_count = 0
+    malformed: str | None = None
+    while cursor < scan_end and attribute_count < 20_000:
+        if data[cursor] == 0:
+            cursor += 1
+            break
+        try:
+            name, cursor = _bounded_cstring(data, cursor, scan_end, 4_096)
+            attr_type, cursor = _bounded_cstring(data, cursor, scan_end, 4_096)
+        except ValueError as exc:
+            malformed = display_text(exc, 300)
+            break
+        if cursor + 4 > scan_end:
+            malformed = "truncated OpenEXR attribute size"
+            break
+        size = int.from_bytes(data[cursor:cursor + 4], "little")
+        cursor += 4
+        if size > scan_end - cursor:
+            malformed = f"attribute {name} exceeds retained header bytes"
+            break
+        payload = data[cursor:cursor + size]
+        cursor += size
+        rendered = f"{name} [{attr_type}] ({size} bytes)"
+        if attr_type in {"string", "stringvector"} and size <= 1_000_000:
+            value = payload.rstrip(b"\0").decode("utf-8", "replace")
+            rendered += f" = {display_text(value, 16_384)}"
+            result["metadata"][safe_label(name, 80)] = display_text(value, 16_384)
+        elif attr_type == "box2i" and size == 16:
+            x_min, y_min, x_max, y_max = struct.unpack("<iiii", payload)
+            result["properties"][safe_label(name, 80)] = {"x_min": x_min, "y_min": y_min, "x_max": x_max, "y_max": y_max, "width": x_max - x_min + 1, "height": y_max - y_min + 1}
+        elif attr_type == "compression" and size == 1:
+            result["properties"]["compression_code"] = payload[0]
+        elif attr_type == "chlist":
+            channel_cursor = 0
+            channels: list[str] = []
+            while channel_cursor < len(payload) and len(channels) < 256 and payload[channel_cursor] != 0:
+                try:
+                    channel, next_cursor = _bounded_cstring(payload, channel_cursor, len(payload), 4_096)
+                except ValueError:
+                    break
+                if next_cursor + 16 > len(payload):
+                    break
+                channels.append(channel)
+                channel_cursor = next_cursor + 16
+            result["properties"]["channels"] = channels
+            rendered += f" = {', '.join(channels)}"
+        attributes.append(rendered)
+        attribute_count += 1
+    result["properties"].update({"version": version_field & 0xFF, "version_flags": f"0x{version_field & 0xFFFFFF00:08x}", "tiled": bool(version_field & 0x200), "long_names": bool(version_field & 0x400), "deep_data": bool(version_field & 0x800), "multi_part": bool(version_field & 0x1000), "attributes": attribute_count, "header_end": cursor, "parser_stop": malformed})
+    if attributes:
+        result["text_records"].append({"encoding": "openexr-attributes", "offset": 8, "text": display_text("\n".join(attributes), 1_000_000), "source": "OpenEXR header attributes", "confidence_hint": 10})
+    if malformed:
+        result["findings"].append(_finding("warning", "structure", "OpenEXR header traversal stopped", "Completed attributes were retained before an invalid or incomplete attribute.", reason=malformed))
+    return result
+
+
+def parse_android_sparse(data: bytes, profile: str = "balanced") -> dict[str, Any]:
+    result = _result("android_sparse")
+    if len(data) < 28 or data[:4] != b"\x3a\xff\x26\xed":
+        result["findings"].append(_finding("error", "structure", "Invalid Android sparse-image header", "The sparse magic or 28-byte header is missing."))
+        return result
+    magic, major, minor, file_header_size, chunk_header_size, block_size, total_blocks, total_chunks, checksum = struct.unpack_from("<IHHHHIIII", data, 0)
+    output_size = block_size * total_blocks
+    result["properties"].update({"major_version": major, "minor_version": minor, "file_header_size": file_header_size, "chunk_header_size": chunk_header_size, "block_size": block_size, "total_blocks": total_blocks, "total_chunks": total_chunks, "expanded_bytes": output_size, "image_checksum": f"0x{checksum:08x}"})
+    if magic != 0xED26FF3A or not 28 <= file_header_size <= 4096 or not 12 <= chunk_header_size <= 4096 or block_size < 512 or block_size > 16 * 1024 * 1024 or block_size % 4:
+        result["findings"].append(_finding("error", "structure", "Unsafe Android sparse-image geometry", "One or more fixed header sizes are outside conservative bounds."))
+        return result
+    reconstruct_limit = {"quick": 16, "balanced": 64, "deep": 192}.get(profile, 64) * 1024 * 1024
+    reconstruct = output_size <= reconstruct_limit
+    expanded = bytearray() if reconstruct else None
+    cursor = file_header_size
+    blocks_seen = 0
+    parsed = 0
+    counts: dict[str, int] = {"raw": 0, "fill": 0, "skip": 0, "crc32": 0}
+    malformed: str | None = None
+    deadline = time.monotonic() + (8.0 if profile == "deep" else 3.0)
+    for _ in range(min(total_chunks, 1_000_000)):
+        if time.monotonic() > deadline:
+            malformed = "sparse chunk traversal reached the profile time limit"
+            break
+        if cursor + chunk_header_size > len(data):
+            malformed = "truncated sparse chunk header"
+            break
+        chunk_type, _reserved, chunk_blocks, total_size = struct.unpack_from("<HHII", data, cursor)
+        if total_size < chunk_header_size or total_size > len(data) - cursor:
+            malformed = "sparse chunk leaves the retained file"
+            break
+        payload_offset = cursor + chunk_header_size
+        payload_size = total_size - chunk_header_size
+        expanded_chunk = chunk_blocks * block_size
+        if chunk_type != 0xCAC4 and (chunk_blocks > total_blocks - blocks_seen or expanded_chunk > output_size):
+            malformed = "sparse chunks exceed the declared expanded block count"
+            break
+        if chunk_type == 0xCAC1:
+            if payload_size != expanded_chunk:
+                malformed = "raw sparse chunk size mismatch"
+                break
+            counts["raw"] += 1
+            if expanded is not None:
+                expanded.extend(data[payload_offset:payload_offset + payload_size])
+        elif chunk_type == 0xCAC2:
+            if payload_size != 4:
+                malformed = "fill sparse chunk is not four bytes"
+                break
+            counts["fill"] += 1
+            if expanded is not None:
+                expanded.extend(data[payload_offset:payload_offset + 4] * (expanded_chunk // 4))
+        elif chunk_type == 0xCAC3:
+            if payload_size != 0:
+                malformed = "don't-care sparse chunk unexpectedly has data"
+                break
+            counts["skip"] += 1
+            if expanded is not None:
+                expanded.extend(b"\0" * expanded_chunk)
+        elif chunk_type == 0xCAC4:
+            if payload_size != 4 or chunk_blocks != 0:
+                malformed = "CRC32 sparse chunk has invalid geometry"
+                break
+            counts["crc32"] += 1
+        else:
+            malformed = f"unknown sparse chunk type 0x{chunk_type:04x}"
+            break
+        blocks_seen += chunk_blocks
+        parsed += 1
+        cursor += total_size
+    valid = malformed is None and parsed == total_chunks and blocks_seen == total_blocks
+    result["properties"].update({"chunks_parsed": parsed, "blocks_reconstructed": blocks_seen, "chunk_counts": counts, "valid_chunk_table": valid, "parser_stop": malformed, "reconstruction_limited": not reconstruct})
+    if valid and expanded is not None and len(expanded) == output_size:
+        payload = bytes(expanded)
+        result["extracted"].append({"label": "android_sparse_expanded_image", "data": payload, "kind": sniff_kind(payload, "expanded.img"), "offset": None, "transformation": "expand validated Android sparse chunks", "parameters": {"bytes": len(payload), "chunks": parsed}})
+    elif not reconstruct:
+        result["findings"].append(_finding("info", "resource-limit", "Android sparse expansion was not materialized", "The declared expanded image exceeds the profile's in-memory child-artifact limit.", declared_bytes=output_size, limit_bytes=reconstruct_limit))
+    if malformed:
+        result["findings"].append(_finding("warning", "structure", "Android sparse chunk traversal stopped", "No partial expanded image was emitted.", reason=malformed))
+    return result
+
+
+def parse_dtb(data: bytes, profile: str = "balanced") -> dict[str, Any]:
+    result = _result("dtb")
+    if len(data) < 40 or data[:4] != b"\xd0\x0d\xfe\xed":
+        result["findings"].append(_finding("error", "structure", "Invalid flattened device tree header", "The FDT magic or 40-byte header is missing."))
+        return result
+    fields = struct.unpack_from(">10I", data, 0)
+    _magic, total_size, struct_offset, strings_offset, reserve_offset, version, last_compatible, boot_cpu, strings_size, struct_size = fields
+    result["properties"].update({"declared_total_bytes": total_size, "structure_offset": struct_offset, "structure_bytes": struct_size, "strings_offset": strings_offset, "strings_bytes": strings_size, "reserve_map_offset": reserve_offset, "version": version, "last_compatible_version": last_compatible, "boot_cpu_id": boot_cpu})
+    boundary = min(total_size, len(data))
+    if total_size < 40 or struct_offset + struct_size > boundary or strings_offset + strings_size > boundary:
+        result["findings"].append(_finding("error", "structure", "Device-tree blocks exceed the file", "The structure or strings block is outside the declared and retained bounds."))
+        return result
+    strings = data[strings_offset:strings_offset + strings_size]
+    cursor, struct_end = struct_offset, struct_offset + struct_size
+    stack: list[str] = []
+    records: list[str] = []
+    nodes = properties = 0
+    extracted_total = 0
+    malformed: str | None = None
+    deadline = time.monotonic() + (8.0 if profile == "deep" else 3.0)
+    while cursor + 4 <= struct_end and nodes < 100_000 and properties < 200_000 and time.monotonic() <= deadline:
+        token = int.from_bytes(data[cursor:cursor + 4], "big")
+        cursor += 4
+        if token == 1:
+            try:
+                name, cursor = _bounded_cstring(data, cursor, struct_end, 65_536)
+            except ValueError as exc:
+                malformed = display_text(exc, 300)
+                break
+            cursor = (cursor + 3) & ~3
+            if len(stack) >= 128:
+                malformed = "device-tree nesting limit reached"
+                break
+            stack.append(name)
+            nodes += 1
+        elif token == 2:
+            if not stack:
+                malformed = "unbalanced FDT_END_NODE token"
+                break
+            stack.pop()
+        elif token == 3:
+            if cursor + 8 > struct_end:
+                malformed = "truncated FDT_PROP token"
+                break
+            length, name_offset = struct.unpack_from(">II", data, cursor)
+            cursor += 8
+            if length > struct_end - cursor or name_offset >= len(strings):
+                malformed = "device-tree property leaves its blocks"
+                break
+            try:
+                name, _ = _bounded_cstring(strings, name_offset, len(strings), 65_536)
+            except ValueError as exc:
+                malformed = display_text(exc, 300)
+                break
+            payload = data[cursor:cursor + length]
+            path = "/" + "/".join(part for part in stack if part)
+            rendered = ""
+            parts = payload.rstrip(b"\0").split(b"\0") if payload else []
+            if parts and all(part and sum(32 <= byte < 127 or byte in {9, 10, 13} for byte in part) / len(part) >= 0.85 for part in parts):
+                rendered = " | ".join(part.decode("utf-8", "replace") for part in parts)
+            elif length in {4, 8, 12, 16}:
+                rendered = " ".join(f"0x{int.from_bytes(payload[index:index + 4], 'big'):08x}" for index in range(0, length, 4))
+            if rendered:
+                records.append(f"{path or '/'}: {name} = {display_text(rendered, 32_768)}")
+            child_kind = sniff_kind(payload, name)
+            if 8 <= length <= 4 * 1024 * 1024 and child_kind not in {"binary", "text", "dtb"} and len(result["extracted"]) < 32 and extracted_total + length <= 16 * 1024 * 1024:
+                result["extracted"].append({"label": f"dtb_{safe_label(name, 80)}", "data": payload, "kind": child_kind, "offset": cursor, "transformation": f"extract bounded device-tree property {safe_label(name, 80)}", "parameters": {"node": display_text(path or "/", 240), "bytes": length}})
+                extracted_total += length
+            cursor += length
+            cursor = (cursor + 3) & ~3
+            properties += 1
+        elif token == 4:
+            continue
+        elif token == 9:
+            break
+        else:
+            malformed = f"unknown device-tree token 0x{token:08x}"
+            break
+    result["properties"].update({"nodes": nodes, "properties": properties, "bytes_consumed": cursor - struct_offset, "parser_stop": malformed, "trailing_bytes": max(0, len(data) - total_size)})
+    if records:
+        result["text_records"].append({"encoding": "flattened-device-tree-properties", "offset": struct_offset, "text": display_text("\n".join(records), 2_000_000), "source": "flattened device-tree nodes and properties", "confidence_hint": 10})
+    if malformed:
+        result["findings"].append(_finding("warning", "structure", "Device-tree traversal stopped", "Completed nodes and properties were retained before an invalid token or resource limit.", reason=malformed))
+    return result
+
+
+def parse_tnef(data: bytes, profile: str = "balanced") -> dict[str, Any]:
+    result = _result("tnef")
+    if len(data) < 6 or data[:4] != b"x\x9f>\x22":
+        result["findings"].append(_finding("error", "structure", "Invalid TNEF header", "The Microsoft TNEF signature and legacy key are missing."))
+        return result
+    attribute_names = {
+        0x8004: "subject", 0x8008: "message_class", 0x800C: "body", 0x800F: "attachment_data",
+        0x8010: "attachment_title", 0x8011: "attachment_metafile", 0x9001: "attachment_transport_filename",
+        0x9002: "attachment_render_data", 0x9003: "mapi_properties", 0x9005: "attachment_properties",
+        0x9006: "tnef_version", 0x9007: "oem_codepage",
+    }
+    cursor = 6
+    attributes = invalid_checksums = 0
+    current_name = "attachment.bin"
+    text: list[str] = []
+    extracted_total = 0
+    scan_end = min(len(data), 128 * 1024 * 1024 if profile == "deep" else 32 * 1024 * 1024)
+    malformed: str | None = None
+    while cursor + 11 <= scan_end and attributes < 100_000:
+        level = data[cursor]
+        attribute_id = int.from_bytes(data[cursor + 1:cursor + 3], "little")
+        attribute_type = int.from_bytes(data[cursor + 3:cursor + 5], "little")
+        length = int.from_bytes(data[cursor + 5:cursor + 9], "little")
+        value_offset = cursor + 9
+        checksum_offset = value_offset + length
+        if length > scan_end - value_offset or checksum_offset + 2 > scan_end:
+            malformed = "TNEF attribute exceeds retained bytes"
+            break
+        payload = data[value_offset:checksum_offset]
+        checksum = int.from_bytes(data[checksum_offset:checksum_offset + 2], "little")
+        if sum(payload) & 0xFFFF != checksum:
+            invalid_checksums += 1
+        name = attribute_names.get(attribute_id, f"attribute_0x{attribute_id:04x}")
+        if attribute_id in {0x8004, 0x8008, 0x800C, 0x8010, 0x9001}:
+            value = payload.rstrip(b"\0").decode("cp1252", "replace")
+            text.append(f"{name} = {display_text(value, 100_000)}")
+            if attribute_id in {0x8010, 0x9001} and value.strip():
+                current_name = safe_label(value, 120)
+        if attribute_id == 0x800F and payload and len(result["extracted"]) < 64 and extracted_total + len(payload) <= 64 * 1024 * 1024:
+            result["extracted"].append({"label": current_name, "data": payload, "kind": sniff_kind(payload, current_name), "offset": value_offset, "transformation": "extract bounded TNEF attachment data", "parameters": {"level": level, "attribute_type": attribute_type, "checksum_valid": sum(payload) & 0xFFFF == checksum}})
+            extracted_total += len(payload)
+            current_name = "attachment.bin"
+        cursor = checksum_offset + 2
+        attributes += 1
+    result["properties"].update({"legacy_key": int.from_bytes(data[4:6], "little"), "attributes": attributes, "invalid_attribute_checksums": invalid_checksums, "attachments_extracted": len(result["extracted"]), "bytes_scanned": cursor, "parser_stop": malformed, "input_truncated": len(data) > scan_end})
+    if text:
+        result["text_records"].append({"encoding": "tnef-message-attributes", "offset": 6, "text": display_text("\n".join(text), 2_000_000), "source": "TNEF message and attachment attributes", "confidence_hint": 9})
+    if malformed:
+        result["findings"].append(_finding("warning", "structure", "TNEF traversal stopped", "Completed attributes and attachments were retained before an invalid or incomplete attribute.", reason=malformed))
     return result
 
 

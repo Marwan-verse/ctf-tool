@@ -1,5 +1,5 @@
 meta:
-  id: forenscope_pe_header
+  id: remanence_pe_header
   title: Bounded Portable Executable header
   endian: le
 seq:

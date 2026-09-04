@@ -704,6 +704,9 @@ def test_endpoint_and_disk_adapters_use_fixed_read_only_arguments(monkeypatch, t
         "ese": ("evidence.edb", "esedbinfo"),
         "hdf5": ("evidence.h5", "h5dump"),
         "access_db": ("evidence.accdb", "mdb_schema"),
+        "dicom": ("evidence.dcm", "dcmdump"),
+        "openexr": ("evidence.exr", "exrheader"),
+        "dtb": ("evidence.dtb", "fdtdump"),
         "qcow": ("evidence.qcow2", "qemu_img_info"),
         "disk": ("evidence.img", "bulk_extractor"),
     }
@@ -741,6 +744,9 @@ def test_endpoint_and_disk_adapters_use_fixed_read_only_arguments(monkeypatch, t
     assert commands["esedbinfo"][-1].endswith("evidence.edb")
     assert commands["h5dump"][1] == "--header" and commands["h5dump"][-1].endswith("evidence.h5")
     assert commands["mdb_schema"][-1].endswith("evidence.accdb")
+    assert commands["dcmdump"][-1].endswith("evidence.dcm")
+    assert commands["exrheader"][-1].endswith("evidence.exr")
+    assert commands["fdtdump"][-1].endswith("evidence.dtb")
     assert commands["plistutil"][-2:] == ["-f", "json"]
     assert commands["qemu_img_info"][1:3] == ["info", "--output=json"]
     assert not {"convert", "commit", "rebase", "resize", "--backing-chain"} & set(commands["qemu_img_info"])

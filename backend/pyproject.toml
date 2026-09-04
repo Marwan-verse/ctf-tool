@@ -3,7 +3,7 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "forenscope-api"
+name = "remanence-api"
 version = "0.1.0"
 description = "Local-first image and audio forensics CTF analysis control plane"
 requires-python = ">=3.11"
@@ -28,7 +28,7 @@ dev = [
 ]
 
 [project.scripts]
-forenscope-api = "app.main:run"
+remanence-api = "app.main:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]

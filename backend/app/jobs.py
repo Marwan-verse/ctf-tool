@@ -71,7 +71,7 @@ class JobManager:
         self.engine_factory = engine_factory or _default_engine_factory
         self._executor = ThreadPoolExecutor(
             max_workers=settings.max_workers,
-            thread_name_prefix="forenscope-analysis",
+            thread_name_prefix="remanence-analysis",
         )
         self._lock = threading.RLock()
         self._futures: dict[str, Future[None]] = {}

@@ -44,9 +44,9 @@ from .analyzers.visual import analyze_visual
 from .solve_guidance import build_solve_guidance
 
 
-SUPPORTED_IMAGE_FORMATS = ["PNG/APNG", "JPEG/MPO", "GIF", "BMP", "WebP", "SVG text", "TIFF/BigTIFF", "ICO/CUR", "PSD/PSB", "GIMP XCF", "PBM/PGM/PPM/PAM", "HEIF/HEIC/AVIF"]
+SUPPORTED_IMAGE_FORMATS = ["PNG/APNG", "JPEG/MPO", "GIF", "BMP", "WebP", "SVG text", "TIFF/BigTIFF", "ICO/CUR", "PSD/PSB", "GIMP XCF", "PBM/PGM/PPM/PAM", "HEIF/HEIC/AVIF", "QOI", "DDS", "KTX1/KTX2", "OpenEXR", "DICOM", "FITS"]
 SUPPORTED_AUDIO_FORMATS = ["WAV/PCM", "AIFF/AIFC", "FLAC", "Ogg/Opus", "MP3", "AAC/M4A", "AU", "WMA/ASF", "AMR", "CAF", "MIDI"]
-SUPPORTED_DOCUMENT_FORMATS = ["plain text", "Markdown/JSON/XML/CSV", "PDF", "RTF", "DOCX/XLSX/PPTX and macro variants", "ODT/ODS/ODP", "EPUB/XPS", "legacy Office/OLE", "OneNote"]
+SUPPORTED_DOCUMENT_FORMATS = ["plain text", "Markdown/JSON/XML/CSV", "PDF", "RTF", "DOCX/XLSX/PPTX and macro variants", "ODT/ODS/ODP", "EPUB/XPS", "legacy Office/OLE", "OneNote", "WARC", "CHM", "DjVu"]
 SUPPORTED_FORENSIC_FORMATS = [
     "PCAP/PCAPNG", "SQLite", "OLE/RTF/EML/MBOX", "TAR/7z/RAR", "shar/uuencode/ar", "LZIP/LZ4/LZMA/LZOP",
     "raw disk/ISO", "E01/EWF", "Windows registry hive", "memory/crash dump",
@@ -60,9 +60,11 @@ SUPPORTED_FORENSIC_FORMATS = [
     "APK/AAB/JAR/WAR/IPA/AppX/MSIX/NuGet packages", "CAB/CPIO/RPM/XAR",
     "HDF5/BSON/Access databases", "Java serialization/Python pickle/PYC",
     "Git pack/index", "Intel HEX/Motorola S-record firmware", "VHD/OneNote",
+    "DICOM/FITS", "QOI/DDS/KTX/OpenEXR", "Android sparse/boot/vendor-boot images and device trees", "U-Boot uImage/UEFI firmware volumes/SquashFS", "TNEF/winmail.dat",
+    "Parquet/Avro/Arrow IPC/Feather/ORC datasets", "WARC/CHM/DjVu documents",
 ]
 BUILT_IN_STRUCTURE_KINDS = {
-    "png", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "psd", "xcf", "netpbm", "heif", "avif", "pdf", "text",
+    "png", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "psd", "xcf", "netpbm", "heif", "avif", "qoi", "dds", "ktx", "openexr", "dicom", "fits", "pdf", "text",
     "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub", "xps",
     "apk", "aab", "jar", "war", "ipa", "appx", "msix", "nupkg",
     "android_backup", "plist", "lnk", "jumplist", "prefetch", "mft", "usn", "recycle_bin_i", "ese",
@@ -73,7 +75,8 @@ BUILT_IN_STRUCTURE_KINDS = {
     "shar", "ar", "cab", "cpio", "rpm", "xar", "lzip", "lz4", "lzma", "lzop",
     "mp4", "mov", "matroska", "webm", "avi",
     "pe", "elf", "macho", "wasm", "dex", "java_class", "java_serialized", "pyc", "python_pickle",
-    "git_pack", "git_index", "intel_hex", "srec", "hdf5", "bson", "access_db", "onenote",
+    "git_pack", "git_index", "intel_hex", "srec", "android_sparse", "dtb", "uimage", "android_boot", "android_vendor_boot", "uefi_fv", "squashfs",
+    "hdf5", "parquet", "avro", "arrow_ipc", "orc", "bson", "access_db", "onenote", "tnef", "warc", "chm", "djvu",
     "bencode", "cbor", "msgpack", "protobuf",
 }
 ZIP_DOCUMENT_KINDS = {"docx", "xlsx", "pptx", "odt", "ods", "odp", "epub", "xps", "apk", "aab", "jar", "war", "ipa", "appx", "msix", "nupkg"}
@@ -567,7 +570,7 @@ class AnalysisEngine:
                     if header_repairs and not read_truncated and analysis_options["structure_analysis"]
                     else "No unambiguous damaged signature/header reconstruction was available."
                 ),
-                "tool": {"executable": "Forenscope built-in", "resolved": "built-in", "version": "1"},
+                "tool": {"executable": "Remanence built-in", "resolved": "built-in", "version": "1"},
                 "details": {"candidate_count": len(header_repairs), "recovery_used_for_analysis": header_recovery_used},
             })
             pcrt_applicable = analysis_kind == "png" and format_root is not None
@@ -582,7 +585,7 @@ class AnalysisEngine:
                     if pcrt_applicable
                     else "PCRT-style PNG repair is only applicable to a completely read PNG input."
                 ),
-                "tool": {"executable": "Forenscope built-in", "resolved": "built-in", "version": "1"},
+                "tool": {"executable": "Remanence built-in", "resolved": "built-in", "version": "1"},
                 "artifact_ids": repair_artifact_ids,
                 "details": {"repairs_detected": pcrt_repairs, "repair_generation_enabled": bool(analysis_options["repairs"])},
             })
@@ -771,13 +774,13 @@ class AnalysisEngine:
                         "id": "decomposer", "name": "Bit-layer decomposer", "category": "visual",
                         "status": "skipped", "applicable": True, "started_at": None, "duration_ms": 0,
                         "summary": "Bit-layer decomposition did not run because decoded-pixel analysis was unavailable or disabled.",
-                        "tool": {"executable": "Forenscope built-in", "resolved": "built-in", "version": "1"}, "details": {},
+                        "tool": {"executable": "Remanence built-in", "resolved": "built-in", "version": "1"}, "details": {},
                     },
                     {
                         "id": "color_remapping", "name": "Color remapping", "category": "visual",
                         "status": "skipped", "applicable": True, "started_at": None, "duration_ms": 0,
                         "summary": "Color remapping did not run because decoded-pixel analysis was unavailable, disabled, or configured for zero variants.",
-                        "tool": {"executable": "Forenscope built-in", "resolved": "built-in", "version": "1"}, "details": {},
+                        "tool": {"executable": "Remanence built-in", "resolved": "built-in", "version": "1"}, "details": {},
                     },
                 ])
 
@@ -1084,7 +1087,7 @@ class AnalysisEngine:
                 {
                     "id": "spectrogram", "name": "Spectrogram", "category": "audio",
                     "status": "skipped", "applicable": False, "started_at": None, "duration_ms": 0,
-                    "summary": "Spectrogram analysis is available from Forenscope's Audio section and is not applicable to image evidence.",
+                    "summary": "Spectrogram analysis is available from Remanence's Audio section and is not applicable to image evidence.",
                     "tool": {"executable": "FFmpeg", "resolved": None, "version": None}, "details": {},
                 },
                 *([] if source_kind == "pdf" else [{
@@ -1539,7 +1542,7 @@ class AnalysisEngine:
                                         f"Recovered {len(recovered_ids)} SSTV image(s) from FFmpeg-normalized PCM."
                                         if recovered_ids else "FFmpeg produced PCM successfully, but no complete SSTV image was recovered."
                                     ),
-                                    "tool": {"executable": "Forenscope built-in + FFmpeg PCM", "resolved": "built-in", "version": "1"},
+                                    "tool": {"executable": "Remanence built-in + FFmpeg PCM", "resolved": "built-in", "version": "1"},
                                     "details": normalize_json(transcoded_signals), "artifact_ids": recovered_ids,
                                 })
                     elif reason:
@@ -1927,6 +1930,9 @@ def _kind_from_extension(extension: str) -> str | None:
         ".psd": "psd", ".psb": "psd", ".xcf": "xcf",
         ".pbm": "netpbm", ".pgm": "netpbm", ".ppm": "netpbm", ".pnm": "netpbm", ".pam": "netpbm",
         ".heif": "heif", ".heic": "heif", ".avif": "avif",
+        ".qoi": "qoi", ".dds": "dds", ".ktx": "ktx", ".ktx2": "ktx",
+        ".exr": "openexr", ".sxr": "openexr", ".mxr": "openexr", ".dxr": "openexr",
+        ".dcm": "dicom", ".dicom": "dicom", ".fits": "fits", ".fit": "fits", ".fts": "fits",
         ".pdf": "pdf",
         ".pcap": "pcap", ".cap": "pcap", ".pcapng": "pcapng",
         ".sqlite": "sqlite", ".sqlite3": "sqlite", ".db": "sqlite",
@@ -1955,13 +1961,14 @@ def _kind_from_extension(extension: str) -> str | None:
         ".img": "disk", ".dd": "disk", ".iso": "disk",
         ".e01": "ewf", ".ex01": "ewf", ".s01": "ewf", ".hive": "registry",
         ".vmem": "memory", ".mem": "memory", ".lime": "memory", ".dmp": "memory", ".raw": "memory",
-        ".evtx": "evtx", ".pst": "pst", ".ost": "pst",
+        ".evtx": "evtx", ".pst": "pst", ".ost": "pst", ".tnef": "tnef",
         ".one": "onenote", ".onetoc2": "onenote",
         ".7z": "7z", ".rar": "rar", ".tar": "tar", ".cab": "cab", ".cpio": "cpio", ".rpm": "rpm", ".xar": "xar",
         ".ser": "java_serialized", ".serialized": "java_serialized", ".pyc": "pyc",
         ".pkl": "python_pickle", ".pickle": "python_pickle", ".pack": "git_pack", ".idx": "git_index",
         ".hex": "intel_hex", ".ihex": "intel_hex", ".ihx": "intel_hex",
         ".srec": "srec", ".s19": "srec", ".s28": "srec", ".s37": "srec", ".mot": "srec",
+        ".simg": "android_sparse", ".sparse": "android_sparse", ".dtb": "dtb", ".dtbo": "dtb",
     }.get(extension)
 
 

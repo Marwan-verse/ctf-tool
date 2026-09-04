@@ -1,6 +1,8 @@
-# Forenscope
+# Remanence
 
-Forenscope is a local-first CTF file-forensics workbench. Give it an image, audio or video file, packet capture, document, archive, database, disk or memory image, executable, structured binary, or damaged file and it will build a bounded evidence report containing:
+<p align="center"><img src="web/public/remanence-logo.png" alt="Remanence logo" width="220"></p>
+
+Remanence is a local-first CTF file-forensics workbench. Give it an image, audio or video file, packet capture, document, archive, database, disk or memory image, executable, structured binary, or damaged file and it will build a bounded evidence report containing:
 
 - content-based format identification and hashes;
 - readable document text and media previews;
@@ -11,10 +13,21 @@ Forenscope is a local-first CTF file-forensics workbench. Give it an image, audi
 - a Solve guide that recommends evidence-driven next steps; and
 - an explicit coverage record showing which built-in and optional methods ran, were missing, were inapplicable, timed out, or failed.
 
-Forenscope is designed for CTF challenges and files you are authorized to inspect. It is not a malware sandbox, antivirus product, password-cracking service, or replacement for evidence-handling procedures required by law or policy.
+Remanence is designed for CTF challenges and files you are authorized to inspect. It is not a malware sandbox, antivirus product, password-cracking service, or replacement for evidence-handling procedures required by law or policy.
+
+## Interface preview
+
+### Desktop workbench
+
+![Remanence desktop file-forensics workbench](docs/screenshots/remanence-desktop.png)
+
+### Mobile workbench
+
+<p align="center"><img src="docs/screenshots/remanence-mobile.png" alt="Remanence mobile file-forensics workbench" width="390"></p>
 
 ## Contents
 
+- [Interface preview](#interface-preview)
 - [Safety and operating model](#safety-and-operating-model)
 - [Quick start](#quick-start)
 - [Your first analysis](#your-first-analysis)
@@ -103,11 +116,11 @@ npm run dev
 docker compose up --build
 ```
 
-The Compose stack publishes only `127.0.0.1:3000` and `127.0.0.1:8000`, drops Linux capabilities, uses `no-new-privileges`, limits CPU/memory/PIDs, mounts evidence storage in the `forenscope-data` volume, and runs the backend filesystem read-only apart from its data volume and temporary filesystem.
+The Compose stack publishes only `127.0.0.1:3000` and `127.0.0.1:8000`, drops Linux capabilities, uses `no-new-privileges`, limits CPU/memory/PIDs, mounts evidence storage in the `remanence-data` volume, and runs the backend filesystem read-only apart from its data volume and temporary filesystem.
 
 The backend image includes the image/steganography utilities declared in `backend/Dockerfile`. It does not contain every optional network, disk, mobile, memory, or program-analysis adapter. Because the Compose backend is non-root and read-only, **Install missing tools is not supported inside the hardened container**. Use a local/WSL installation for the full adapter catalog, or build a reviewed custom image.
 
-Stop the stack with `docker compose down`. Add `--volumes` only when you intentionally want to delete the persisted Forenscope database and all cases in the Docker volume.
+Stop the stack with `docker compose down`. Add `--volumes` only when you intentionally want to delete the persisted Remanence database and all cases in the Docker volume.
 
 ## Your first analysis
 
@@ -167,27 +180,29 @@ The Solve guide is a bounded provenance graph. It links artifacts, producing met
 
 ## Supported evidence and analysis
 
-Forenscope always begins with content signatures, SHA-256, bounded entropy/string inspection, embedded-signature searches, recursive decoding where applicable, and candidate extraction. Extension-only identification is used for formats without a reliable universal magic value, such as generic MessagePack or Protocol Buffers.
+Remanence always begins with content signatures, SHA-256, bounded entropy/string inspection, embedded-signature searches, recursive decoding where applicable, and candidate extraction. Extension-only identification is used for formats without a reliable universal magic value, such as generic MessagePack or Protocol Buffers.
 
 ### Format overview
 
 | Family | Recognized formats and artifacts | Main built-in work |
 |---|---|---|
-| Images | PNG/APNG, JPEG/MPO, GIF, BMP, WebP, SVG text, TIFF/BigTIFF, ICO/CUR, PSD/PSB, GIMP XCF, PBM/PGM/PPM/PAM, HEIF/HEIC/AVIF | structure, metadata, frames, channels, palette/index data, bit planes, OCR/barcodes, embedded content, repairs, bounded long-tail header triage |
+| Images and scientific imaging | PNG/APNG, JPEG/MPO, GIF, BMP, WebP, SVG text, TIFF/BigTIFF, ICO/CUR, PSD/PSB, GIMP XCF, PBM/PGM/PPM/PAM, HEIF/HEIC/AVIF, QOI, DDS, KTX1/KTX2, OpenEXR, DICOM, FITS | structure, metadata, frames, channels, palette/index data, bit planes, OCR/barcodes, exact QOI/FITS residue, DICOM text VRs/preamble, FITS cards, texture metadata, repairs, bounded long-tail header triage |
 | Audio | WAV/PCM, AIFF/AIFC, FLAC, Ogg/Opus, MP3, AAC/M4A, AU, WMA/ASF, AMR, CAF, MIDI | headers/metadata, PCM analysis, waveform/spectrogram, channels, LSB lanes, DTMF/Morse/SSTV, conversion handoffs |
 | Video | MP4/MOV, Matroska/WebM, AVI | BMFF/EBML/RIFF structure, brands, text metadata, invalid sizes, trailers, optional metadata and contact-frame extraction |
-| Text and documents | plain text, Markdown, JSON/JSONL, XML, YAML, CSV/TSV, config/log files, PDF, RTF, EML/MBOX, DOC/XLS/PPT, DOCX/XLSX/PPTX plus macro/template variants, ODT/ODS/ODP, EPUB, XPS/OXPS, OneNote | bounded plain-text preview, package text/metadata, attachments/objects, active-content indicators, whitespace and encoding analysis |
+| Text and documents | plain text, Markdown, JSON/JSONL, XML, YAML, CSV/TSV, config/log files, PDF, RTF, EML/MBOX, DOC/XLS/PPT, DOCX/XLSX/PPTX plus macro/template variants, ODT/ODS/ODP, EPUB, XPS/OXPS, OneNote, WARC, CHM/ITSF, DjVu | bounded plain-text preview, WARC record/payload recovery, DjVu text/chunk inventory, CHM strings/member handoff, package text/metadata, attachments/objects, active-content indicators, whitespace and encoding analysis |
 | Captures | PCAP, PCAPNG, PCAPNG secrets blocks, SocketCAN in captures | native flow/stream/object/covert-channel analysis plus optional TShark/Wireshark-grade queries |
 | Archives, packages and compression | ZIP, TAR, gzip, bzip2, XZ, Zstandard, 7z, RAR, LZIP, LZ4, LZMA, LZOP, shar/uuencode, Unix ar, CAB, CPIO, RPM, XAR, APK, AAB, JAR/WAR, IPA, AppX/MSIX, NuGet/VSIX | bounded recursion, safe member extraction, package manifest text, extra-field carving, trailers, decompression, optional flat 7-Zip extraction |
-| Databases and browser data | SQLite, WAL, rollback journal, LevelDB, ESE/EDB, Firefox MOZLZ4, HDF5, BSON, Access Jet/ACE | bounded schema/page/record/object strings, BSON key/value and binary-field recovery, and fixed read-only queries for common browser, activity, quarantine, and message stores |
-| Windows artifacts | Registry hives, EVTX, LNK, Jump Lists, Prefetch, `$MFT`, `$UsnJrnl:$J`, `$Recycle.Bin` `$I`, thumbnail cache, PST/OST, memory/crash dumps | headers, records, paths, timestamps, stale cells, UserAssist, event strings, mail/store metadata, optional specialist tools |
-| Linux/macOS/mobile | utmp/wtmp/btmp, systemd journals, plist, `.DS_Store`, Safari binary cookies, iOS MBDB, Android ADB backup | records, fields, timestamps, strings, filenames/comments/cookies, backup manifests and bounded child extraction |
-| Disk and VM images | raw MBR/GPT/filesystem images, FAT/exFAT, NTFS, ext, HFS/HFS+, APFS, XFS, Btrfs, SquashFS/CramFS, LUKS/BitLocker indicators, ISO, E01/EWF, QCOW, VMDK, VHD/VHDX, VDI, DMG, AFF/AFF4 | container/partition metadata, embedded signatures, optional Sleuth Kit/libewf/QEMU recovery workflows |
-| Programs, serialization and firmware | PE/PE32+, ELF32/ELF64, thin/fat Mach-O, WebAssembly, Android DEX, Java class/serialization, Python PYC/pickle, Intel HEX, Motorola S-record | bounded headers, sections/segments/load commands, strings/custom sections, checksum-validated firmware reconstruction, serialization disassembly without object loading, RWX warnings, overlays |
+| Databases, datasets and browser data | SQLite, WAL, rollback journal, LevelDB, ESE/EDB, Firefox MOZLZ4, HDF5, Apache Parquet (including PARE identification), Avro object containers, Arrow IPC/Feather V2, ORC, BSON, Access Jet/ACE | bounded schema/footer/postscript/block indexing, exact trailer recovery, BSON key/value and binary-field recovery, and fixed read-only queries for common browser, activity, quarantine, and message stores |
+| Windows and mail artifacts | Registry hives, EVTX, LNK, Jump Lists, Prefetch, `$MFT`, `$UsnJrnl:$J`, `$Recycle.Bin` `$I`, thumbnail cache, PST/OST, TNEF/winmail.dat, memory/crash dumps | headers, records, paths, timestamps, stale cells, UserAssist, event strings, mail/store metadata, checksum-validated TNEF attachments, optional specialist tools |
+| Linux/macOS/mobile | utmp/wtmp/btmp, systemd journals, plist, `.DS_Store`, Safari binary cookies, iOS MBDB, Android ADB backup, Android sparse/boot/vendor-boot images, flattened device trees/overlays | records, fields, timestamps, strings, filenames/comments/cookies, backup manifests, validated page-aligned boot segments and sparse expansion, device-tree nodes/properties and bounded child extraction |
+| Disk and VM images | raw MBR/GPT/filesystem images, FAT/exFAT, NTFS, ext, HFS/HFS+, APFS, XFS, Btrfs, SquashFS v4/CramFS, LUKS/BitLocker indicators, ISO, E01/EWF, QCOW, VMDK, VHD/VHDX, VDI, DMG, AFF/AFF4 | container/partition metadata, SquashFS superblock and exact used-byte boundary, embedded signatures, optional Sleuth Kit/libewf/QEMU/unsquashfs workflows |
+| Programs, serialization and firmware | PE/PE32+, ELF32/ELF64, thin/fat Mach-O, WebAssembly, Android DEX, Java class/serialization, Python PYC/pickle, Intel HEX, Motorola S-record, U-Boot uImage, Android sparse/boot/vendor-boot, UEFI firmware volumes, DTB/DTBO | bounded headers, CRC checks, page-aligned boot segments, UEFI header checksum and GUID, sections/load commands, checksum-validated firmware reconstruction, device-tree boot arguments and embedded properties, serialization disassembly without object loading, RWX warnings, overlays |
 | Developer artifacts | Git pack and index files | bounded version/object metadata and path/string recovery without checking out or executing repository content |
 | Structured binary | bencode/BitTorrent, self-described or extension-identified CBOR, MessagePack, Protocol Buffers wire data | bounded maps, arrays, fields, strings, byte payloads, trailers, recursive child inspection |
 
 Unknown binary data still receives hashes, entropy, ASCII/UTF-16 strings, signature search, carving, common decoding/compression checks, crypto signals, and optional general-purpose tools.
+
+The long-tail parsers follow the container layouts published by [Apache Parquet](https://parquet.apache.org/docs/file-format/), [Apache Avro](https://avro.apache.org/docs/current/specification/), [Apache Arrow IPC](https://arrow.apache.org/docs/format/Columnar.html#ipc-file-format), [Apache ORC](https://orc.apache.org/specification/ORCv0/), [AOSP boot images](https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/heads/main/include/bootimg/bootimg.h), [UEFI PI firmware storage](https://uefi.org/specs/PI/1.8/V3_Code_Definitions.html), [SquashFS](https://github.com/torvalds/linux/blob/master/fs/squashfs/squashfs_fs.h), and [WARC 1.1](https://iipc.github.io/warc-specifications/specifications/warc-format/warc-1.1-annotated/). Dataset schemas, FlatBuffers, Thrift objects, compressed stripes, filesystems, HTML, and embedded scripts are never instantiated by the native parser.
 
 ### Images and steganography
 
@@ -203,7 +218,7 @@ Built-in image analysis includes:
 
 #### Image uncropping and repair
 
-Forenscope creates a repair only when bytes and format invariants support it:
+Remanence creates a repair only when bytes and format invariants support it:
 
 - PNG dimensions can expand when the complete decompressed IDAT scanline layout proves hidden rows or columns.
 - BMP height can expand when `biSizeImage` and exact row stride prove complete hidden rows.
@@ -216,7 +231,7 @@ This cannot restore pixels that no longer exist. Ordinary editor crops, most JPE
 
 ### Documents and text preview
 
-The Document text view supports readable text/config formats and `.pdf`, `.rtf`, `.eml`, `.mbox`, `.doc`, `.xls`, `.ppt`, OOXML and macro/template variants, `.odt`, `.ods`, `.odp`, `.epub`, `.xps`, `.oxps`, `.one`, and manifest-bearing APK/AAB/JAR/WAR/IPA/AppX/MSIX/NuGet packages. It reports encoding, character/line counts, source parts, and truncation.
+The Document text view supports readable text/config formats and `.pdf`, `.rtf`, `.eml`, `.mbox`, `.doc`, `.xls`, `.ppt`, OOXML and macro/template variants, `.odt`, `.ods`, `.odp`, `.epub`, `.xps`, `.oxps`, `.one`, manifest-bearing APK/AAB/JAR/WAR/IPA/AppX/MSIX/NuGet packages, DICOM text VRs, FITS cards, KTX/OpenEXR metadata, Parquet/Arrow footer strings, Avro schemas/block indexes, ORC footer strings, WARC record indexes, CHM strings, DjVu text chunks, Android/U-Boot boot arguments and segment maps, SquashFS superblocks, flattened device-tree properties, and TNEF message attributes. It reports encoding, character/line counts, source parts, and truncation.
 
 Preview safety limits are independent:
 
@@ -262,7 +277,7 @@ When TShark is installed, `POST /api/jobs/{job_id}/traffic/query` powers three r
 - `follow`: numbered TCP, UDP, DCCP, TLS, DTLS, HTTP, HTTP/2, QUIC, MPEG-TS, or MPEG-PES streams in ASCII, hex, raw, or YAML form; and
 - `statistics`: protocol hierarchy, I/O graph, packet lengths, flow graph, endpoints, conversations, DNS, HTTP, HTTP requests, HTTP/2, ICMP, SIP, RTP, SMB2, Expert Info, or credentials.
 
-An NSS TLS key-log can be selected only from a text artifact already belonging to the same job. Secret values are validated but not rendered in the response. Forenscope does not start live capture, inject/replay traffic, resolve arbitrary paths, load capture-provided plugins, or expose every interactive Wireshark GUI feature.
+An NSS TLS key-log can be selected only from a text artifact already belonging to the same job. Secret values are validated but not rendered in the response. Remanence does not start live capture, inject/replay traffic, resolve arbitrary paths, load capture-provided plugins, or expose every interactive Wireshark GUI feature.
 
 ### Endpoint, browser, mobile, disk, and memory artifacts
 
@@ -289,9 +304,9 @@ Bencode, CBOR, MessagePack, and Protocol Buffers enforce nesting, node/field, an
 
 The bounded decoder explores common Base encodings, hexadecimal, URL encoding, Unicode representations, compression, and simple CTF transformations while tracking the transform chain. It is intentionally not an unbounded brute-force engine.
 
-Ciphertext-like extracted payloads are reported. If you supply a passphrase, Forenscope can try bounded repeating-key XOR and OpenSSL `Salted__` AES-256-CBC recovery. It also supports the common capture challenge where one same-capture cleartext stream contains a literal OpenSSL decrypt command and another contains its payload; only that literal observed passphrase is considered. Legacy OpenSSL 3DES-CBC plus fixed MD5/SHA-256 EVP_BytesToKey variants are supported for this correlation. Plaintext is retained only after padding/content checks succeed.
+Ciphertext-like extracted payloads are reported. If you supply a passphrase, Remanence can try bounded repeating-key XOR and OpenSSL `Salted__` AES-256-CBC recovery. It also supports the common capture challenge where one same-capture cleartext stream contains a literal OpenSSL decrypt command and another contains its payload; only that literal observed passphrase is considered. Legacy OpenSSL 3DES-CBC plus fixed MD5/SHA-256 EVP_BytesToKey variants are supported for this correlation. Plaintext is retained only after padding/content checks succeed.
 
-Forenscope does not perform password spraying, wordlist attacks, hash cracking, online credential validation, or key retrieval.
+Remanence does not perform password spraying, wordlist attacks, hash cracking, online credential validation, or key retrieval.
 
 ## Optional external tools
 
@@ -306,7 +321,7 @@ All optional adapters are capability checks, not requirements. The Settings and 
 | Steganography/carving | zsteg, Stegseek, Steghide, OutGuess, JPSeek, JSteg, OpenStego, Binwalk, Foremost, 7-Zip | embedded payload and bit/coefficient techniques |
 | Documents | Poppler, qpdf, SNOW, Oletools | text/images/attachments, whitespace steg, VBA/object indicators |
 | Network | capinfos, TShark, Zeek, tcpflow, hcxpcapngtool, pcapfix | packet dissection, objects, flows, authentication artifacts, repair |
-| Endpoint/database/disk | SQLite CLI, HDF5 `h5dump`, mdbtools, libyal tools, Sleuth Kit, libewf, Reglookup, python-evtx, libpst, QEMU, bulk_extractor | specialist read-only parsing and recovery |
+| Endpoint/database/disk/firmware | SQLite CLI, HDF5 `h5dump`, mdbtools, DCMTK `dcmdump`, OpenEXR `exrheader`, `fdtdump`, U-Boot `dumpimage`, `unsquashfs`, DjVuLibre `djvudump`/`djvutxt`, flat 7-Zip CHM extraction, libyal tools, Sleuth Kit, libewf, Reglookup, python-evtx, libpst, QEMU, bulk_extractor | specialist read-only parsing, image/header cross-checks, device-tree rendering, bounded member extraction, and recovery |
 | Audio/video | FFmpeg/FFprobe, SoX, MediaInfo, Multimon-ng, Minimodem | media normalization, metadata, frames, spectra, signal decoding |
 | Program/mobile/timeline | YARA-X, capa, FLOSS, Kaitai, Plaso, iLEAPP, ALEAPP, Volatility 3 | capabilities/strings, headers, timelines, mobile reports, memory triage |
 
@@ -314,7 +329,7 @@ Primary upstream documentation includes [TShark](https://www.wireshark.org/docs/
 
 ### Discovery and installation
 
-Forenscope searches the current process `PATH`, refreshed Windows user/system PATH entries, common application directories, `FORENSCOPE_TOOL_PATHS`, the managed `.tools` directory, and the default WSL distribution. A WSL tool transparently receives the evidence path as `/mnt/<drive>/...`.
+Remanence searches the current process `PATH`, refreshed Windows user/system PATH entries, common application directories, `REMANENCE_TOOL_PATHS`, the managed `.tools` directory, and the default WSL distribution. A WSL tool transparently receives the evidence path as `/mnt/<drive>/...`.
 
 In the GUI, use **Refresh availability** after installing tools. Availability is otherwise cached for five minutes. **Install all missing** requires explicit confirmation and can install only fixed entries declared in `backend/app/tool_installation.py`:
 
@@ -327,13 +342,13 @@ The browser never supplies package names, repositories, versions, URLs, scripts,
 To expose portable tools outside PATH before starting the backend:
 
 ```powershell
-$env:FORENSCOPE_TOOL_PATHS = 'C:\ForensicTools\bin;D:\Portable\ffmpeg\bin'
+$env:REMANENCE_TOOL_PATHS = 'C:\ForensicTools\bin;D:\Portable\ffmpeg\bin'
 ```
 
 To change the managed tool root:
 
 ```powershell
-$env:FORENSCOPE_TOOLS_DIR = 'D:\ForenscopeTools'
+$env:REMANENCE_TOOLS_DIR = 'D:\RemanenceTools'
 ```
 
 Steghide makes one non-interactive empty-passphrase attempt when no passphrase is supplied; a supplied passphrase replaces it. `zsteg_mode=all` uses `-a`, while `zsteg_mode=lsb` limits the adapter to `--lsb` checks.
@@ -342,31 +357,31 @@ Steghide makes one non-interactive empty-passphrase attempt when no passphrase i
 
 ### Backend environment variables
 
-All values are read when the backend process starts.
+All values are read when the backend process starts. The former `FORENSCOPE_*` names remain accepted as migration aliases; new configuration should use `REMANENCE_*`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FORENSCOPE_DATA_DIR` | `backend/data` | SQLite database, jobs, artifacts, and temporary report workspace. |
-| `FORENSCOPE_DB_PATH` | `<data-dir>/forenscope.sqlite3` | Override the job database path. |
-| `FORENSCOPE_MAX_UPLOAD_BYTES` | `104857600` | Maximum uploaded file size: 100 MiB by default. |
-| `FORENSCOPE_MAX_WORKERS` | `2` | Concurrent background analysis workers. |
-| `FORENSCOPE_MAX_ARTIFACTS` | `500` | Server-wide maximum artifacts allowed for one job. |
-| `FORENSCOPE_MAX_REPORT_BYTES` | `26214400` | Maximum serialized report size: 25 MiB by default. |
-| `FORENSCOPE_EVENT_POLL_SECONDS` | `0.35` | Server-side event-stream database polling interval. |
-| `FORENSCOPE_RATE_LIMIT` | `300` | Default requests per minute per client. |
-| `FORENSCOPE_UPLOAD_RATE_LIMIT` | `12` | Upload requests per minute per client. |
-| `FORENSCOPE_ALLOWED_ORIGINS` | local ports 3000 and 5173 | Comma-separated browser origins; validation permits loopback HTTP(S) origins only. |
-| `FORENSCOPE_ALLOWED_HOSTS` | localhost/loopback/testserver | Trusted `Host` header values. |
-| `FORENSCOPE_TOOL_PATHS` | empty | OS-path-separated additional directories used for tool discovery. |
-| `FORENSCOPE_TOOLS_DIR` | repository `.tools` | Managed/portable tool directory. |
+| `REMANENCE_DATA_DIR` | `backend/data` | SQLite database, jobs, artifacts, and temporary report workspace. |
+| `REMANENCE_DB_PATH` | `<data-dir>/remanence.sqlite3` | Override the job database path. Existing `forenscope.sqlite3` data is detected for migration compatibility. |
+| `REMANENCE_MAX_UPLOAD_BYTES` | `104857600` | Maximum uploaded file size: 100 MiB by default. |
+| `REMANENCE_MAX_WORKERS` | `2` | Concurrent background analysis workers. |
+| `REMANENCE_MAX_ARTIFACTS` | `500` | Server-wide maximum artifacts allowed for one job. |
+| `REMANENCE_MAX_REPORT_BYTES` | `26214400` | Maximum serialized report size: 25 MiB by default. |
+| `REMANENCE_EVENT_POLL_SECONDS` | `0.35` | Server-side event-stream database polling interval. |
+| `REMANENCE_RATE_LIMIT` | `300` | Default requests per minute per client. |
+| `REMANENCE_UPLOAD_RATE_LIMIT` | `12` | Upload requests per minute per client. |
+| `REMANENCE_ALLOWED_ORIGINS` | local ports 3000 and 5173 | Comma-separated browser origins; validation permits loopback HTTP(S) origins only. |
+| `REMANENCE_ALLOWED_HOSTS` | localhost/loopback/testserver | Trusted `Host` header values. |
+| `REMANENCE_TOOL_PATHS` | empty | OS-path-separated additional directories used for tool discovery. |
+| `REMANENCE_TOOLS_DIR` | repository `.tools` | Managed/portable tool directory. |
 
 Example PowerShell session:
 
 ```powershell
-$env:FORENSCOPE_DATA_DIR = 'D:\ForenscopeCases'
-$env:FORENSCOPE_MAX_UPLOAD_BYTES = '536870912'
-$env:FORENSCOPE_MAX_WORKERS = '1'
-$env:FORENSCOPE_ALLOWED_ORIGINS = 'http://localhost:3000'
+$env:REMANENCE_DATA_DIR = 'D:\RemanenceCases'
+$env:REMANENCE_MAX_UPLOAD_BYTES = '536870912'
+$env:REMANENCE_MAX_WORKERS = '1'
+$env:REMANENCE_ALLOWED_ORIGINS = 'http://localhost:3000'
 Set-Location backend
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
@@ -476,7 +491,7 @@ do {
 } while ($job.status -in @('queued', 'running', 'cancelling'))
 
 Invoke-WebRequest "http://127.0.0.1:8000/api/jobs/$jobId/report.zip" `
-  -OutFile ".\forenscope-$jobId.zip"
+  -OutFile ".\remanence-$jobId.zip"
 ```
 
 Use `curl.exe -N http://127.0.0.1:8000/api/jobs/$jobId/events` for the live event stream.
@@ -533,9 +548,9 @@ The default runtime tree is:
 
 ```text
 backend/data/
-├── forenscope.sqlite3
-├── forenscope.sqlite3-shm
-├── forenscope.sqlite3-wal
+├── remanence.sqlite3
+├── remanence.sqlite3-shm
+├── remanence.sqlite3-wal
 ├── jobs/
 │   └── <job UUID>/
 │       ├── input/source.upload
@@ -595,14 +610,14 @@ Exports wrap the job, result, and public artifact records in schema version `1.0
 - No tool can recover bytes that were deleted or overwritten. “Uncrop” is evidence-backed container/residue recovery, not generative reconstruction.
 - Built-in reads, recursion, parser nodes, packet rows, strings, visuals, artifacts, decompression, tools, output, and report sizes are intentionally capped.
 - Large sources can be stored but only a profile-bounded prefix may be examined by generic passes.
-- Long-tail containers such as PSD/XCF, HDF5/Access, CAB/RPM/XAR, OneNote, VHD, and application packages receive safe built-in identification, header/manifest, string, and child-artifact triage. Full semantic extraction can still require the listed optional specialist tools.
+- Long-tail containers such as PSD/XCF, DDS/KTX/OpenEXR, DICOM/FITS, HDF5/Access, Parquet/Avro/Arrow/ORC, WARC/CHM/DjVu, CAB/RPM/XAR, OneNote, VHD, boot/firmware images, and application packages receive safe built-in identification, header/footer/manifest, string, and child-artifact triage. Full pixel, filesystem, compressed-record, or semantic extraction can still require the listed optional specialist tools.
 - Generic Protocol Buffers have no semantic field names without a trusted schema; evidence-provided schemas are not loaded.
 - 7z/RAR extraction, compressed-media decoding, full disk recovery, memory plugins, and many specialist reports depend on optional local tools.
 - Encrypted archives, encrypted Android backups, protected documents, and unknown cryptosystems are reported but not brute-forced.
 - PDF/document preview is extracted text, not a faithful page renderer. Complex layout, formulas, tracked changes, charts, and unsupported encodings may be incomplete.
 - Live Wireshark capture, packet injection/replay, Lua plugins, arbitrary profiles/scripts, and every Wireshark GUI dialog are outside the workbench.
 - Volatility never downloads symbols automatically; offline analysis may be limited on an unfamiliar image.
-- Forenscope is not hardened to execute malicious binaries. Do not manually open recovered executables on your host.
+- Remanence is not hardened to execute malicious binaries. Do not manually open recovered executables on your host.
 - The backend is local-only and unauthenticated. Public/multi-user deployment requires a separate authentication, isolation, authorization, retention, and abuse-control design.
 - No license file is currently included in this repository. Do not assume permission to redistribute it until the project owner adds a license.
 
@@ -617,11 +632,11 @@ Invoke-RestMethod http://127.0.0.1:8000/api/health
 Get-Content web/.env.local -ErrorAction SilentlyContinue
 ```
 
-`NEXT_PUBLIC_API_URL` should normally be `http://localhost:8000`. Restart the frontend after changing environment files. Keep the hostname/port in `FORENSCOPE_ALLOWED_ORIGINS` if you use another loopback frontend port.
+`NEXT_PUBLIC_API_URL` should normally be `http://localhost:8000`. Restart the frontend after changing environment files. Keep the hostname/port in `REMANENCE_ALLOWED_ORIGINS` if you use another loopback frontend port.
 
 ### A tool is still marked missing
 
-Call `/api/capabilities?refresh=true` or use Refresh availability. Confirm the executable works in the same account/environment that runs the backend. For portable Windows tools, set `FORENSCOPE_TOOL_PATHS` before backend startup. For WSL tools, confirm the default distribution starts and the command exists there.
+Call `/api/capabilities?refresh=true` or use Refresh availability. Confirm the executable works in the same account/environment that runs the backend. For portable Windows tools, set `REMANENCE_TOOL_PATHS` before backend startup. For WSL tools, confirm the default distribution starts and the command exists there.
 
 The automatic installer does not cover every declared adapter and cannot mutate the hardened Docker container. Read the tool's upstream documentation, install it through a trusted channel, then restart or refresh detection.
 
@@ -639,7 +654,7 @@ Refresh the job. Cancellation is cooperative and waits for a safe boundary or to
 
 ### Upload rejected with 413
 
-Raise `FORENSCOPE_MAX_UPLOAD_BYTES` before backend startup. For Docker Compose, set it in the shell or a root `.env` file. This permits storage only; profile inspection limits remain bounded.
+Raise `REMANENCE_MAX_UPLOAD_BYTES` before backend startup. For Docker Compose, set it in the shell or a root `.env` file. This permits storage only; profile inspection limits remain bounded.
 
 ### Build reports an unknown route classification
 

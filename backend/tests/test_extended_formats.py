@@ -119,3 +119,144 @@ def test_new_types_have_stable_mime_and_download_extensions() -> None:
     assert mime_for("avif") == "image/avif"
     assert extension_for("java_serialized") == ".ser"
     assert mime_for("hdf5") == "application/x-hdf5"
+
+
+@pytest.mark.parametrize(
+    ("payload", "filename", "expected"),
+    [
+        (b"qoif" + struct.pack(">IIBB", 1, 1, 4, 0) + b"\0" * 8, "image.bin", "qoi"),
+        (b"DDS " + struct.pack("<I", 124) + b"\0" * 120, "texture.bin", "dds"),
+        (b"\xabKTX 20\xbb\r\n\x1a\n" + b"\0" * 68, "texture.bin", "ktx"),
+        (b"v/1\x01\x02\0\0\0\0", "image.bin", "openexr"),
+        (b"\0" * 128 + b"DICM" + b"\0" * 8, "medical.bin", "dicom"),
+        (b"SIMPLE  =                    T".ljust(80, b" "), "science.bin", "fits"),
+        (struct.pack("<IHHHHIIII", 0xED26FF3A, 1, 0, 28, 12, 4096, 1, 0, 0), "system.bin", "android_sparse"),
+        (b"\xd0\x0d\xfe\xed" + b"\0" * 36, "tree.bin", "dtb"),
+        (b"x\x9f>\x22\x01\0", "winmail.dat", "tnef"),
+    ],
+)
+def test_second_tier_magic_detection(payload: bytes, filename: str, expected: str) -> None:
+    assert sniff_kind(payload, filename) == expected
+
+
+def test_qoi_structure_finds_exact_trailing_payload() -> None:
+    marker = b"\0\0\0\0\0\0\0\x01"
+    source = b"qoif" + struct.pack(">IIBB", 1, 1, 4, 0) + b"\xfe\xff\x00\x00" + marker + b"PK\x03\x04"
+    report = analyze_format("qoi", source)
+    assert report["properties"]["decoded_pixels"] == 1
+    assert report["properties"]["end_marker_valid"] is True
+    assert report["properties"]["trailing_bytes"] == 4
+    assert report["extracted"][0]["kind"] == "zip"
+
+
+def test_dds_ktx_and_openexr_headers_are_bounded() -> None:
+    dds = bytearray(128)
+    dds[:4] = b"DDS "
+    struct.pack_into("<I", dds, 4, 124)
+    struct.pack_into("<II", dds, 12, 32, 64)
+    struct.pack_into("<I", dds, 76, 32)
+    dds[84:88] = b"DXT1"
+    dds_report = analyze_format("dds", bytes(dds))
+    assert dds_report["properties"]["width"] == 64
+    assert dds_report["properties"]["height"] == 32
+    assert dds_report["properties"]["fourcc"] == "DXT1"
+
+    kv_payload = b"KTXwriter\0flag{ktx_metadata}"
+    kv_record = struct.pack("<I", len(kv_payload)) + kv_payload
+    kv_record += b"\0" * ((-len(kv_record)) % 4)
+    ktx_header = b"\xabKTX 20\xbb\r\n\x1a\n" + struct.pack(
+        "<9I4I2Q", 37, 1, 8, 4, 0, 0, 1, 1, 0, 0, 0, 80, len(kv_record), 0, 0,
+    )
+    ktx_report = analyze_format("ktx", ktx_header + kv_record)
+    assert ktx_report["properties"]["width"] == 8
+    assert "flag{ktx_metadata}" in ktx_report["text_records"][0]["text"]
+
+    value = b"flag{openexr_attribute}"
+    exr = b"v/1\x01" + struct.pack("<I", 2) + b"comments\0string\0" + struct.pack("<I", len(value)) + value + b"\0"
+    exr_report = analyze_format("openexr", exr)
+    assert exr_report["properties"]["version"] == 2
+    assert "flag{openexr_attribute}" in exr_report["text_records"][0]["text"]
+
+
+def _dicom_explicit(tag: tuple[int, int], vr: bytes, payload: bytes) -> bytes:
+    if len(payload) % 2:
+        payload += b"\0" if vr == b"UI" else b" "
+    if vr.decode("ascii") in {"OB", "OD", "OF", "OL", "OV", "OW", "SQ", "SV", "UC", "UR", "UT", "UN", "UV"}:
+        return struct.pack("<HH", *tag) + vr + b"\0\0" + struct.pack("<I", len(payload)) + payload
+    return struct.pack("<HH", *tag) + vr + struct.pack("<H", len(payload)) + payload
+
+
+def test_dicom_and_fits_text_and_residue_are_recovered() -> None:
+    dicom = b"\0" * 128 + b"DICM"
+    dicom += _dicom_explicit((0x0002, 0x0010), b"UI", b"1.2.840.10008.1.2.1")
+    dicom += _dicom_explicit((0x0010, 0x0010), b"PN", b"flag{dicom_patient}")
+    dicom += _dicom_explicit((0x0028, 0x0010), b"US", struct.pack("<H", 32))
+    dicom += _dicom_explicit((0x7FE0, 0x0010), b"OB", b"")
+    dicom_report = analyze_format("dicom", dicom)
+    assert dicom_report["properties"]["rows"] == 32
+    assert "flag{dicom_patient}" in dicom_report["text_records"][0]["text"]
+
+    def card(value: str) -> bytes:
+        return value.encode("ascii").ljust(80, b" ")
+
+    fits = card("SIMPLE  =                    T") + card("BITPIX  =                    8") + card("NAXIS   =                    0")
+    fits += card("COMMENT flag{fits_card}") + card("END")
+    fits = fits.ljust(2880, b" ") + b"PK\x03\x04"
+    fits_report = analyze_format("fits", fits)
+    assert fits_report["properties"]["trailing_bytes"] == 4
+    assert "flag{fits_card}" in fits_report["text_records"][0]["text"]
+    assert fits_report["extracted"][0]["kind"] == "zip"
+
+    extension_hdu = card("XTENSION= 'IMAGE   '") + card("BITPIX  =                    8") + card("NAXIS   =                    0") + card("PCOUNT  =                    0") + card("GCOUNT  =                    1") + card("END")
+    multi_hdu = fits[:2880] + extension_hdu.ljust(2880, b" ") + b"PK\x03\x04"
+    multi_report = analyze_format("fits", multi_hdu)
+    assert multi_report["properties"]["hdu_count"] == 2
+    assert multi_report["properties"]["logical_file_end"] == 5760
+    assert multi_report["properties"]["trailing_bytes"] == 4
+
+
+def test_android_sparse_and_dtb_emit_validated_child_artifacts() -> None:
+    raw = b"PK\x03\x04" + b"\0" * 508
+    sparse = struct.pack("<IHHHHIIII", 0xED26FF3A, 1, 0, 28, 12, 512, 1, 1, 0)
+    sparse += struct.pack("<HHII", 0xCAC1, 0, 1, 12 + len(raw)) + raw
+    sparse_report = analyze_format("android_sparse", sparse)
+    assert sparse_report["properties"]["valid_chunk_table"] is True
+    assert sparse_report["extracted"][0]["kind"] == "zip"
+
+    strings = b"compatible\0payload\0"
+    structure = struct.pack(">I", 1) + b"\0\0\0\0"
+    compatible = b"ctf,board\0"
+    structure += struct.pack(">III", 3, len(compatible), 0) + compatible + b"\0" * ((-len(compatible)) % 4)
+    embedded = b"\x89PNG\r\n\x1a\n"
+    structure += struct.pack(">III", 3, len(embedded), len(b"compatible\0")) + embedded
+    structure += struct.pack(">III", 2, 9, 0)
+    struct_offset = 40
+    strings_offset = struct_offset + len(structure)
+    total_size = strings_offset + len(strings)
+    header = struct.pack(">10I", 0xD00DFEED, total_size, struct_offset, strings_offset, 40, 17, 16, 0, len(strings), len(structure))
+    dtb_report = analyze_format("dtb", header + structure + strings)
+    assert dtb_report["properties"]["nodes"] == 1
+    assert "ctf,board" in dtb_report["text_records"][0]["text"]
+    assert dtb_report["extracted"][0]["kind"] == "png"
+
+
+def test_tnef_attributes_and_attachment_checksums_are_validated() -> None:
+    def attribute(attribute_id: int, payload: bytes, level: int = 2, attribute_type: int = 6) -> bytes:
+        return bytes([level]) + struct.pack("<HHI", attribute_id, attribute_type, len(payload)) + payload + struct.pack("<H", sum(payload) & 0xFFFF)
+
+    source = b"x\x9f>\x22\x01\0"
+    source += attribute(0x8010, b"flag.txt\0")
+    source += attribute(0x800F, b"flag{tnef_attachment}")
+    report = analyze_format("tnef", source)
+    assert report["properties"]["invalid_attribute_checksums"] == 0
+    assert report["properties"]["attachments_extracted"] == 1
+    assert report["extracted"][0]["label"] == "flag.txt"
+    assert report["extracted"][0]["data"] == b"flag{tnef_attachment}"
+
+
+def test_second_tier_types_have_stable_mime_and_extensions() -> None:
+    assert mime_for("dicom") == "application/dicom"
+    assert extension_for("fits") == ".fits"
+    assert mime_for("tnef") == "application/vnd.ms-tnef"
+    assert extension_for("android_sparse") == ".simg"
+    assert extension_for("dtb") == ".dtb"

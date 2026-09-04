@@ -64,6 +64,12 @@ MIME_BY_KIND = {
     "netpbm": "image/x-portable-anymap",
     "heif": "image/heif",
     "avif": "image/avif",
+    "qoi": "image/qoi",
+    "dds": "image/vnd.ms-dds",
+    "ktx": "image/ktx",
+    "openexr": "image/x-exr",
+    "dicom": "application/dicom",
+    "fits": "image/fits",
     "wav": "audio/wav",
     "aiff": "audio/aiff",
     "flac": "audio/flac",
@@ -94,6 +100,8 @@ MIME_BY_KIND = {
     "git_index": "application/x-git-index",
     "intel_hex": "application/x-intel-hex",
     "srec": "application/x-motorola-s-record",
+    "android_sparse": "application/x-android-sparse-image",
+    "dtb": "application/x-dtb",
     "bencode": "application/x-bittorrent",
     "cbor": "application/cbor",
     "msgpack": "application/msgpack",
@@ -140,6 +148,10 @@ MIME_BY_KIND = {
     "rtf": "application/rtf",
     "eml": "message/rfc822",
     "mbox": "application/mbox",
+    "tnef": "application/vnd.ms-tnef",
+    "warc": "application/warc",
+    "chm": "application/vnd.ms-htmlhelp",
+    "djvu": "image/vnd.djvu",
     "systemd_journal": "application/x-systemd-journal",
     "disk": "application/x-raw-disk-image",
     "ewf": "application/x-ewf",
@@ -158,6 +170,10 @@ MIME_BY_KIND = {
     "ese": "application/x-esedb",
     "access_db": "application/x-msaccess",
     "hdf5": "application/x-hdf5",
+    "parquet": "application/vnd.apache.parquet",
+    "avro": "application/avro",
+    "arrow_ipc": "application/vnd.apache.arrow.file",
+    "orc": "application/vnd.apache.orc",
     "bson": "application/bson",
     "qcow": "application/x-qemu-disk",
     "vmdk": "application/x-vmdk",
@@ -177,6 +193,11 @@ MIME_BY_KIND = {
     "lz4": "application/x-lz4",
     "lzma": "application/x-lzma",
     "lzop": "application/x-lzop",
+    "uimage": "application/x-u-boot-image",
+    "android_boot": "application/x-android-boot-image",
+    "android_vendor_boot": "application/x-android-vendor-boot-image",
+    "uefi_fv": "application/x-uefi-firmware-volume",
+    "squashfs": "application/vnd.squashfs",
     "text": "text/plain",
     "binary": "application/octet-stream",
 }
@@ -347,6 +368,18 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "xcf"
     if len(data) >= 3 and data[:2] in {b"P1", b"P2", b"P3", b"P4", b"P5", b"P6", b"P7"} and data[2] in b" \t\r\n#":
         return "netpbm"
+    if data.startswith(b"qoif") and len(data) >= 14:
+        return "qoi"
+    if data.startswith(b"DDS ") and len(data) >= 128 and int.from_bytes(data[4:8], "little") == 124:
+        return "dds"
+    if data.startswith((b"\xabKTX 11\xbb\r\n\x1a\n", b"\xabKTX 20\xbb\r\n\x1a\n")):
+        return "ktx"
+    if data.startswith(b"v/1\x01"):
+        return "openexr"
+    if len(data) >= 132 and data[128:132] == b"DICM":
+        return "dicom"
+    if data.startswith(b"SIMPLE  =") and len(data) >= 80:
+        return "fits"
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "webp"
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
@@ -413,12 +446,30 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "dex"
     if data.startswith(b"\xac\xed\x00\x05"):
         return "java_serialized"
+    if data.startswith(b"'\x05\x19V") and len(data) >= 64:
+        return "uimage"
+    if data.startswith(b"ANDROID!") and len(data) >= 44:
+        return "android_boot"
+    if data.startswith(b"VNDRBOOT") and len(data) >= 44:
+        return "android_vendor_boot"
+    if data.startswith(b"\x3a\xff\x26\xed") and len(data) >= 28:
+        return "android_sparse"
+    if data.startswith(b"\xd0\x0d\xfe\xed") and len(data) >= 40:
+        return "dtb"
     if data.startswith(b"PACK") and len(data) >= 12 and 2 <= int.from_bytes(data[4:8], "big") <= 3:
         return "git_pack"
     if data.startswith(b"DIRC") and len(data) >= 12 and 2 <= int.from_bytes(data[4:8], "big") <= 4:
         return "git_index"
     if any(data[offset:offset + 8] == b"\x89HDF\r\n\x1a\n" for offset in (0, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536)):
         return "hdf5"
+    if data.startswith((b"PAR1", b"PARE")) and len(data) >= 12:
+        return "parquet"
+    if data.startswith(b"Obj\x01") and len(data) >= 20:
+        return "avro"
+    if data.startswith(b"ARROW1") and len(data) >= 16:
+        return "arrow_ipc"
+    if data.startswith(b"ORC") and len(data) >= 4:
+        return "orc"
     if len(data) >= 32 and data[4:20].startswith((b"Standard Jet DB", b"Standard ACE DB")):
         return "access_db"
     if data.startswith(b"\xd9\xd9\xf7"):
@@ -494,6 +545,18 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         return "evtx"
     if data.startswith(b"!BDN"):
         return "pst"
+    if data.startswith(b"x\x9f>\x22"):
+        return "tnef"
+    if data.startswith((b"WARC/1.0\r\n", b"WARC/1.1\r\n", b"WARC/1.0\n", b"WARC/1.1\n")):
+        return "warc"
+    if data.startswith(b"ITSF") and len(data) >= 56:
+        return "chm"
+    if data.startswith(b"AT&TFORM") and len(data) >= 16:
+        return "djvu"
+    if len(data) >= 56 and data[40:44] == b"_FVH":
+        return "uefi_fv"
+    if data.startswith(b"hsqs") and len(data) >= 96:
+        return "squashfs"
     if data.startswith(bytes.fromhex("e4525c7b8cd8a74daeb15378d02996d3")):
         return "onenote"
     if data.startswith((b"MDMP", b"PAGEDUMP", b"PAGEDU64")):
@@ -536,6 +599,9 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         ".psd": "psd", ".psb": "psd", ".xcf": "xcf",
         ".pbm": "netpbm", ".pgm": "netpbm", ".ppm": "netpbm", ".pnm": "netpbm", ".pam": "netpbm",
         ".heif": "heif", ".heic": "heif", ".heifs": "heif", ".heics": "heif", ".avif": "avif",
+        ".qoi": "qoi", ".dds": "dds", ".ktx": "ktx", ".ktx2": "ktx",
+        ".exr": "openexr", ".sxr": "openexr", ".mxr": "openexr", ".dxr": "openexr",
+        ".dcm": "dicom", ".dicom": "dicom", ".fits": "fits", ".fit": "fits", ".fts": "fits",
         ".wav": "wav", ".wave": "wav", ".aif": "aiff", ".aiff": "aiff", ".aifc": "aiff",
         ".flac": "flac", ".ogg": "ogg", ".oga": "ogg", ".opus": "ogg",
         ".mp3": "mp3", ".aac": "aac", ".m4a": "m4a", ".m4b": "m4a",
@@ -554,6 +620,7 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         ".jsonlz4": "mozlz4", ".baklz4": "mozlz4", ".mozlz4": "mozlz4",
         ".ldb": "leveldb", ".sst": "leveldb",
         ".h5": "hdf5", ".hdf": "hdf5", ".hdf5": "hdf5", ".he5": "hdf5",
+        ".parquet": "parquet", ".avro": "avro", ".arrow": "arrow_ipc", ".feather": "arrow_ipc", ".orc": "orc",
         ".bson": "bson", ".mdb": "access_db", ".accdb": "access_db",
         ".doc": "ole", ".xls": "ole", ".ppt": "ole", ".msg": "ole",
         ".rtf": "rtf", ".eml": "eml", ".mbox": "mbox", ".mbx": "mbox", ".journal": "systemd_journal",
@@ -566,13 +633,17 @@ def sniff_kind(data: bytes, filename: str = "") -> str:
         ".e01": "ewf", ".ex01": "ewf", ".s01": "ewf",
         ".dat": "binary", ".hive": "registry",
         ".vmem": "memory", ".mem": "memory", ".lime": "memory", ".dmp": "memory", ".raw": "memory",
-        ".evtx": "evtx", ".pst": "pst", ".ost": "pst",
+        ".evtx": "evtx", ".pst": "pst", ".ost": "pst", ".tnef": "tnef",
         ".one": "onenote", ".onetoc2": "onenote",
+        ".warc": "warc", ".chm": "chm", ".chi": "chm", ".chw": "chm", ".djvu": "djvu", ".djv": "djvu",
         ".exe": "pe", ".dll": "pe", ".sys": "pe", ".efi": "pe",
         ".elf": "elf", ".so": "elf", ".o": "elf", ".dylib": "macho", ".wasm": "wasm",
         ".dex": "dex", ".class": "java_class",
         ".ser": "java_serialized", ".serialized": "java_serialized", ".pyc": "pyc",
         ".pkl": "python_pickle", ".pickle": "python_pickle",
+        ".simg": "android_sparse", ".sparse": "android_sparse", ".dtb": "dtb", ".dtbo": "dtb",
+        ".uimg": "uimage", ".uimage": "uimage", ".bootimg": "android_boot", ".vendor_boot": "android_vendor_boot",
+        ".fv": "uefi_fv", ".fd": "uefi_fv", ".squashfs": "squashfs", ".sqfs": "squashfs",
         ".pack": "git_pack", ".idx": "git_index",
         ".hex": "intel_hex", ".ihex": "intel_hex", ".ihx": "intel_hex",
         ".srec": "srec", ".s19": "srec", ".s28": "srec", ".s37": "srec", ".mot": "srec",
@@ -662,6 +733,7 @@ def extension_for(kind: str) -> str:
         "png": ".png", "jpeg": ".jpg", "gif": ".gif", "bmp": ".bmp",
         "webp": ".webp", "svg": ".svg", "tiff": ".tiff", "ico": ".ico", "zip": ".zip",
         "psd": ".psd", "xcf": ".xcf", "netpbm": ".pnm", "heif": ".heif", "avif": ".avif",
+        "qoi": ".qoi", "dds": ".dds", "ktx": ".ktx2", "openexr": ".exr", "dicom": ".dcm", "fits": ".fits",
         "docx": ".docx", "xlsx": ".xlsx", "pptx": ".pptx",
         "odt": ".odt", "ods": ".ods", "odp": ".odp", "epub": ".epub",
         "xps": ".xps", "apk": ".apk", "aab": ".aab", "jar": ".jar", "war": ".war",
@@ -674,6 +746,9 @@ def extension_for(kind: str) -> str:
         "dex": ".dex", "java_class": ".class",
         "java_serialized": ".ser", "pyc": ".pyc", "python_pickle": ".pickle",
         "git_pack": ".pack", "git_index": ".idx", "intel_hex": ".hex", "srec": ".srec",
+        "android_sparse": ".simg", "dtb": ".dtb",
+        "uimage": ".uimg", "android_boot": ".boot.img", "android_vendor_boot": ".vendor_boot.img",
+        "uefi_fv": ".fv", "squashfs": ".squashfs",
         "bencode": ".torrent", "cbor": ".cbor", "msgpack": ".msgpack", "protobuf": ".pb",
         "gzip": ".gz", "zlib": ".zlib", "bzip2": ".bz2", "xz": ".xz", "zstd": ".zst",
         "7z": ".7z", "rar": ".rar", "tar": ".tar", "shar": ".shar", "ar": ".a",
@@ -685,7 +760,9 @@ def extension_for(kind: str) -> str:
         "mozlz4": ".jsonlz4", "leveldb": ".ldb", "ds_store": ".DS_Store",
         "binarycookies": ".binarycookies",
         "hdf5": ".h5", "bson": ".bson", "access_db": ".accdb",
-        "ole": ".ole", "rtf": ".rtf", "eml": ".eml", "mbox": ".mbox",
+        "parquet": ".parquet", "avro": ".avro", "arrow_ipc": ".arrow", "orc": ".orc",
+        "ole": ".ole", "rtf": ".rtf", "eml": ".eml", "mbox": ".mbox", "tnef": ".tnef",
+        "warc": ".warc", "chm": ".chm", "djvu": ".djvu",
         "systemd_journal": ".journal", "disk": ".img", "ewf": ".E01",
         "registry": ".hive", "memory": ".mem", "text": ".txt",
         "evtx": ".evtx", "pst": ".pst",
@@ -768,6 +845,12 @@ def find_magic_offsets(data: bytes, maximum_per_kind: int = 20) -> list[dict[str
         "7zip": b"7z\xbc\xaf'\x1c", "rar": b"Rar!\x1a\x07", "sqlite": b"SQLite format 3\x00",
         "pcapng": b"\x0a\x0d\x0d\x0a", "ole": b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",
         "registry": b"regf", "evtx": b"ElfFile\x00", "pst": b"!BDN",
+        "qoi": b"qoif", "dds": b"DDS ", "ktx2": b"\xabKTX 20\xbb\r\n\x1a\n",
+        "openexr": b"v/1\x01", "fits": b"SIMPLE  =", "android_sparse": b"\x3a\xff\x26\xed",
+        "dtb": b"\xd0\x0d\xfe\xed", "tnef": b"x\x9f>\x22",
+        "parquet": b"PAR1", "avro": b"Obj\x01", "arrow_ipc": b"ARROW1", "orc": b"ORC",
+        "uimage": b"'\x05\x19V", "android_boot": b"ANDROID!", "android_vendor_boot": b"VNDRBOOT",
+        "uefi_fv": b"_FVH", "squashfs": b"hsqs", "warc": b"WARC/1.", "chm": b"ITSF", "djvu": b"AT&TFORM",
     }
     hits: list[dict[str, Any]] = []
     for name, signature in signatures.items():

@@ -535,7 +535,7 @@ def _render_waveform(samples: np.ndarray, sample_rate: int) -> bytes:
     image = Image.new("RGB", (width, height), "#10291f")
     draw = ImageDraw.Draw(image)
     plot_left, plot_right, plot_top, plot_bottom = 76, width - 26, 54, height - 44
-    draw.text((26, 20), "FORENSCOPE · WAVEFORM", fill="#d9f99d")
+    draw.text((26, 20), "REMANENCE · WAVEFORM", fill="#d9f99d")
     for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
         x = int(plot_left + (plot_right - plot_left) * fraction)
         draw.line((x, plot_top, x, plot_bottom), fill="#244d3c", width=1)
@@ -587,7 +587,7 @@ def _render_spectrogram(samples: np.ndarray, sample_rate: int, fft_size: int) ->
     image = Image.new("RGB", (1600, 820), "#10291f")
     image.paste(heatmap, (92, 54))
     draw = ImageDraw.Draw(image)
-    draw.text((26, 20), f"FORENSCOPE · SPECTROGRAM · FFT {fft_size}", fill="#d9f99d")
+    draw.text((26, 20), f"REMANENCE · SPECTROGRAM · FFT {fft_size}", fill="#d9f99d")
     nyquist = sample_rate / 2
     for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
         y = int(54 + 720 * (1.0 - fraction))
@@ -819,7 +819,7 @@ def _method(method_id: str, name: str, category: str, status: str, summary: str,
         "id": method_id, "name": name, "category": category, "status": status,
         "applicable": status != "skipped", "started_at": utc_now() if status != "skipped" else None,
         "duration_ms": 0, "summary": summary,
-        "tool": {"executable": "Forenscope built-in", "resolved": "built-in", "version": "1"},
+        "tool": {"executable": "Remanence built-in", "resolved": "built-in", "version": "1"},
         "details": normalize_json(details or {}),
     }
 

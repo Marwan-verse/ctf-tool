@@ -45,14 +45,14 @@ class ResolvedTool:
         return f"WSL: {self.executable}"
 
 
-IMAGE_KINDS = frozenset({"png", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "psd", "xcf", "netpbm", "heif", "avif"})
+IMAGE_KINDS = frozenset({"png", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "psd", "xcf", "netpbm", "heif", "avif", "qoi", "dds", "ktx", "openexr", "dicom", "fits"})
 AUDIO_KINDS = frozenset({"audio", "wav", "aiff", "flac", "ogg", "mp3", "aac", "m4a", "au", "asf", "amr", "caf", "midi"})
 VIDEO_KINDS = frozenset({"mp4", "mov", "matroska", "webm", "avi"})
 PROGRAM_KINDS = frozenset({"pe", "elf", "macho", "wasm", "dex", "java_class", "pyc"})
 PDF_KINDS = frozenset({"pdf"})
 TEXT_KINDS = frozenset({"text", "svg"})
 NETWORK_KINDS = frozenset({"pcap", "pcapng"})
-ARCHIVE_KINDS = frozenset({"zip", "7z", "rar", "tar", "gzip", "bzip2", "xz", "zstd", "android_backup", "cab", "cpio", "rpm", "xar", "apk", "aab", "jar", "war", "ipa", "appx", "msix", "nupkg", "xps"})
+ARCHIVE_KINDS = frozenset({"zip", "7z", "rar", "tar", "gzip", "bzip2", "xz", "zstd", "android_backup", "cab", "cpio", "rpm", "xar", "chm", "apk", "aab", "jar", "war", "ipa", "appx", "msix", "nupkg", "xps"})
 OFFICE_KINDS = frozenset({"ole", "rtf", "zip", "docx", "xlsx", "pptx", "odt", "ods", "odp", "xps", "onenote"})
 DISK_KINDS = frozenset({"disk", "ewf", "qcow", "vmdk", "vhd", "vhdx", "vdi", "dmg", "aff"})
 MEMORY_KINDS = frozenset({"memory"})
@@ -95,6 +95,13 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec("webpmux", "webpmux", "WebP container and animation inspection", "structure", frozenset({"webp"}), frozenset({"balanced", "deep"})),
     ToolSpec("gifsicle", "gifsicle", "Gifsicle animation inspection", "animation", frozenset({"gif"}), frozenset({"balanced", "deep"}), "https://www.lcdf.org/gifsicle/"),
     ToolSpec("gifsicle_repair", "gifsicle", "Gifsicle tolerant GIF rewrite", "repair", frozenset({"gif"}), frozenset({"balanced", "deep"}), "https://www.lcdf.org/gifsicle/"),
+    ToolSpec("dcmdump", "dcmdump", "DCMTK DICOM element dump", "medical-image", frozenset({"dicom"}), frozenset({"balanced", "deep"}), "https://support.dcmtk.org/docs/dcmdump.html"),
+    ToolSpec("exrheader", "exrheader", "OpenEXR authoritative header report", "image-structure", frozenset({"openexr"}), frozenset({"balanced", "deep"}), "https://openexr.com/en/latest/bin/exrheader.html"),
+    ToolSpec("fdtdump", "fdtdump", "Flattened device-tree structure dump", "firmware", frozenset({"dtb"}), frozenset({"balanced", "deep"}), "https://www.devicetree.org/"),
+    ToolSpec("dumpimage", "dumpimage", "U-Boot legacy image header and CRC report", "firmware", frozenset({"uimage"}), frozenset({"balanced", "deep"}), "https://docs.u-boot.org/en/latest/usage/cmd/source.html"),
+    ToolSpec("unsquashfs", "unsquashfs", "SquashFS read-only superblock report", "filesystem", frozenset({"squashfs"}), frozenset({"balanced", "deep"}), "https://github.com/plougher/squashfs-tools"),
+    ToolSpec("djvudump", "djvudump", "DjVuLibre chunk structure dump", "document", frozenset({"djvu"}), frozenset({"balanced", "deep"}), "https://djvu.sourceforge.net/doc/man/djvudump.html"),
+    ToolSpec("djvutxt", "djvutxt", "DjVuLibre text-layer extraction", "document", frozenset({"djvu"}), frozenset({"balanced", "deep"}), "https://djvu.sourceforge.net/doc/man/djvutxt.html"),
     ToolSpec("zipfix", "zip", "Info-ZIP archive repair", "repair", frozenset({"zip"}), frozenset({"deep"}), "https://infozip.sourceforge.net/"),
     ToolSpec("zipfix_deep", "zip", "Info-ZIP deep archive repair", "repair", frozenset({"zip"}), frozenset({"deep"}), "https://infozip.sourceforge.net/"),
     ToolSpec("pdfinfo", "pdfinfo", "Poppler PDF metadata and page inspection", "metadata", PDF_KINDS, frozenset({"quick", "balanced", "deep"}), "https://poppler.freedesktop.org/"),
@@ -234,7 +241,7 @@ def _tool_search_path() -> str:
     for value in [
         *_path_entries(os.environ.get("PATH")),
         *_windows_environment_path(),
-        *_path_entries(os.environ.get("FORENSCOPE_TOOL_PATHS")),
+        *_path_entries(os.environ.get("REMANENCE_TOOL_PATHS") or os.environ.get("FORENSCOPE_TOOL_PATHS")),
     ]:
         key = value.casefold() if os.name == "nt" else value
         if key in seen:
@@ -261,7 +268,7 @@ def _well_known_tool_directories(executable: str) -> tuple[str, ...]:
     user_program_roots = ([local / "Programs"] if local else [])
 
     directories: list[Path] = []
-    configured_tools_root = os.environ.get("FORENSCOPE_TOOLS_DIR")
+    configured_tools_root = os.environ.get("REMANENCE_TOOLS_DIR") or os.environ.get("FORENSCOPE_TOOLS_DIR")
     managed_tools_root = (
         Path(configured_tools_root).expanduser()
         if configured_tools_root
@@ -709,7 +716,7 @@ class ExternalToolRunner:
                 index, result = execute(item)
                 results[index] = result
         elif scheduled:
-            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="forenscope-tool") as executor:
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="remanence-tool") as executor:
                 futures = [executor.submit(execute, item) for item in scheduled]
                 for future in as_completed(futures):
                     index, result = future.result()
@@ -988,6 +995,13 @@ class ExternalToolRunner:
                 argv = [executable, "-1", str(input_path)]
             elif spec.tool_id == "mdb_schema":
                 argv = [executable, str(input_path)]
+            elif spec.tool_id in {"dcmdump", "exrheader", "fdtdump", "djvudump", "djvutxt"}:
+                argv = [executable, str(input_path)]
+            elif spec.tool_id == "dumpimage":
+                argv = [executable, "-l", str(input_path)]
+            elif spec.tool_id == "unsquashfs":
+                # Superblock-only inspection: do not extract or mount members.
+                argv = [executable, "-s", str(input_path)]
             elif spec.tool_id in {"lnkinfo", "sccainfo", "esedbinfo"}:
                 argv = [executable, str(input_path)]
             elif spec.tool_id == "plistutil":
@@ -1874,6 +1888,7 @@ class ExternalToolRunner:
                 "lnkinfo": ["-V"], "sccainfo": ["-V"], "esedbinfo": ["-V"],
                 "h5dump": ["--version"], "h5dump_values": ["--version"],
                 "mdb_tables": ["--version"], "mdb_schema": ["--version"],
+                "dcmdump": ["--version"], "exrheader": ["--version"], "fdtdump": ["--version"],
                 "plistutil": ["--version"], "qemu_img_info": ["--version"], "bulk_extractor": ["-V"],
                 "wtcdbinfo": ["-V"], "wtcdbexport": ["-V"], "utmpdump": ["--version"],
                 "journalctl": ["--version"],
